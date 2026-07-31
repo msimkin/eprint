@@ -198,14 +198,10 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
                 spans.extend(marked_spans(&l, body_s, hl, &mut open));
                 lines.push(Line::from(spans));
             }
-        } else if !hit.snippet.is_empty() {
-            let mut open = false;
-            for l in wrap(&hit.snippet, body_w) {
-                let mut spans = vec![Span::raw(pad.clone())];
-                spans.extend(marked_spans(&l, body_s, hl, &mut open));
-                lines.push(Line::from(spans));
-            }
         }
+        // No snippet while collapsed: a 16-token window out of the middle of an
+        // abstract reads as noise. Matches are still highlighted in the title
+        // here, and in the whole abstract once expanded.
 
         lines.push(Line::raw(""));
     }
