@@ -192,6 +192,21 @@ pub fn wrap_body(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Every author, first names included. `short_authors` reduces to surnames so a
+/// list of results stays scannable; this is for the single-paper views, where the
+/// byline is worth the lines it takes.
+pub fn full_authors(authors: &str) -> String {
+    let names: Vec<&str> = authors
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return "—".to_string();
+    }
+    names.join(", ")
+}
+
 pub fn short_authors(authors: &str) -> String {
     let names: Vec<&str> = authors
         .split(';')
@@ -333,7 +348,7 @@ pub fn render_full(out: &mut String, p: &Paper, st: &Style, bib: Option<&(String
     for line in wrap(&p.title, width) {
         let _ = writeln!(out, "{}", th.paint(Tone::Title, &line));
     }
-    for line in wrap(&p.authors.replace("; ", ", "), width) {
+    for line in wrap(&full_authors(&p.authors), width) {
         let _ = writeln!(out, "{}", th.paint(Tone::Meta, &line));
     }
     let _ = writeln!(out);

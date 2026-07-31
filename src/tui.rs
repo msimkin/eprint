@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 
 use crate::db::{self, Hit, Query, Scope, MARK_END, MARK_START};
-use crate::render::{short_authors, wrap, wrap_body};
+use crate::render::{full_authors, short_authors, wrap, wrap_body};
 use crate::theme::{Theme, Tone};
 
 #[derive(Default, Clone)]
@@ -169,21 +169,33 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
             lines.push(Line::from(spans));
         }
 
-        // Authors only while collapsed; date and citation key once expanded.
-        let mut meta = vec![short_authors(&p.authors)];
-        if is_open && !p.date.is_empty() {
-            meta.push(p.date.chars().take(10).collect());
-        }
+        // Surnames while collapsed, so rows stay scannable. Expanding gives the
+        // full byline its own line — as `eprint show` does — because appending
+        // eight first names to the `·`-joined line buries the date behind them.
+        let mut meta = vec![if is_open {
+            full_authors(&p.authors)
+        } else {
+            short_authors(&p.authors)
+        }];
         if is_open {
+            let mut trailer: Vec<String> = Vec::new();
+            if !p.date.is_empty() {
+                trailer.push(p.date.chars().take(10).collect());
+            }
             if let Some((key, _)) = app.bib.get(&p.id) {
-                meta.push(key.clone());
+                trailer.push(key.clone());
+            }
+            if !trailer.is_empty() {
+                meta.push(trailer.join(" · "));
             }
         }
-        for m in wrap(&meta.join(" · "), body_w) {
-            lines.push(Line::from(vec![
-                Span::raw(pad.clone()),
-                Span::styled(m, meta_s),
-            ]));
+        for src in &meta {
+            for m in wrap(src, body_w) {
+                lines.push(Line::from(vec![
+                    Span::raw(pad.clone()),
+                    Span::styled(m, meta_s),
+                ]));
+            }
         }
 
         let body_s = th.style(Tone::Body);
