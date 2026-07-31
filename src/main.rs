@@ -56,12 +56,12 @@ enum Cmd {
     },
     /// Show one paper in full
     Show {
-        /// Paper id, e.g. 2026/1539
+        /// Paper id, e.g. 2026/1539, or just 1539 for this year
         id: String,
     },
     /// Open a paper in your browser
     Open {
-        /// Paper id, e.g. 2026/1539
+        /// Paper id, e.g. 2026/1539, or just 1539 for this year
         id: String,
         /// Go straight to the PDF instead of the abstract page
         #[arg(long)]
@@ -81,7 +81,7 @@ enum Cmd {
     },
     /// Look up BibTeX citation keys (CryptoBib)
     Bib {
-        /// Paper id, e.g. 2015/123. Omit to show database status
+        /// Paper id, e.g. 2015/123 (bare 1539 means this year). Omit for status
         id: Option<String>,
         /// Download or refresh the CryptoBib database
         #[arg(long)]
@@ -96,7 +96,7 @@ enum Cmd {
     /// Print the full BibTeX record (same as `bib <id> --entry`)
     #[command(name = "Bib")]
     BibEntry {
-        /// Paper id, e.g. 2018/116
+        /// Paper id, e.g. 2018/116, or just 116 for this year
         id: String,
     },
     /// Show index statistics
@@ -442,11 +442,20 @@ pub fn open_url(url: &str) -> Result<()> {
 }
 
 fn normalise_id(raw: &str) -> String {
-    raw.trim()
+    let id = raw
+        .trim()
         .trim_start_matches("https://eprint.iacr.org/")
         .trim_start_matches("http://eprint.iacr.org/")
-        .trim_end_matches(".pdf")
-        .to_string()
+        .trim_end_matches(".pdf");
+    // A bare number is the year-less half of an id, as printed in announcements
+    // and mailing-list posts; assume the current year. Even a four-digit input
+    // is read this way — per-year submission counts passed 2000 in 2024, so it
+    // is a plausible paper number and guessing "year" would be wrong as often.
+    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+        let (y, _, _) = civil_from_days(now().div_euclid(86400));
+        return format!("{y}/{id}");
+    }
+    id.to_string()
 }
 
 fn do_search(a: &SearchArgs) -> Result<()> {
