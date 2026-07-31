@@ -8,9 +8,9 @@ pub struct Config {
     /// all | title
     pub scope: String,
     pub limit: usize,
-    /// Results for a bare `eprint` (no query, no filters). `None` follows `limit`,
-    /// which is what every config written before this setting existed does.
-    pub latest_limit: Option<usize>,
+    /// Results for a bare `eprint` (no query, no filters) — a glance at the feed,
+    /// so it stays short regardless of how large `limit` is.
+    pub latest_limit: usize,
 }
 
 impl Default for Config {
@@ -19,14 +19,8 @@ impl Default for Config {
             theme: "auto".into(),
             scope: "all".into(),
             limit: 20,
-            latest_limit: None,
+            latest_limit: 10,
         }
-    }
-}
-
-impl Config {
-    pub fn latest_limit(&self) -> usize {
-        self.latest_limit.unwrap_or(self.limit)
     }
 }
 
@@ -48,7 +42,8 @@ scope = "all"
 limit = 20
 
 # Results for a bare `eprint` with no query or filters, which just lists the
-# latest papers. Comment out to use `limit` for both.
+# latest papers. Independent of `limit`, so a large `limit` still leaves the
+# no-argument listing short.
 latest_limit = 10
 "#;
 
@@ -94,7 +89,7 @@ pub fn load() -> Config {
             "latest_limit" => {
                 if let Ok(n) = v.parse::<usize>() {
                     if n > 0 {
-                        c.latest_limit = Some(n);
+                        c.latest_limit = n;
                     }
                 }
             }

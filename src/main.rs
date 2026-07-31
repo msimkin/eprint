@@ -510,12 +510,10 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         since,
         author: a.author.clone(),
         category: a.category.clone(),
-        limit: a.limit.unwrap_or_else(|| {
-            if a.is_latest() {
-                cfg.latest_limit()
-            } else {
-                cfg.limit
-            }
+        limit: a.limit.unwrap_or(if a.is_latest() {
+            cfg.latest_limit
+        } else {
+            cfg.limit
         }),
         scope,
         prefix: !a.exact,
@@ -826,10 +824,7 @@ fn do_config(init: bool, edit: bool) -> Result<()> {
     println!("  theme          {}", cfg.theme);
     println!("  scope          {}", cfg.scope);
     println!("  limit          {}", cfg.limit);
-    match cfg.latest_limit {
-        Some(n) => println!("  latest_limit   {n}"),
-        None => println!("  latest_limit   {}  (unset; follows limit)", cfg.limit),
-    }
+    println!("  latest_limit   {}", cfg.latest_limit);
     if path.is_some() {
         println!("\n  edit with `eprint config --edit`");
     }
