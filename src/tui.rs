@@ -60,7 +60,6 @@ impl App {
             author: self.filters.author.clone(),
             category: self.filters.category.clone(),
             limit: self.filters.limit,
-            by_date: true,
             scope: self.scope,
             prefix: self.filters.prefix,
         };

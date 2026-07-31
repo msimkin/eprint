@@ -376,7 +376,6 @@ pub struct Query<'a> {
     pub author: Option<String>,
     pub category: Option<String>,
     pub limit: usize,
-    pub by_date: bool,
     pub scope: Scope,
     /// Treat bare terms as prefixes so partial words match.
     pub prefix: bool,
@@ -514,12 +513,6 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
 fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>> {
     let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(match_expr.to_string())];
     let filters = filter_sql(q, &mut args);
-    let order = if q.by_date {
-        "p.date DESC".to_string()
-    } else {
-        // Title matches outrank abstract matches; category is a weak signal.
-        "bm25(papers_fts, 8.0, 4.0, 1.0, 3.0)".to_string()
-    };
     args.push(Box::new(q.limit as i64));
     let limit_idx = args.len();
 
@@ -531,7 +524,7 @@ fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>
                 highlight(papers_fts, 0, char(1), char(2))
          FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
          WHERE papers_fts MATCH ?1{filters}
-         ORDER BY {order}
+         ORDER BY p.date DESC
          LIMIT ?{limit_idx}"
     );
 

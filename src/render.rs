@@ -306,7 +306,6 @@ pub fn render_header(
     count: usize,
     total: usize,
     age: Option<String>,
-    sort: &str,
     scope: &str,
     st: &Style,
 ) {
@@ -315,7 +314,7 @@ pub fn render_header(
     } else {
         format!("{count} result{}", if count == 1 { "" } else { "s" })
     };
-    let mut tail = format!("by {sort} · {scope}");
+    let mut tail = scope.to_string();
     if let Some(a) = age {
         tail.push_str(&format!(" · index {a}"));
     }

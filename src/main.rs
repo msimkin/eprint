@@ -164,9 +164,6 @@ struct SearchArgs {
     /// Match titles and authors only, ignoring abstracts
     #[arg(short = 't', long)]
     title: bool,
-    /// Sort order
-    #[arg(long, value_name = "date|relevance")]
-    sort: Option<String>,
     /// Include full abstracts (omitted by default)
     #[arg(short = 'a', long)]
     abstracts: bool,
@@ -371,11 +368,6 @@ fn style_for(a: &SearchArgs, cfg: &config::Config) -> Style {
 }
 
 /// CLI flag beats config file beats built-in default.
-fn effective_sort(cli: Option<&str>, cfg: &config::Config) -> bool {
-    let s = cli.unwrap_or(&cfg.sort);
-    !s.eq_ignore_ascii_case("relevance") && !s.eq_ignore_ascii_case("rank")
-}
-
 fn effective_scope(title_flag: bool, cli: Option<&str>, cfg: &config::Config) -> Scope {
     if title_flag {
         return Scope::Title;
@@ -485,10 +477,6 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         Some(s) => Some(resolve_since(s)?),
         None => None,
     };
-    // An author filter with no query terms has no relevance signal to rank by,
-    // so date order is the only sensible one.
-    let author_only = a.author.is_some() && terms.trim().is_empty();
-    let by_date = effective_sort(a.sort.as_deref(), cfg) || author_only;
     let scope = effective_scope(a.title, a.scope.as_deref(), cfg);
 
     let q = Query {
@@ -498,7 +486,6 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         author: a.author.clone(),
         category: a.category.clone(),
         limit: a.limit.unwrap_or(cfg.limit),
-        by_date,
         scope,
         prefix: !a.exact,
     };
@@ -518,15 +505,7 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
     let total = db::count_matches(&conn, &q)?;
     let age = index_age(&conn)?.map(human_age);
     let mut out = String::new();
-    render::render_header(
-        &mut out,
-        hits.len(),
-        total,
-        age,
-        if by_date { "date" } else { "relevance" },
-        scope.label(),
-        st,
-    );
+    render::render_header(&mut out, hits.len(), total, age, scope.label(), st);
     let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
     for hit in &hits {
@@ -649,7 +628,6 @@ fn do_new_inner(
             hits.len(),
             total,
             None,
-            "arrival",
             &format!("since {}", &watermark.chars().take(10).collect::<String>()),
             &st,
         );
@@ -787,7 +765,6 @@ fn do_config(init: bool) -> Result<()> {
         None => println!("  config file    <could not determine a location>"),
     }
     println!("  theme          {}", cfg.theme);
-    println!("  sort           {}", cfg.sort);
     println!("  scope          {}", cfg.scope);
     println!("  limit          {}", cfg.limit);
     println!();

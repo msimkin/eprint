@@ -5,8 +5,6 @@ use std::path::PathBuf;
 pub struct Config {
     /// auto | dark | light | mono
     pub theme: String,
-    /// date | relevance
-    pub sort: String,
     /// all | title
     pub scope: String,
     pub limit: usize,
@@ -16,7 +14,6 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             theme: "auto".into(),
-            sort: "date".into(),
             scope: "all".into(),
             limit: 20,
         }
@@ -32,9 +29,6 @@ pub const TEMPLATE: &str = r#"# eprint configuration
 #   light  for light terminal backgrounds
 #   mono   no colour, only bold / dim / reverse
 theme = "auto"
-
-# Default result order: "date" (newest first) or "relevance" (best match first).
-sort = "date"
 
 # Default search scope: "all" (title, authors and abstract) or
 # "title" (title and authors only).
@@ -75,7 +69,6 @@ pub fn load() -> Config {
         let v = v.trim().trim_matches(['"', '\'']).to_string();
         match k.trim() {
             "theme" => c.theme = v,
-            "sort" => c.sort = v,
             "scope" => c.scope = v,
             "limit" => {
                 if let Ok(n) = v.parse::<usize>() {

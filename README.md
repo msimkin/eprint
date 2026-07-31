@@ -103,7 +103,6 @@ eprint "threshold ecdsa"              # search
 eprint search "threshold ecdsa"       # same thing, explicit
 eprint "fully homomorphic" -a         # include full abstracts
 eprint "Dan Boneh" -t                 # match titles and authors only
-eprint zk --sort relevance            # best match first instead of newest
 eprint garbled --year 2024 -n 50      # filter by year, more results
 eprint --author Boneh --since 2y      # browse without a query
 eprint --category "Public-key" -n 5   # filter by IACR category
@@ -233,7 +232,6 @@ Lives at `~/.config/eprint/config.toml` (override with `$EPRINT_CONFIG`):
 
 ```toml
 theme = "auto"    # auto | dark | light | mono
-sort  = "date"    # date | relevance
 scope = "all"     # all | title
 limit = 20
 ```
@@ -292,14 +290,8 @@ exactly as written. Pass `--exact` for strict whole-word matching.
 
 ### Sorting
 
-Results are **newest first by default**. Pass `--sort relevance` for BM25 ranking, which
-weights title matches above abstract matches — better for topical searches where you want
-the seminal papers rather than the most recent ones.
-
-`--author X` with no query terms is always date-sorted, since there is no relevance signal
-to rank by. The active sort is always shown in the results header.
-
-`browse` is always date-sorted; use `search --sort relevance` when you want ranking.
+Results are always **newest first**, in `search`, `browse` and `new` alike. There is no
+ordering to choose and nothing to configure.
 
 ### Search scope
 
