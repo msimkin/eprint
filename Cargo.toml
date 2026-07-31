@@ -3,6 +3,7 @@ name = "eprint"
 version = "0.1.0"
 edition = "2021"
 description = "Search the IACR Cryptology ePrint Archive from the command line"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

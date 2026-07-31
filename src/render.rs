@@ -285,6 +285,9 @@ pub fn render_hit(
         let _ = writeln!(out, "{pad}{}", th.paint(Tone::Url, &p.url));
     }
 
+    // Nothing of the abstract unless asked for: a single truncated line is
+    // too little to judge a paper by, and `-a` covers the case where you
+    // actually want to read it.
     if show_abstract && !hit.abstract_hl.is_empty() {
         let mut open = false;
         for line in wrap_body(&hit.abstract_hl, body_width) {
@@ -293,11 +296,6 @@ pub fn render_hit(
             } else {
                 let _ = writeln!(out, "{pad}{}", st.marked(&line, Tone::Body, &mut open));
             }
-        }
-    } else if !hit.snippet.is_empty() {
-        let mut open = false;
-        for line in wrap(&hit.snippet, body_width) {
-            let _ = writeln!(out, "{pad}{}", st.marked(&line, Tone::Body, &mut open));
         }
     }
     let _ = writeln!(out);

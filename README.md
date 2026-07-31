@@ -101,7 +101,7 @@ too.
 ```sh
 eprint "threshold ecdsa"              # search
 eprint search "threshold ecdsa"       # same thing, explicit
-eprint "fully homomorphic" -a         # show full abstracts, not snippets
+eprint "fully homomorphic" -a         # include full abstracts
 eprint "Dan Boneh" -t                 # match titles and authors only
 eprint zk --sort relevance            # best match first instead of newest
 eprint garbled --year 2024 -n 50      # filter by year, more results
@@ -170,9 +170,13 @@ stale data is the entire failure mode for a "what's new" command.
 
 ```sh
 eprint bib --update      # download / refresh the CryptoBib database
-eprint bib 2018/116      # look up one paper
+eprint bib 2018/116      # citation key only
+eprint Bib 2018/116      # the whole BibTeX record
 eprint bib               # database status
 ```
+
+`eprint Bib` (capital B) prints the complete record; `eprint bib <id> --entry` is the same
+thing. The pairing mirrors `b` and `B` in the interactive browser.
 
 Links each paper to its [CryptoBib](https://cryptobib.di.ens.fr/) citation key, preferring
 the **published version** over the preprint where one is known:
@@ -390,11 +394,9 @@ open, so existing databases upgrade in place.
 
 ## Licence
 
-This project does not yet carry a licence file. Add one before publishing if you want
-others to be able to use and contribute to the code — without one, default copyright
-applies and reuse rights are unclear.
+MIT — see [LICENSE](LICENSE).
 
-Note that the two data sources have their own terms, independent of this tool:
+The two data sources have their own terms, independent of this tool:
 
 - **IACR Cryptology ePrint Archive** — papers are licensed individually; each result shows
   its licence. Metadata is taken from the OAI-PMH interface the archive publishes for that

@@ -93,6 +93,12 @@ enum Cmd {
         #[arg(long, conflicts_with = "update")]
         entry: bool,
     },
+    /// Print the full BibTeX record (same as `bib <id> --entry`)
+    #[command(name = "Bib")]
+    BibEntry {
+        /// Paper id, e.g. 2018/116
+        id: String,
+    },
     /// Show index statistics
     Status,
     /// Show or create the configuration file
@@ -161,7 +167,7 @@ struct SearchArgs {
     /// Sort order
     #[arg(long, value_name = "date|relevance")]
     sort: Option<String>,
-    /// Print full abstracts instead of match snippets
+    /// Include full abstracts (omitted by default)
     #[arg(short = 'a', long)]
     abstracts: bool,
 
@@ -841,6 +847,7 @@ fn real_main() -> Result<()> {
             force,
             entry,
         }) => do_bib(id.as_deref(), update, force, entry),
+        Some(Cmd::BibEntry { id }) => do_bib(Some(&id), false, false, true),
         Some(Cmd::Status) => do_status(),
         Some(Cmd::Config { init }) => do_config(init),
         Some(Cmd::Show { id }) => {
