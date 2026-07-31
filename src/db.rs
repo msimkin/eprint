@@ -47,8 +47,10 @@ impl Scope {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Scope::All => "title+abstract",
-            Scope::Title => "title only",
+            // Authors are searched in both modes, so name them explicitly;
+            // the "in:" prefix marks this as *where* the query is matched.
+            Scope::All => "in: title, authors, abstract",
+            Scope::Title => "in: title, authors",
         }
     }
 }

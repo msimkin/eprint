@@ -135,7 +135,7 @@ collapse in place, and matches stay highlighted inside the expanded text.
 | `ctrl-d` / `ctrl-u`, page keys | jump |
 | `space` / `tab` | expand or collapse the abstract |
 | `a` | expand or collapse everything |
-| `t` | toggle scope: title+abstract ⇄ title only |
+| `t` | toggle where the query is matched: `in: title, authors, abstract` ⇄ `in: title, authors` |
 | `/` | edit the query — results filter live as you type |
 | `ctrl-u` | clear the query (while editing) |
 | `enter` / `o` | open the paper in your browser |
