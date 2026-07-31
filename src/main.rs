@@ -106,6 +106,9 @@ enum Cmd {
         /// Write a commented default config file if none exists
         #[arg(long)]
         init: bool,
+        /// Open the config file in $EDITOR, creating it first if needed
+        #[arg(short = 'e', long, conflicts_with = "init")]
+        edit: bool,
     },
 }
 
@@ -199,6 +202,19 @@ struct SearchArgs {
     /// Skip the automatic background index refresh
     #[arg(long, hide = true)]
     no_update: bool,
+}
+
+impl SearchArgs {
+    /// A bare `eprint`: no query and nothing narrowed down, so the output is just
+    /// the newest papers. Filters count as a search even without query terms —
+    /// `--author x` is something you asked for, not a glance at the feed.
+    fn is_latest(&self) -> bool {
+        self.query.join(" ").trim().is_empty()
+            && self.year.is_none()
+            && self.since.is_none()
+            && self.author.is_none()
+            && self.category.is_none()
+    }
 }
 
 // ---------- minimal civil-time helpers (no chrono dependency) ----------
@@ -494,7 +510,13 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         since,
         author: a.author.clone(),
         category: a.category.clone(),
-        limit: a.limit.unwrap_or(cfg.limit),
+        limit: a.limit.unwrap_or_else(|| {
+            if a.is_latest() {
+                cfg.latest_limit()
+            } else {
+                cfg.limit
+            }
+        }),
         scope,
         prefix: !a.exact,
     };
@@ -752,7 +774,35 @@ fn warn_if_stale(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-fn do_config(init: bool) -> Result<()> {
+/// `$VISUAL`/`$EDITOR` may carry arguments (`code -w`, `emacsclient -nw`), so the
+/// first word is the program and the rest are passed through.
+fn edit_config() -> Result<()> {
+    // Nothing to edit until the file exists; write the commented template so the
+    // editor opens on the settings and their explanations rather than a blank buffer.
+    let (path, created) = config::init()?;
+    if created {
+        println!("wrote {}", path.display());
+    }
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut words = editor.split_whitespace();
+    let prog = words.next().unwrap_or("vi");
+    let status = std::process::Command::new(prog)
+        .args(words)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("launching {prog} (set $EDITOR to choose another editor)"))?;
+    if !status.success() {
+        bail!("{prog} exited with {status}");
+    }
+    Ok(())
+}
+
+fn do_config(init: bool, edit: bool) -> Result<()> {
+    if edit {
+        return edit_config();
+    }
     if init {
         let (p, created) = config::init()?;
         println!();
@@ -770,12 +820,19 @@ fn do_config(init: bool) -> Result<()> {
     println!();
     match &path {
         Some(p) if exists => println!("  config file    {}", p.display()),
-        Some(p) => println!("  config file    {}  (not created; run `eprint config --init`)", p.display()),
+        Some(p) => println!("  config file    {}  (not created yet)", p.display()),
         None => println!("  config file    <could not determine a location>"),
     }
     println!("  theme          {}", cfg.theme);
     println!("  scope          {}", cfg.scope);
     println!("  limit          {}", cfg.limit);
+    match cfg.latest_limit {
+        Some(n) => println!("  latest_limit   {n}"),
+        None => println!("  latest_limit   {}  (unset; follows limit)", cfg.limit),
+    }
+    if path.is_some() {
+        println!("\n  edit with `eprint config --edit`");
+    }
     println!();
     Ok(())
 }
@@ -835,7 +892,7 @@ fn real_main() -> Result<()> {
         }) => do_bib(id.as_deref(), update, force, entry),
         Some(Cmd::BibEntry { id }) => do_bib(Some(&id), false, false, true),
         Some(Cmd::Status) => do_status(),
-        Some(Cmd::Config { init }) => do_config(init),
+        Some(Cmd::Config { init, edit }) => do_config(init, edit),
         Some(Cmd::Show { id }) => {
             let conn = db::open()?;
             let st = Style::detect(StyleOpts {

@@ -8,6 +8,9 @@ pub struct Config {
     /// all | title
     pub scope: String,
     pub limit: usize,
+    /// Results for a bare `eprint` (no query, no filters). `None` follows `limit`,
+    /// which is what every config written before this setting existed does.
+    pub latest_limit: Option<usize>,
 }
 
 impl Default for Config {
@@ -16,7 +19,14 @@ impl Default for Config {
             theme: "auto".into(),
             scope: "all".into(),
             limit: 20,
+            latest_limit: None,
         }
+    }
+}
+
+impl Config {
+    pub fn latest_limit(&self) -> usize {
+        self.latest_limit.unwrap_or(self.limit)
     }
 }
 
@@ -36,6 +46,10 @@ scope = "all"
 
 # Default number of results for `eprint search`.
 limit = 20
+
+# Results for a bare `eprint` with no query or filters, which just lists the
+# latest papers. Comment out to use `limit` for both.
+latest_limit = 10
 "#;
 
 pub fn path() -> Option<PathBuf> {
@@ -74,6 +88,13 @@ pub fn load() -> Config {
                 if let Ok(n) = v.parse::<usize>() {
                     if n > 0 {
                         c.limit = n;
+                    }
+                }
+            }
+            "latest_limit" => {
+                if let Ok(n) = v.parse::<usize>() {
+                    if n > 0 {
+                        c.latest_limit = Some(n);
                     }
                 }
             }

@@ -225,16 +225,22 @@ redistributed with this tool.
 
 ```sh
 eprint config          # show the file location and effective settings
-eprint config --init   # write a commented default file
+eprint config --edit   # open it in $EDITOR, creating it first if needed
+eprint config --init   # write a commented default file without opening it
 ```
 
 Lives at `~/.config/eprint/config.toml` (override with `$EPRINT_CONFIG`):
 
 ```toml
-theme = "auto"    # auto | dark | light | mono
-scope = "all"     # all | title
-limit = 20
+theme = "auto"       # auto | dark | light | mono
+scope = "all"        # all | title
+limit = 20           # results for a search
+latest_limit = 10    # results for a bare `eprint`; omit to follow `limit`
 ```
+
+`latest_limit` covers only the no-argument case — a bare `eprint`, which lists the newest
+papers. Any query term or filter (`--author`, `--year`, `--since`, `--category`) makes it a
+search and uses `limit`. `-n` overrides both.
 
 Results list authors only. The date joins them once an abstract is open (`space` in
 `browse`, `-a` in `search`). Category and licence are shown by `eprint show`.
