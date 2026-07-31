@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Local scratch
+*.bib
+*.db
+*.db-wal
+*.db-shm
+
+# Local tool settings
+.claude/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
