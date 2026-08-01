@@ -9,6 +9,7 @@
 
 # Local tool settings
 .claude/
+CLAUDE.md
 
 # Editor / OS noise
 .DS_Store
