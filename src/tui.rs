@@ -56,6 +56,9 @@ struct App {
     /// `w`: restrict the whole listing, and any query typed into it, to papers
     /// matching a watch.
     watched_only: bool,
+    /// The saved searches, from the config file. Re-read when `w` is pressed, so
+    /// an edit in another shell is picked up without restarting.
+    watch_list: Vec<db::Watch>,
     /// Age of the CryptoBib data in days, when it is old enough to mention.
     bib_stale_days: Option<i64>,
 }
@@ -80,7 +83,7 @@ impl App {
                 self.total = db::count_matches(conn, &q).unwrap_or(hits.len());
                 let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
                 self.bib = db::bib_map(conn, &ids).unwrap_or_default();
-                self.watched = db::watched_ids(conn, &ids).unwrap_or_default();
+                self.watched = db::watched_ids(conn, &ids, &self.watch_list).unwrap_or_default();
                 self.hits = hits;
                 self.status = None;
             }
@@ -303,6 +306,7 @@ pub fn run(
     theme: Theme,
     scope: Scope,
     bib_stale_days: Option<i64>,
+    watch_list: Vec<db::Watch>,
 ) -> Result<()> {
     let mut app = App {
         query: initial,
@@ -314,6 +318,7 @@ pub fn run(
         expanded: HashSet::new(),
         watched: HashSet::new(),
         watched_only: false,
+        watch_list,
         status: None,
         filters,
         theme,
@@ -505,7 +510,8 @@ pub fn run(
                 } else {
                     // Re-stage on every switch-on, so watches added in another
                     // shell since this session started are picked up.
-                    match db::stage_watched(&conn, WATCH_STAGE_CAP) {
+                    app.watch_list = crate::config::load().watches;
+                    match db::stage_watched(&conn, &app.watch_list, WATCH_STAGE_CAP) {
                         Ok(0) => {
                             app.status =
                                 Some("no watches yet — `eprint watch add \"topic\"`".to_string())

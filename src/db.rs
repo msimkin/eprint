@@ -136,19 +136,9 @@ CREATE TABLE IF NOT EXISTS bib (
   PRIMARY KEY (eprint_id, kind)
 );
 
--- Saved searches. A watch is a `Query` without a limit; `eprint new` replays
--- each one over the papers that arrived since your last look. Empty strings
--- rather than NULL so the unique index treats "unset" as one value.
-CREATE TABLE IF NOT EXISTS watches (
-  id       INTEGER PRIMARY KEY,
-  terms    TEXT NOT NULL DEFAULT '',
-  author   TEXT NOT NULL DEFAULT '',
-  category TEXT NOT NULL DEFAULT '',
-  scope    TEXT NOT NULL DEFAULT 'all',
-  added    TEXT NOT NULL DEFAULT ''
-);
-CREATE UNIQUE INDEX IF NOT EXISTS watches_uniq
-  ON watches(terms, author, category, scope);
+-- Saved searches are *not* here: they live in the config file, so that copying it
+-- carries a whole setup to another machine. `legacy_watches` reads the table an
+-- older build created, once, and then drops it.
 
 -- Scratch space for `browse`'s watched-only filter: the union of every watch's
 -- matches, so the filter is one `IN (SELECT …)` instead of thousands of bound
@@ -347,13 +337,28 @@ pub fn added_since(conn: &Connection, watermark: &str, limit: usize) -> Result<V
     Ok(out)
 }
 
-pub fn count_added_since(conn: &Connection, watermark: &str) -> Result<usize> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM papers WHERE added > ?1",
-        [watermark],
-        |r| r.get(0),
+/// The most recently *arrived* papers, whatever the watermark says. The floor under
+/// a bare `eprint`: when nothing is new there is still something to look at.
+pub fn recent_arrivals(conn: &Connection, limit: usize) -> Result<Vec<Hit>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,title,authors,abstract,category,date,year,rights,url
+         FROM papers ORDER BY added DESC, date DESC LIMIT ?1",
     )?;
-    Ok(n as usize)
+    let rows = stmt.query_map([limit as i64], |r| {
+        let paper = row_to_paper(r, 0)?;
+        let abstract_hl = paper.abstract_.clone();
+        let title_hl = paper.title.clone();
+        Ok(Hit {
+            paper,
+            abstract_hl,
+            title_hl,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
@@ -400,17 +405,30 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// How the watch reads back to the user, in the same shape they typed it.
+    /// How the watch reads back to the user, in the same shape they typed it —
+    /// and also how it is written to the config file, so this has to round-trip
+    /// through `config`'s parser exactly.
     pub fn label(&self) -> String {
+        // A flag value containing a space must come back quoted, or reading the
+        // line again splits `--author Dan Boneh` into author `Dan` plus a stray
+        // query term `Boneh`. Terms keep whatever quoting they already carry,
+        // because FTS5 reads `"a b"` as a phrase.
+        let arg = |v: &str| {
+            if v.contains(char::is_whitespace) && !v.starts_with('"') {
+                format!("\"{v}\"")
+            } else {
+                v.to_string()
+            }
+        };
         let mut parts: Vec<String> = Vec::new();
         if !self.terms.trim().is_empty() {
             parts.push(self.terms.clone());
         }
         if let Some(a) = &self.author {
-            parts.push(format!("--author {a}"));
+            parts.push(format!("--author {}", arg(a)));
         }
         if let Some(c) = &self.category {
-            parts.push(format!("--category {c}"));
+            parts.push(format!("--category {}", arg(c)));
         }
         if self.scope == Scope::Title {
             parts.push("--title".to_string());
@@ -483,9 +501,9 @@ fn matching_ids(conn: &Connection, q: &Query) -> Result<Vec<String>> {
 /// Fill `watched_stage` with every id matching some watch, and report how many.
 /// Cheap to repeat, so callers can re-stage whenever the watch list may have
 /// changed rather than tracking that themselves.
-pub fn stage_watched(conn: &Connection, cap_per_watch: usize) -> Result<usize> {
+pub fn stage_watched(conn: &Connection, watches: &[Watch], cap_per_watch: usize) -> Result<usize> {
     conn.execute("DELETE FROM watched_stage", [])?;
-    for w in watch_list(conn)? {
+    for w in watches {
         // A watch that no longer parses contributes nothing rather than
         // emptying the filter.
         if let Ok(ids) = matching_ids(conn, &w.query(None, cap_per_watch)) {
@@ -502,19 +520,19 @@ pub fn stage_watched(conn: &Connection, cap_per_watch: usize) -> Result<usize> {
 /// Which of `ids` match at least one saved watch. One small FTS query per watch,
 /// restricted to the ids already on screen, so this costs the same whether the
 /// caller is showing 5 results or 500.
-pub fn watched_ids(conn: &Connection, ids: &[String]) -> Result<HashSet<String>> {
+pub fn watched_ids(
+    conn: &Connection,
+    ids: &[String],
+    watches: &[Watch],
+) -> Result<HashSet<String>> {
     let mut out = HashSet::new();
-    if ids.is_empty() {
-        return Ok(out);
-    }
-    let watches = watch_list(conn)?;
-    if watches.is_empty() {
+    if ids.is_empty() || watches.is_empty() {
         return Ok(out);
     }
     // `browse` loads 500 ids by default and `-n` can raise that, so chunk rather
     // than betting on SQLite's bound-parameter ceiling.
     for chunk in ids.chunks(400) {
-        for w in &watches {
+        for w in watches {
             let mut q = w.query(None, chunk.len());
             q.only_ids = Some(chunk.to_vec());
             // A watch with a broken expression must not break the listing it is
@@ -529,42 +547,21 @@ pub fn watched_ids(conn: &Connection, ids: &[String]) -> Result<HashSet<String>>
     Ok(out)
 }
 
-pub fn watch_add(
-    conn: &Connection,
-    terms: &str,
-    author: Option<&str>,
-    category: Option<&str>,
-    scope: Scope,
-    now: &str,
-) -> Result<Option<i64>> {
-    let scope_s = match scope {
-        Scope::Title => "title",
-        Scope::All => "all",
-    };
-    let n = conn.execute(
-        "INSERT OR IGNORE INTO watches (terms,author,category,scope,added)
-         VALUES (?1,?2,?3,?4,?5)",
-        rusqlite::params![
-            terms.trim(),
-            author.unwrap_or("").trim(),
-            category.unwrap_or("").trim(),
-            scope_s,
-            now
-        ],
+/// Watches used to live in this file, one row per saved search. They are settings,
+/// not index data, so they moved to the config file where a single copy carries a
+/// whole setup to another machine. This reads whatever an older build left behind,
+/// once, so `main` can write it out and then call `drop_legacy_watches`.
+pub fn legacy_watches(conn: &Connection) -> Result<Vec<Watch>> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='watches'",
+        [],
+        |r| r.get(0),
     )?;
-    // Zero rows means the unique index rejected a duplicate, which the caller
-    // reports rather than silently pretending to have saved something.
-    Ok(if n == 0 {
-        None
-    } else {
-        Some(conn.last_insert_rowid())
-    })
-}
-
-pub fn watch_list(conn: &Connection) -> Result<Vec<Watch>> {
-    let mut stmt = conn.prepare(
-        "SELECT id,terms,author,category,scope FROM watches ORDER BY id",
-    )?;
+    if present == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        conn.prepare("SELECT id,terms,author,category,scope FROM watches ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         let author: String = r.get(2)?;
         let category: String = r.get(3)?;
@@ -584,12 +581,10 @@ pub fn watch_list(conn: &Connection) -> Result<Vec<Watch>> {
     Ok(out)
 }
 
-pub fn watch_delete(conn: &Connection, id: i64) -> Result<bool> {
-    Ok(conn.execute("DELETE FROM watches WHERE id = ?1", [id])? > 0)
-}
-
-pub fn watch_clear(conn: &Connection) -> Result<usize> {
-    Ok(conn.execute("DELETE FROM watches", [])?)
+/// Only after the config has been written, so a failed migration can be retried.
+pub fn drop_legacy_watches(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS watches;")?;
+    Ok(())
 }
 
 pub struct Query<'a> {

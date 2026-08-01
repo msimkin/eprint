@@ -146,8 +146,8 @@ too.
 ## Use
 
 ```sh
+eprint                                # papers that arrived since you last looked
 eprint "threshold ecdsa"              # search
-eprint search "threshold ecdsa"       # same thing, explicit
 eprint "fully homomorphic" -a         # include full abstracts
 eprint "Dan Boneh" -t                 # match titles and authors only
 eprint garbled --year 2024 -n 50      # filter by year, more results
@@ -155,13 +155,15 @@ eprint --author Boneh --since 2y      # browse without a query
 eprint --category "Public-key" -n 5   # filter by IACR category
 eprint show 2026/1538                 # one paper in full
 eprint open 2026/1538                 # the PDF — your local copy once you have one
-eprint new                            # papers that arrived since you last looked
-eprint new --since 30d --peek         # a window, without moving the marker
 eprint watch add "lattice OR LWE"     # mark matching papers with a ✱ everywhere
+eprint bib 2018/116 --entry           # the whole BibTeX record
 eprint status                         # index stats
 eprint update                         # refresh now
 eprint update --full                  # rebuild from scratch
 ```
+
+There is no `search` subcommand: a query is just the first argument. Anything you type is
+therefore treated as query terms, so `eprint search foo` searches for the words "search foo".
 
 ## Interactive browser
 
@@ -201,21 +203,33 @@ support — press `enter` instead.
 ## Keeping up
 
 ```sh
-eprint new                     # arrivals since you last ran it
-eprint new --since 30d         # an explicit window instead
-eprint new --peek              # look without advancing the marker
+eprint                         # arrivals since you last ran it, never empty
+eprint -n 20                   # exactly 20, batch or not
 ```
+
+A bare `eprint` — no query, no filters — is the feed rather than a search, and it always shows
+something:
+
+- **More arrived than `latest_limit`?** You get the whole batch. Seventeen papers means seventeen
+  lines, not a number chosen in advance.
+- **Fewer, or nothing new?** The list is topped up with the most recent arrivals to `latest_limit`
+  (10 by default), and the header says how many are actually new — `2 new since 2026-08-01`, or
+  `nothing new since 2026-08-01`.
+- **`-n N`** overrides both as an exact count.
+
+So `latest_limit` is a floor, not a ceiling.
 
 Papers carry an `added` timestamp recording when they first entered *your* index, which is
 what this filters on. A paper's own date can predate its arrival here, so filtering by that
 would silently skip late-published submissions.
 
-Unlike `search`, this refreshes the index synchronously when it is more than an hour old —
-stale data is the entire failure mode for a "what's new" command.
+The index refreshes in the background, the same as for a search, so this stays instant even when
+the local copy is stale. The batch replay below is what makes that safe: a slightly old answer is
+shown again next time rather than lost.
 
-**The last batch sticks around.** ePrint posts in bursts, so most runs of `new` find nothing
-at all. Rather than print "nothing new" for the rest of the day, `new` shows the last batch it
-found again, and says so:
+**The last batch sticks around.** ePrint posts in bursts, so most runs find nothing at all.
+Rather than print "nothing new" for the rest of the day, the feed shows the last batch it found
+again, and says so:
 
 ```
 4 results  last batch, from 2026-07-30 · nothing new yet
@@ -223,8 +237,7 @@ found again, and says so:
 
 When the archive does move, you get only the genuinely new papers and *those* become the
 remembered batch — so each burst is shown until the next one replaces it, and nothing is ever
-silently skipped. `--peek` still changes no state, and `--since` is an ad-hoc question about a
-specific window: it neither replays nor overwrites the remembered batch.
+silently skipped.
 
 ### Watches
 
@@ -267,21 +280,40 @@ In `browse`, **`w`** filters the listing down to watched papers, and any query y
 searches within that subset. The header shows `· watched only` while it is on; `w` again
 restores everything.
 
+Watches live in the **config file**, one `watch` line each, written exactly as you would type
+them:
+
+```toml
+watch = "lattice OR LWE"
+watch = --author Boneh
+watch = zk --category "Public-key"
+watch = "proof of work" --title
+```
+
+So copying `~/.config/eprint/config.toml` to another machine copies your whole setup — theme,
+limits and watches together — and you can add or remove them by hand with `eprint config --edit`
+as easily as with `watch add`. `watch add`/`watch rm` rewrite just those lines and leave the rest
+of the file, comments included, untouched. Watch numbers are positions in the file, so they close
+up after a removal.
+
 Watches store no year filter — that would date a standing watch — and the count `eprint
 watch` shows next to each one is its total across the whole index, which is the quick check
 that a new expression actually matches something.
 
+If you used an earlier version, your watches were kept in the index database; the first run of a
+newer build moves them into the config for you and says so.
+
 ## Citation keys (CryptoBib)
 
 ```sh
-eprint bib --update      # download / refresh the CryptoBib database
-eprint bib 2018/116      # citation key only
-eprint Bib 2018/116      # the whole BibTeX record
-eprint bib               # database status
+eprint bib --update          # download / refresh the CryptoBib database
+eprint bib 2018/116          # citation key only
+eprint bib 2018/116 --entry  # the whole BibTeX record
+eprint bib                   # database status
 ```
 
-`eprint Bib` (capital B) prints the complete record; `eprint bib <id> --entry` is the same
-thing. The pairing mirrors `b` and `B` in the interactive browser.
+`--entry` prints the complete record rather than just the key — the command-line equivalent of
+`B` in the interactive browser, where `b` copies the key and `B` the whole entry.
 
 Links each paper to its [CryptoBib](https://cryptobib.di.ens.fr/) citation key, preferring
 the **published version** over the preprint where one is known:
@@ -342,6 +374,7 @@ theme = "auto"       # auto | dark | light | mono
 scope = "all"        # all | title
 limit = 20           # results for a search
 latest_limit = 10    # results for a bare `eprint`
+watch = --author Boneh    # zero or more; see Watches below
 ```
 
 `latest_limit` covers only the no-argument case — a bare `eprint`, which lists the newest

@@ -21,6 +21,9 @@ const STALE_SECS: u64 = 24 * 3600;
 const ATTEMPT_COOLDOWN_SECS: u64 = 3600;
 /// Re-request a small overlap window so nothing slips through the cracks.
 const OVERLAP_SECS: u64 = 2 * 24 * 3600;
+/// Sanity bound on one arrival batch, for someone coming back after a long
+/// absence. Not a display limit: `latest_limit` is a floor, not a cap.
+const BATCH_MAX: usize = 500;
 /// Set on a detached child to make it file a downloaded PDF instead of running a
 /// command. An env marker rather than a subcommand, hidden or otherwise, so the
 /// CLI surface stays exactly as it was.
@@ -33,6 +36,8 @@ const ADOPT_TITLE_VAR: &str = "EPRINT_ADOPT_TITLE";
     version,
     about = "Search the IACR Cryptology ePrint Archive from the command line",
     long_about = "Search the IACR Cryptology ePrint Archive.\n\n\
+        `eprint <query>` searches; a bare `eprint` shows the papers that have\n\
+        arrived since you last looked.\n\n\
         Metadata comes from the archive's OAI-PMH interface and is cached locally,\n\
         so searches are instant and offline. Full-text PDFs are licensed per paper\n\
         and are opened in your browser rather than downloaded in bulk.",
@@ -47,10 +52,39 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Search titles, authors, abstracts and categories
-    Search(SearchArgs),
     /// Interactive full-screen browser
     Browse(BrowseArgs),
+    /// Open a paper's PDF — your local copy once you have one
+    Open {
+        /// Paper id, e.g. 2026/1539, or just 1539 for this year
+        id: String,
+    },
+    /// Show one paper in full
+    Show {
+        /// Paper id, e.g. 2026/1539, or just 1539 for this year
+        id: String,
+    },
+    /// Saved searches that mark the papers you care about
+    Watch {
+        #[command(subcommand)]
+        action: Option<WatchCmd>,
+    },
+    /// Citation keys from CryptoBib — add `--entry` for the whole record
+    Bib {
+        /// Paper id, e.g. 2015/123 (bare 1539 means this year). Omit for status
+        id: Option<String>,
+        /// Print the full BibTeX record instead of just the key
+        #[arg(long, conflicts_with = "update")]
+        entry: bool,
+        /// Download or refresh the CryptoBib database
+        #[arg(long)]
+        update: bool,
+        /// Re-download even if unchanged
+        #[arg(long, requires = "update")]
+        force: bool,
+    },
+    /// Show index statistics
+    Status,
     /// Refresh the local index from the ePrint OAI-PMH feed
     Update {
         /// Re-harvest the entire archive instead of only what changed
@@ -60,55 +94,6 @@ enum Cmd {
         #[arg(long)]
         quiet: bool,
     },
-    /// Show one paper in full
-    Show {
-        /// Paper id, e.g. 2026/1539, or just 1539 for this year
-        id: String,
-    },
-    /// Open a paper's PDF — your local copy once you have one
-    Open {
-        /// Paper id, e.g. 2026/1539, or just 1539 for this year
-        id: String,
-    },
-    /// Show papers that arrived since you last looked
-    New {
-        /// Maximum results to show
-        #[arg(short = 'n', long, default_value_t = 50, value_parser = positive)]
-        limit: usize,
-        /// Show without moving the "last seen" marker
-        #[arg(long)]
-        peek: bool,
-        /// Override the starting point (YYYY-MM-DD, or e.g. 7d)
-        #[arg(long)]
-        since: Option<String>,
-    },
-    /// Saved searches that `eprint new` checks for you
-    Watch {
-        #[command(subcommand)]
-        action: Option<WatchCmd>,
-    },
-    /// Look up BibTeX citation keys (CryptoBib)
-    Bib {
-        /// Paper id, e.g. 2015/123 (bare 1539 means this year). Omit for status
-        id: Option<String>,
-        /// Download or refresh the CryptoBib database
-        #[arg(long)]
-        update: bool,
-        /// Re-download even if unchanged
-        #[arg(long, requires = "update")]
-        force: bool,
-        /// Print the full BibTeX record instead of just the key
-        #[arg(long, conflicts_with = "update")]
-        entry: bool,
-    },
-    /// Print the full BibTeX record (same as `bib <id> --entry`)
-    #[command(name = "Bib")]
-    BibEntry {
-        /// Paper id, e.g. 2018/116, or just 116 for this year
-        id: String,
-    },
-    /// Show index statistics
-    Status,
     /// Show or create the configuration file
     Config {
         /// Write a commented default config file if none exists
@@ -636,7 +621,7 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
     render::render_header(&mut out, hits.len(), total, age, scope.label(), st);
     let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
-    let watched = db::watched_ids(&conn, &ids).unwrap_or_default();
+    let watched = db::watched_ids(&conn, &ids, &watches(&conn)).unwrap_or_default();
     for hit in &hits {
         let w = watched.contains(&hit.paper.id);
         render::render_hit(&mut out, hit, st, a.abstracts, bibs.get(&hit.paper.id), w);
@@ -678,7 +663,8 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
     );
     let scope = effective_scope(a.title, a.scope.as_deref(), &cfg);
     let stale = bib_stale_days(&conn)?;
-    tui::run(conn, a.query.join(" "), filters, theme, scope, stale)
+    let watch_list = watches(&conn);
+    tui::run(conn, a.query.join(" "), filters, theme, scope, stale, watch_list)
 }
 
 /// Days since the CryptoBib data was refreshed, but only once that exceeds
@@ -703,60 +689,53 @@ fn bib_stale_days(conn: &rusqlite::Connection) -> Result<Option<i64>> {
     })
 }
 
-fn do_new(limit: usize, peek: bool, since: Option<&str>) -> Result<()> {
+/// A bare `eprint`: the papers that have arrived since you last looked. Refreshes
+/// in the background like `search` rather than blocking — this is the most-typed
+/// invocation, and the batch replay below means a slightly stale answer is shown
+/// again next time rather than lost.
+fn do_feed(a: &SearchArgs) -> Result<()> {
     let cfg = config::load();
     let conn = db::open()?;
     if db::count(&conn)? == 0 {
         drop(conn);
         eprintln!("No local index yet — building it now (one time only).");
         do_update(true, false)?;
-        return do_new(limit, peek, since);
+        return do_feed(a);
     }
-    // Refresh first: "what's new" is the one command where stale data is the
-    // whole failure mode, so this blocks rather than backgrounding.
-    if index_age(&conn)?.map(|s| s > 3600).unwrap_or(true) {
-        drop(conn);
-        do_update(false, false)?;
-        return do_new_inner(limit, peek, since, &cfg);
+    if !a.no_update && index_age(&conn)?.map(|s| s as u64 > STALE_SECS).unwrap_or(true) {
+        let _ = spawn_background_refresh(&conn);
     }
     drop(conn);
-    do_new_inner(limit, peek, since, &cfg)
+    do_feed_inner(a, &cfg)
 }
 
-fn do_new_inner(
-    limit: usize,
-    peek: bool,
-    since: Option<&str>,
-    cfg: &config::Config,
-) -> Result<()> {
+fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
     let conn = db::open()?;
-    let st = Style::detect(StyleOpts {
-        plain: false,
-        force_color: false,
-        urls: None,
-        theme: cfg.theme.clone(),
-    });
+    let st = style_for(a, cfg);
+    // `latest_limit` is a *floor*, not a cap: a quiet day still shows something, and
+    // a big batch is shown whole rather than truncated to a number that has nothing
+    // to do with how much arrived. `-n` overrides it as an exact count.
+    let floor = a.limit.unwrap_or(cfg.latest_limit);
 
-    let watermark = match since {
-        Some(s) => resolve_since(s)?,
-        None => db::meta_get(&conn, harvest::KEY_LAST_SEEN)?
-            .unwrap_or_else(|| format_iso(now() - 7 * 86400)),
-    };
+    let watermark = db::meta_get(&conn, harvest::KEY_LAST_SEEN)?
+        .unwrap_or_else(|| format_iso(now() - 7 * 86400));
 
     let day = |ts: &str| ts.chars().take(10).collect::<String>();
 
-    let mut hits = db::added_since(&conn, &watermark, limit)?;
+    // No cap on the batch itself, only a sanity bound for the case where someone
+    // returns from a long absence.
+    let mut hits = db::added_since(&conn, &watermark, BATCH_MAX)?;
+    let fresh_count = hits.len();
     // The window whose papers are on screen: the fresh diff normally, the
     // remembered one when there is no fresh diff to show.
     let mut window = watermark.clone();
     let mut replayed = false;
 
     // ePrint posts in bursts, so most runs find nothing. Rather than report an
-    // empty diff, show the last one again until the archive actually moves. An
-    // explicit --since is a question about a specific window, so it opts out.
-    if hits.is_empty() && since.is_none() {
+    // empty diff, show the last one again until the archive actually moves.
+    if hits.is_empty() {
         if let Some(prev) = db::meta_get(&conn, harvest::KEY_NEW_BATCH)? {
-            let again = db::added_since(&conn, &prev, limit)?;
+            let again = db::added_since(&conn, &prev, BATCH_MAX)?;
             if !again.is_empty() {
                 hits = again;
                 window = prev;
@@ -764,45 +743,98 @@ fn do_new_inner(
             }
         }
     }
-    let total = db::count_added_since(&conn, &window)?;
+
+    // Still short of the floor — either nothing is new or the batch was tiny — so
+    // top up with the most recent arrivals. They are ordered the same way, so the
+    // new ones stay at the top and the rest are simply context.
+    let topped_up = hits.len() < floor;
+    if topped_up {
+        hits = db::recent_arrivals(&conn, floor)?;
+    }
+    // With `-n`, the number given wins outright, batch or not.
+    if let Some(n) = a.limit {
+        hits.truncate(n);
+    }
 
     if hits.is_empty() {
-        println!("\nNothing new since {}.\n", day(&watermark));
-    } else {
-        let label = if replayed {
-            // Name what is on screen, and when it stopped being news. Same-day
-            // repeats read as a typo, so collapse them.
-            let (batch, seen) = (day(&window), day(&watermark));
-            if batch == seen {
-                format!("last batch, from {batch} · nothing new yet")
-            } else {
-                format!("last batch, from {batch} · nothing new since {seen}")
-            }
-        } else {
-            format!("since {}", day(&window))
-        };
-        let mut out = String::new();
-        render::render_header(&mut out, hits.len(), total, None, &label, &st);
-        let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
-        let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
-        let watched = db::watched_ids(&conn, &ids).unwrap_or_default();
-        for hit in &hits {
-            let w = watched.contains(&hit.paper.id);
-            render::render_hit(&mut out, hit, &st, false, bibs.get(&hit.paper.id), w);
-        }
-        page(&out, &st, false)?;
+        // Only reachable on an empty index, which the caller has already handled.
+        println!("\nNothing to show yet — try `eprint update`.\n");
+        return Ok(());
     }
 
-    if !peek {
-        // Remember a *fresh* diff so later runs can replay it. Not a replay (the
-        // pointer already names that window) and not an explicit --since window,
-        // which would overwrite the real batch with an arbitrary one.
-        if !replayed && !hits.is_empty() && since.is_none() {
-            db::meta_set(&conn, harvest::KEY_NEW_BATCH, &watermark)?;
+    // Order matters: a topped-up listing is no longer "the last batch", even if a
+    // replay is what it was topped up from, so that case is reported first.
+    let label = if topped_up {
+        match fresh_count {
+            0 => format!("nothing new since {}", day(&watermark)),
+            n => format!("{n} new since {}", day(&watermark)),
         }
-        db::meta_set(&conn, harvest::KEY_LAST_SEEN, &format_iso(now()))?;
+    } else if replayed {
+        // Name what is on screen, and when it stopped being news. Same-day
+        // repeats read as a typo, so collapse them.
+        let (batch, seen) = (day(&window), day(&watermark));
+        if batch == seen {
+            format!("last batch, from {batch} · nothing new yet")
+        } else {
+            format!("last batch, from {batch} · nothing new since {seen}")
+        }
+    } else {
+        format!("since {}", day(&window))
+    };
+
+    if a.json {
+        println!("{}", render::json_of(&hits));
+        return Ok(());
     }
+    let mut out = String::new();
+    render::render_header(&mut out, hits.len(), hits.len(), None, &label, &st);
+    let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
+    let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
+    let watched = db::watched_ids(&conn, &ids, &watches(&conn)).unwrap_or_default();
+    for hit in &hits {
+        let w = watched.contains(&hit.paper.id);
+        render::render_hit(&mut out, hit, &st, a.abstracts, bibs.get(&hit.paper.id), w);
+    }
+    page(&out, &st, a.no_pager)?;
+
+    // Remember a *fresh* diff so later runs can replay it; a replay needs no
+    // pointer write, since the pointer already names that window, and a topped-up
+    // listing is not a batch at all.
+    if fresh_count > 0 {
+        db::meta_set(&conn, harvest::KEY_NEW_BATCH, &watermark)?;
+    }
+    db::meta_set(&conn, harvest::KEY_LAST_SEEN, &format_iso(now()))?;
     Ok(())
+}
+
+/// The saved searches, from the config file — plus the one-time move of anything an
+/// older build left in the index. Everything that reads watches goes through here,
+/// so the migration cannot be missed by one code path.
+fn watches(conn: &rusqlite::Connection) -> Vec<db::Watch> {
+    let from_config = config::load().watches;
+    if !from_config.is_empty() {
+        return from_config;
+    }
+    let legacy = db::legacy_watches(conn).unwrap_or_default();
+    if legacy.is_empty() {
+        return legacy;
+    }
+    let labels: Vec<String> = legacy.iter().map(|w| w.label()).collect();
+    match config::set_watches(&labels) {
+        Ok(path) => {
+            // Only drop the table once the config is safely written, so a failure
+            // here leaves the watches recoverable and the move is retried.
+            let _ = db::drop_legacy_watches(conn);
+            eprintln!(
+                "moved {} watch{} into {} — they travel with that file now",
+                labels.len(),
+                if labels.len() == 1 { "" } else { "es" },
+                path.display()
+            );
+            config::load().watches
+        }
+        Err(_) => legacy,
+    }
 }
 
 fn do_watch(action: Option<WatchCmd>) -> Result<()> {
@@ -827,32 +859,44 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
             }
             let cfg = config::load();
             let scope = effective_scope(title, None, &cfg);
-            match db::watch_add(
-                &conn,
-                &terms,
-                author.as_deref(),
-                category.as_deref(),
+            let new = db::Watch {
+                id: 0,
+                terms,
+                author,
+                category,
                 scope,
-                &format_iso(now()),
-            )? {
-                Some(_) => {
-                    println!();
-                    list_watches(&conn)?;
-                }
-                None => bail!("you are already watching that"),
             }
+            .label();
+            let mut labels: Vec<String> = watches(&conn).iter().map(|w| w.label()).collect();
+            if labels.contains(&new) {
+                bail!("you are already watching that");
+            }
+            labels.push(new);
+            config::set_watches(&labels)?;
+            println!();
+            list_watches(&conn)?;
         }
         WatchCmd::Rm { id, all } => {
+            let existing = watches(&conn);
             if all {
-                let n = db::watch_clear(&conn)?;
+                let n = existing.len();
+                config::set_watches(&[])?;
                 println!("\n  removed {n} watch{}\n", if n == 1 { "" } else { "es" });
             } else {
                 let Some(id) = id else {
                     bail!("which watch? give a number from `eprint watch`, or --all");
                 };
-                if !db::watch_delete(&conn, id)? {
+                // Numbers are positions in the file, so they close up after a
+                // removal — which is what `eprint watch` shows you next.
+                if id < 1 || id as usize > existing.len() {
                     bail!("no watch {id} — `eprint watch` lists them");
                 }
+                let labels: Vec<String> = existing
+                    .iter()
+                    .filter(|w| w.id != id)
+                    .map(|w| w.label())
+                    .collect();
+                config::set_watches(&labels)?;
                 println!();
                 list_watches(&conn)?;
             }
@@ -866,7 +910,7 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
 }
 
 fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
-    let watches = db::watch_list(conn)?;
+    let watches = watches(conn);
     if watches.is_empty() {
         println!("  No watches yet. Save one with:\n");
         println!("    eprint watch add \"lattice OR LWE\"");
@@ -881,7 +925,14 @@ fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
         let total = db::count_matches(conn, &w.query(None, 1)).unwrap_or(0);
         println!("  {:<3} {:<44} {total} in the index", w.id, w.label());
     }
-    println!("\n  matches are marked ✱ in search, `new` and `browse` · `w` in browse filters to them\n");
+    println!("\n  matches are marked ✱ in search, `new` and `browse` · `w` in browse filters to them");
+    if let Some(p) = config::path() {
+        // Naming the file is the point of keeping them there: copy it and the
+        // whole setup follows.
+        println!("  stored in {}\n", p.display());
+    } else {
+        println!();
+    }
     Ok(())
 }
 
@@ -1038,6 +1089,15 @@ fn do_config(init: bool, edit: bool) -> Result<()> {
     println!("  scope          {}", cfg.scope);
     println!("  limit          {}", cfg.limit);
     println!("  latest_limit   {}", cfg.latest_limit);
+    println!(
+        "  watches        {} ({})",
+        cfg.watches.len(),
+        if cfg.watches.is_empty() {
+            "eprint watch add \"topic\"".to_string()
+        } else {
+            "eprint watch".to_string()
+        }
+    );
     if path.is_some() {
         println!("\n  edit with `eprint config --edit`");
     }
@@ -1094,11 +1154,11 @@ fn real_main() -> Result<()> {
     }
     let cli = Cli::parse();
     match cli.cmd {
+        // No query and no filters is not an empty search, it is "what is new?".
+        None if cli.search.is_latest() => do_feed(&cli.search),
         None => do_search(&cli.search),
-        Some(Cmd::Search(a)) => do_search(&a),
         Some(Cmd::Browse(a)) => do_browse(&a),
         Some(Cmd::Update { full, quiet }) => do_update(full, quiet),
-        Some(Cmd::New { limit, peek, since }) => do_new(limit, peek, since.as_deref()),
         Some(Cmd::Watch { action }) => do_watch(action),
         Some(Cmd::Bib {
             id,
@@ -1106,7 +1166,6 @@ fn real_main() -> Result<()> {
             force,
             entry,
         }) => do_bib(id.as_deref(), update, force, entry),
-        Some(Cmd::BibEntry { id }) => do_bib(Some(&id), false, false, true),
         Some(Cmd::Status) => do_status(),
         Some(Cmd::Config { init, edit }) => do_config(init, edit),
         Some(Cmd::Show { id }) => {
