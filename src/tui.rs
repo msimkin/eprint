@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 
 use crate::db::{self, Hit, Query, Scope, MARK_END, MARK_START};
-use crate::render::{full_authors, short_authors, wrap, wrap_body};
+use crate::render::{full_authors, short_authors, wrap, wrap_body, BADGE, BADGE_W};
 use crate::theme::{Theme, Tone};
 
 #[derive(Default, Clone)]
@@ -25,6 +25,10 @@ pub struct Filters {
 }
 
 const ID_W: usize = 11;
+/// Per-watch ceiling when staging the watched-only filter. Generous enough that
+/// no realistic watch is truncated, bounded so a pathological one cannot stage
+/// the whole archive.
+const WATCH_STAGE_CAP: usize = 20_000;
 /// Width of the "❯ " selection marker and the "▸ " expand arrow.
 const MARKER_W: usize = 2;
 const ARROW_W: usize = 2;
@@ -47,6 +51,11 @@ struct App {
     scope: Scope,
     /// eprint id -> (citation key, is_published)
     bib: HashMap<String, (String, bool)>,
+    /// Ids on screen that match a saved watch.
+    watched: HashSet<String>,
+    /// `w`: restrict the whole listing, and any query typed into it, to papers
+    /// matching a watch.
+    watched_only: bool,
     /// Age of the CryptoBib data in days, when it is old enough to mention.
     bib_stale_days: Option<i64>,
 }
@@ -57,6 +66,9 @@ impl App {
             terms: &self.query,
             year: self.filters.year,
             since: self.filters.since.clone(),
+            added_since: None,
+            only_ids: None,
+            only_watched: self.watched_only,
             author: self.filters.author.clone(),
             category: self.filters.category.clone(),
             limit: self.filters.limit,
@@ -68,6 +80,7 @@ impl App {
                 self.total = db::count_matches(conn, &q).unwrap_or(hits.len());
                 let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
                 self.bib = db::bib_map(conn, &ids).unwrap_or_default();
+                self.watched = db::watched_ids(conn, &ids).unwrap_or_default();
                 self.hits = hits;
                 self.status = None;
             }
@@ -140,6 +153,7 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         let is_sel = i == app.selected;
         let is_open = app.expanded.contains(&p.id);
 
+        let is_watched = app.watched.contains(&p.id);
         let marker = if is_sel { "❯ " } else { "  " };
         let arrow = if is_open { "▾ " } else { "▸ " };
         let title_src = if hit.title_hl.is_empty() {
@@ -147,7 +161,17 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         } else {
             &hit.title_hl
         };
-        let title_lines = wrap(title_src, body_w);
+        // Matches `render_hit`: only a watched title gives up width, for the
+        // badge that trails its last line.
+        let title_lines = wrap(
+            title_src,
+            if is_watched {
+                body_w.saturating_sub(BADGE_W)
+            } else {
+                body_w
+            },
+        );
+        let last_title = title_lines.len() - 1;
 
         let mut title_s = th.style(Tone::Title);
         if is_sel {
@@ -158,14 +182,23 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         let mut head = vec![
             Span::styled(marker, th.style(Tone::Marker)),
             Span::styled(arrow, meta_s),
-            Span::styled(format!("{:<w$}", p.id, w = ID_W), th.style(Tone::Id)),
+            Span::styled(
+                format!("{:<w$}", p.id, w = ID_W),
+                th.style(if is_watched { Tone::Watch } else { Tone::Id }),
+            ),
             Span::raw("  "),
         ];
         head.extend(marked_spans(&title_lines[0], title_s, hl, &mut topen));
+        if is_watched && last_title == 0 {
+            head.push(Span::styled(format!(" {BADGE}"), th.style(Tone::Watch)));
+        }
         lines.push(Line::from(head));
-        for cont in title_lines.iter().skip(1) {
+        for (i, cont) in title_lines.iter().enumerate().skip(1) {
             let mut spans = vec![Span::raw(pad.clone())];
             spans.extend(marked_spans(cont, title_s, hl, &mut topen));
+            if is_watched && i == last_title {
+                spans.push(Span::styled(format!(" {BADGE}"), th.style(Tone::Watch)));
+            }
             lines.push(Line::from(spans));
         }
 
@@ -211,9 +244,9 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
                 lines.push(Line::from(spans));
             }
         }
-        // No snippet while collapsed: a 16-token window out of the middle of an
-        // abstract reads as noise. Matches are still highlighted in the title
-        // here, and in the whole abstract once expanded.
+        // Nothing of the abstract while collapsed. A 16-token FTS snippet used to
+        // go here and read as noise; matches show in the title, and in the whole
+        // abstract once expanded.
 
         lines.push(Line::raw(""));
     }
@@ -279,6 +312,8 @@ pub fn run(
         scroll: 0,
         editing: false,
         expanded: HashSet::new(),
+        watched: HashSet::new(),
+        watched_only: false,
         status: None,
         filters,
         theme,
@@ -329,6 +364,9 @@ pub fn run(
                 format!("{}/{}", app.selected + 1, app.hits.len())
             };
             let mut modes = format!("   [{}]  {} · {}", position, count, app.scope.label());
+            if app.watched_only {
+                modes.push_str(" · watched only");
+            }
             if let Some(d) = app.bib_stale_days {
                 modes.push_str(&format!(" · bib {d}d old"));
             }
@@ -379,7 +417,7 @@ pub fn run(
             let help = if app.editing {
                 "  type to filter · enter accept · ctrl-u clear · esc cancel"
             } else {
-                "  j/k move · space expand · t scope · enter open · y url · b key · B entry · / search · q quit"
+                "  j/k move · space expand · t scope · w watched · enter open · y url · b key · B entry · / search · q quit"
             };
             let foot = match &app.status {
                 Some(s) => Line::from(Span::styled(format!("  {s}"), th.style(Tone::Id))),
@@ -395,17 +433,24 @@ pub fn run(
         };
 
         if app.editing {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => app.editing = false,
+                // Ctrl-C has to work here too. Without this arm it fell through to
+                // `Char(c)` and typed a "c" — an app that swallows Ctrl-C is worse
+                // than one that ignores the key.
+                KeyCode::Char('c') if ctrl => break,
                 KeyCode::Backspace => {
                     app.query.pop();
                     app.search(&conn);
                 }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('u') if ctrl => {
                     app.query.clear();
                     app.search(&conn);
                 }
-                KeyCode::Char(c) => {
+                // Only unmodified characters are text; every other chord (ctrl-d,
+                // ctrl-a, alt-x …) is ignored rather than inserted as its letter.
+                KeyCode::Char(c) if !ctrl => {
                     app.query.push(c);
                     app.search(&conn);
                 }
@@ -453,12 +498,45 @@ pub fn run(
                 };
                 app.search(&conn);
             }
+            KeyCode::Char('w') => {
+                if app.watched_only {
+                    app.watched_only = false;
+                    app.search(&conn);
+                } else {
+                    // Re-stage on every switch-on, so watches added in another
+                    // shell since this session started are picked up.
+                    match db::stage_watched(&conn, WATCH_STAGE_CAP) {
+                        Ok(0) => {
+                            app.status =
+                                Some("no watches yet — `eprint watch add \"topic\"`".to_string())
+                        }
+                        Ok(_) => {
+                            app.watched_only = true;
+                            app.search(&conn);
+                        }
+                        Err(_) => app.status = Some("could not read your watches".to_string()),
+                    }
+                }
+            }
             KeyCode::Char('/') => app.editing = true,
             KeyCode::Enter | KeyCode::Char('o') => {
                 if let Some(h) = app.selected_hit() {
-                    let url = h.paper.url.clone();
-                    let _ = crate::open_url(&url);
-                    app.status = Some(format!("opened {url}"));
+                    let id = h.paper.id.clone();
+                    // Same reflex as `eprint open`: the filed PDF when we have
+                    // one, otherwise the browser plus a detached watcher. The
+                    // status line carries the save hint, since the TUI owns the
+                    // screen and cannot print to it.
+                    let local = crate::pdf::cached(&id);
+                    let _ = crate::open_paper(&conn, &id);
+                    app.status = Some(match local {
+                        Some(p) => format!(
+                            "opened {}",
+                            p.file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_else(|| p.to_string_lossy().to_string())
+                        ),
+                        None => format!("opened {id}.pdf — {}", crate::save_hint()),
+                    });
                 }
             }
             KeyCode::Char('b') => {

@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, ToSql};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// A single ePrint paper as exposed by the OAI-PMH `oai_dc` feed.
@@ -17,14 +17,13 @@ pub struct Paper {
     pub url: String,
 }
 
-/// A search result: the paper plus a snippet showing where the query matched.
-/// Snippets use \x01/\x02 as match delimiters so the renderer can decide
-/// whether to emit ANSI codes; piped output stays clean.
+/// A search result: the paper, plus its title and abstract with the matches
+/// marked. Marks are \x01/\x02 rather than ANSI so each front-end picks its own
+/// styling and piped output stays clean.
 pub struct Hit {
     pub paper: Paper,
-    pub snippet: String,
-    /// The complete abstract with the same match markers, used by `-a` so
-    /// full-abstract mode highlights matches too.
+    /// The complete abstract with match markers, used by `-a` and by `browse`
+    /// when an abstract is expanded.
     pub abstract_hl: String,
     /// The title with match markers.
     pub title_hl: String,
@@ -136,6 +135,26 @@ CREATE TABLE IF NOT EXISTS bib (
   entry     TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (eprint_id, kind)
 );
+
+-- Saved searches. A watch is a `Query` without a limit; `eprint new` replays
+-- each one over the papers that arrived since your last look. Empty strings
+-- rather than NULL so the unique index treats "unset" as one value.
+CREATE TABLE IF NOT EXISTS watches (
+  id       INTEGER PRIMARY KEY,
+  terms    TEXT NOT NULL DEFAULT '',
+  author   TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  scope    TEXT NOT NULL DEFAULT 'all',
+  added    TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS watches_uniq
+  ON watches(terms, author, category, scope);
+
+-- Scratch space for `browse`'s watched-only filter: the union of every watch's
+-- matches, so the filter is one `IN (SELECT …)` instead of thousands of bound
+-- parameters. TEMP, so it lives and dies with the connection and never touches
+-- the stored schema.
+CREATE TEMP TABLE IF NOT EXISTS watched_stage (id TEXT PRIMARY KEY);
 "#,
     )?;
     migrate(conn)?;
@@ -317,7 +336,6 @@ pub fn added_since(conn: &Connection, watermark: &str, limit: usize) -> Result<V
         let title_hl = paper.title.clone();
         Ok(Hit {
             paper,
-            snippet: String::new(),
             abstract_hl,
             title_hl,
         })
@@ -369,10 +387,224 @@ fn row_to_paper(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Paper> {
     })
 }
 
+/// A saved search. Mirrors the fields of `Query` that make sense to persist:
+/// no limit (the caller decides how much to show) and no year, which would
+/// date a standing watch.
+#[derive(Clone, Debug)]
+pub struct Watch {
+    pub id: i64,
+    pub terms: String,
+    pub author: Option<String>,
+    pub category: Option<String>,
+    pub scope: Scope,
+}
+
+impl Watch {
+    /// How the watch reads back to the user, in the same shape they typed it.
+    pub fn label(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.terms.trim().is_empty() {
+            parts.push(self.terms.clone());
+        }
+        if let Some(a) = &self.author {
+            parts.push(format!("--author {a}"));
+        }
+        if let Some(c) = &self.category {
+            parts.push(format!("--category {c}"));
+        }
+        if self.scope == Scope::Title {
+            parts.push("--title".to_string());
+        }
+        parts.join(" ")
+    }
+
+    /// The watch as a query over papers that arrived after `watermark`. Pass
+    /// `None` to match the whole index.
+    pub fn query<'a>(&'a self, watermark: Option<&str>, limit: usize) -> Query<'a> {
+        Query {
+            terms: &self.terms,
+            year: None,
+            since: None,
+            added_since: watermark.map(|w| w.to_string()),
+            only_ids: None,
+            only_watched: false,
+            author: self.author.clone(),
+            category: self.category.clone(),
+            limit,
+            scope: self.scope,
+            prefix: true,
+        }
+    }
+}
+
+/// Just the ids a query matches, skipping the `highlight()` work — used when the
+/// result feeds another query rather than the screen.
+fn matching_ids(conn: &Connection, q: &Query) -> Result<Vec<String>> {
+    let collect = |expr: Option<String>| -> Result<Vec<String>> {
+        let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+        let head = match expr {
+            Some(e) => {
+                args.push(Box::new(e));
+                "papers_fts f JOIN papers p ON p.rowid = f.rowid WHERE papers_fts MATCH ?1"
+            }
+            None => "papers p WHERE 1=1",
+        };
+        let filters = filter_sql(q, &mut args);
+        args.push(Box::new(q.limit as i64));
+        let sql = format!(
+            "SELECT p.id FROM {head}{filters} ORDER BY p.date DESC LIMIT ?{}",
+            args.len()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    };
+    if q.terms.trim().is_empty() {
+        return collect(None);
+    }
+    // Same verbatim-then-quoted fallback as `search`.
+    match collect(Some(primary_expr(q))) {
+        Ok(ids) => Ok(ids),
+        Err(e) => {
+            let fallback = fallback_expr(q);
+            if fallback.is_empty() {
+                return Err(e);
+            }
+            collect(Some(fallback))
+        }
+    }
+}
+
+/// Fill `watched_stage` with every id matching some watch, and report how many.
+/// Cheap to repeat, so callers can re-stage whenever the watch list may have
+/// changed rather than tracking that themselves.
+pub fn stage_watched(conn: &Connection, cap_per_watch: usize) -> Result<usize> {
+    conn.execute("DELETE FROM watched_stage", [])?;
+    for w in watch_list(conn)? {
+        // A watch that no longer parses contributes nothing rather than
+        // emptying the filter.
+        if let Ok(ids) = matching_ids(conn, &w.query(None, cap_per_watch)) {
+            let mut stmt =
+                conn.prepare("INSERT OR IGNORE INTO watched_stage (id) VALUES (?1)")?;
+            for id in ids {
+                stmt.execute([id])?;
+            }
+        }
+    }
+    Ok(conn.query_row("SELECT COUNT(*) FROM watched_stage", [], |r| r.get::<_, i64>(0))? as usize)
+}
+
+/// Which of `ids` match at least one saved watch. One small FTS query per watch,
+/// restricted to the ids already on screen, so this costs the same whether the
+/// caller is showing 5 results or 500.
+pub fn watched_ids(conn: &Connection, ids: &[String]) -> Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let watches = watch_list(conn)?;
+    if watches.is_empty() {
+        return Ok(out);
+    }
+    // `browse` loads 500 ids by default and `-n` can raise that, so chunk rather
+    // than betting on SQLite's bound-parameter ceiling.
+    for chunk in ids.chunks(400) {
+        for w in &watches {
+            let mut q = w.query(None, chunk.len());
+            q.only_ids = Some(chunk.to_vec());
+            // A watch with a broken expression must not break the listing it is
+            // annotating, so a failed match just contributes nothing.
+            if let Ok(hits) = search(conn, &q) {
+                for h in hits {
+                    out.insert(h.paper.id);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn watch_add(
+    conn: &Connection,
+    terms: &str,
+    author: Option<&str>,
+    category: Option<&str>,
+    scope: Scope,
+    now: &str,
+) -> Result<Option<i64>> {
+    let scope_s = match scope {
+        Scope::Title => "title",
+        Scope::All => "all",
+    };
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO watches (terms,author,category,scope,added)
+         VALUES (?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            terms.trim(),
+            author.unwrap_or("").trim(),
+            category.unwrap_or("").trim(),
+            scope_s,
+            now
+        ],
+    )?;
+    // Zero rows means the unique index rejected a duplicate, which the caller
+    // reports rather than silently pretending to have saved something.
+    Ok(if n == 0 {
+        None
+    } else {
+        Some(conn.last_insert_rowid())
+    })
+}
+
+pub fn watch_list(conn: &Connection) -> Result<Vec<Watch>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,terms,author,category,scope FROM watches ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let author: String = r.get(2)?;
+        let category: String = r.get(3)?;
+        let scope: String = r.get(4)?;
+        Ok(Watch {
+            id: r.get(0)?,
+            terms: r.get(1)?,
+            author: Some(author).filter(|s| !s.is_empty()),
+            category: Some(category).filter(|s| !s.is_empty()),
+            scope: Scope::from_str(&scope),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn watch_delete(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn.execute("DELETE FROM watches WHERE id = ?1", [id])? > 0)
+}
+
+pub fn watch_clear(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM watches", [])?)
+}
+
 pub struct Query<'a> {
     pub terms: &'a str,
     pub year: Option<i64>,
     pub since: Option<String>,
+    /// Filters on when the paper entered *this* index, not its own date, so
+    /// `new` can ask a watch "anything since I last looked?".
+    pub added_since: Option<String>,
+    /// Restricts the query to these ids, so a watch can be asked "which of the
+    /// papers already on screen do you match?" without re-running it wholesale.
+    pub only_ids: Option<Vec<String>>,
+    /// Restricts the query to papers matching some watch. Requires a preceding
+    /// `stage_watched()` on the same connection to fill `watched_stage`.
+    pub only_watched: bool,
     pub author: Option<String>,
     pub category: Option<String>,
     pub limit: usize,
@@ -478,12 +710,18 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
     }
     match run_search(conn, q, &primary_expr(q)) {
         Ok(hits) => Ok(hits),
-        Err(e) => {
-            let fallback = fallback_expr(q);
-            if fallback.is_empty() {
-                return Err(e);
+        Err(_) => {
+            // Nothing survives quoting (e.g. a lone `"`), so there is no second
+            // shot to take. Say that plainly instead of forwarding SQLite's
+            // "unterminated string: Error code 1" at the user. Checking the
+            // quoted tokens rather than the whole expression matters: under
+            // `--scope title` the wrapper makes even an empty query non-empty.
+            if quote_terms(q.terms, q.prefix).trim().is_empty() {
+                bail!("could not parse query: {}", q.terms);
             }
-            run_search(conn, q, &fallback)
+            // The fallback keeps its source attached: if *that* fails it is more
+            // likely a real database problem than a syntax one.
+            run_search(conn, q, &fallback_expr(q))
                 .with_context(|| format!("could not parse query: {}", q.terms))
         }
     }
@@ -498,6 +736,29 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     if let Some(s) = &q.since {
         args.push(Box::new(s.clone()));
         sql.push_str(&format!(" AND p.date >= ?{}", args.len()));
+    }
+    // `>` not `>=`, to agree with `added_since()` — the watermark is the last
+    // moment already seen, not the first unseen one.
+    if let Some(s) = &q.added_since {
+        args.push(Box::new(s.clone()));
+        sql.push_str(&format!(" AND p.added > ?{}", args.len()));
+    }
+    if q.only_watched {
+        sql.push_str(" AND p.id IN (SELECT id FROM watched_stage)");
+    }
+    if let Some(ids) = &q.only_ids {
+        if ids.is_empty() {
+            // `IN ()` is a syntax error, and an empty restriction must match
+            // nothing rather than silently matching everything.
+            sql.push_str(" AND 0");
+        } else {
+            let mut slots = Vec::with_capacity(ids.len());
+            for id in ids {
+                args.push(Box::new(id.clone()));
+                slots.push(format!("?{}", args.len()));
+            }
+            sql.push_str(&format!(" AND p.id IN ({})", slots.join(",")));
+        }
     }
     if let Some(a) = &q.author {
         args.push(Box::new(format!("%{}%", a.to_lowercase())));
@@ -518,8 +779,6 @@ fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>
 
     let sql = format!(
         "SELECT p.id,p.title,p.authors,p.abstract,p.category,p.date,p.year,p.rights,p.url,
-                snippet(papers_fts, 2, char(1), char(2), '…', 16),
-                snippet(papers_fts, 0, char(1), char(2), '…', 16),
                 highlight(papers_fts, 2, char(1), char(2)),
                 highlight(papers_fts, 0, char(1), char(2))
          FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
@@ -532,22 +791,10 @@ fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>
     let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(refs.as_slice(), |r| {
         let paper = row_to_paper(r, 0)?;
-        let abs_snip: String = r.get(9)?;
-        let title_snip: String = r.get(10)?;
-        let abstract_hl: String = r.get(11)?;
-        let title_hl: String = r.get(12)?;
-        // Prefer the abstract snippet; fall back to the title when the match
-        // was only in the title (snippet() returns a plain prefix otherwise).
-        let snippet = if abs_snip.contains(MARK_START) {
-            abs_snip
-        } else if title_snip.contains(MARK_START) {
-            String::new()
-        } else {
-            abs_snip
-        };
+        let abstract_hl: String = r.get(9)?;
+        let title_hl: String = r.get(10)?;
         Ok(Hit {
             paper,
-            snippet,
             abstract_hl,
             title_hl,
         })
@@ -614,7 +861,6 @@ fn browse(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
         let title_hl = paper.title.clone();
         Ok(Hit {
             paper,
-            snippet: String::new(),
             abstract_hl,
             title_hl,
         })

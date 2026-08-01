@@ -103,7 +103,7 @@ impl Style {
 }
 
 /// Visible width, ignoring ANSI escapes and match markers.
-fn visible_len(s: &str) -> usize {
+pub fn visible_len(s: &str) -> usize {
     let mut n = 0;
     let mut in_esc = false;
     for c in s.chars() {
@@ -252,12 +252,29 @@ pub fn short_license(rights: &str) -> String {
 
 const ID_W: usize = 11;
 
+/// The watch badge, and the space it needs: one cell for the glyph plus one to
+/// separate it from the title it follows.
+///
+/// It trails the *title text*, not a fixed column, so only a watched row pays for
+/// it: that row's title wraps `BADGE_W` narrower, leaving room on its last line.
+/// Unwatched rows keep the full width. Both renderers must agree on this or their
+/// layouts diverge.
+///
+/// U+2731 is East-Asian **Neutral**, i.e. one cell in every terminal. `★` (U+2605)
+/// and `◆` (U+25C6) are Ambiguous — counted as one cell here and by ratatui, drawn
+/// as two by CJK-aware terminals, which would overrun the line. It is also the
+/// *heavy* asterisk: glyph weight is the only sense in which a terminal glyph can
+/// be made bigger.
+pub const BADGE: &str = "✱";
+pub const BADGE_W: usize = 2;
+
 pub fn render_hit(
     out: &mut String,
     hit: &Hit,
     st: &Style,
     show_abstract: bool,
     bib: Option<&(String, bool)>,
+    watched: bool,
 ) {
     let p = &hit.paper;
     let indent = ID_W + 4;
@@ -272,13 +289,42 @@ pub fn render_hit(
     } else {
         &hit.title_hl
     };
-    let title_lines = wrap(title_src, body_width);
-    let id_cell = th.paint(Tone::Id, &format!("{:<w$}", p.id, w = ID_W));
+    // A watched title wraps narrower so its last line has room for the trailing
+    // badge; an unwatched one uses the full width.
+    let title_lines = wrap(
+        title_src,
+        if watched {
+            body_width.saturating_sub(BADGE_W)
+        } else {
+            body_width
+        },
+    );
+    let last = title_lines.len() - 1;
+    // Watched papers also take Tone::Watch for the id, so the row still reads as
+    // watched when the title is long enough to push the badge out of view.
+    let id_tone = if watched { Tone::Watch } else { Tone::Id };
+    let id_cell = th.paint(id_tone, &format!("{:<w$}", p.id, w = ID_W));
+    // Outside the hyperlink: the badge is our annotation, not part of the paper.
+    let badge = if watched {
+        format!(" {}", th.paint(Tone::Watch, BADGE))
+    } else {
+        String::new()
+    };
     let mut topen = false;
     let first = st.marked(&title_lines[0], Tone::Title, &mut topen);
-    let _ = writeln!(out, "  {}", st.link(&p.url, &format!("{id_cell}  {first}")));
-    for line in title_lines.iter().skip(1) {
-        let _ = writeln!(out, "{pad}{}", st.marked(line, Tone::Title, &mut topen));
+    let _ = writeln!(
+        out,
+        "  {}{}",
+        st.link(&p.url, &format!("{id_cell}  {first}")),
+        if last == 0 { badge.as_str() } else { "" }
+    );
+    for (i, line) in title_lines.iter().enumerate().skip(1) {
+        let _ = writeln!(
+            out,
+            "{pad}{}{}",
+            st.marked(line, Tone::Title, &mut topen),
+            if i == last { badge.as_str() } else { "" }
+        );
     }
 
     // Authors only in the list; date and citation key join once an abstract
@@ -401,7 +447,6 @@ pub fn json_of(hits: &[Hit]) -> String {
                 "year": p.year,
                 "license": p.rights,
                 "url": p.url,
-                "snippet": h.snippet.replace(MARK_START, "").replace(MARK_END, ""),
             })
         })
         .collect();

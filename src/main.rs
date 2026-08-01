@@ -2,6 +2,7 @@ mod bib;
 mod config;
 mod db;
 mod harvest;
+mod pdf;
 mod render;
 mod theme;
 mod tui;
@@ -20,6 +21,11 @@ const STALE_SECS: u64 = 24 * 3600;
 const ATTEMPT_COOLDOWN_SECS: u64 = 3600;
 /// Re-request a small overlap window so nothing slips through the cracks.
 const OVERLAP_SECS: u64 = 2 * 24 * 3600;
+/// Set on a detached child to make it file a downloaded PDF instead of running a
+/// command. An env marker rather than a subcommand, hidden or otherwise, so the
+/// CLI surface stays exactly as it was.
+const ADOPT_ID_VAR: &str = "EPRINT_ADOPT";
+const ADOPT_TITLE_VAR: &str = "EPRINT_ADOPT_TITLE";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,18 +65,15 @@ enum Cmd {
         /// Paper id, e.g. 2026/1539, or just 1539 for this year
         id: String,
     },
-    /// Open a paper in your browser
+    /// Open a paper's PDF — your local copy once you have one
     Open {
         /// Paper id, e.g. 2026/1539, or just 1539 for this year
         id: String,
-        /// Go straight to the PDF instead of the abstract page
-        #[arg(long)]
-        pdf: bool,
     },
     /// Show papers that arrived since you last looked
     New {
         /// Maximum results to show
-        #[arg(short = 'n', long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50, value_parser = positive)]
         limit: usize,
         /// Show without moving the "last seen" marker
         #[arg(long)]
@@ -78,6 +81,11 @@ enum Cmd {
         /// Override the starting point (YYYY-MM-DD, or e.g. 7d)
         #[arg(long)]
         since: Option<String>,
+    },
+    /// Saved searches that `eprint new` checks for you
+    Watch {
+        #[command(subcommand)]
+        action: Option<WatchCmd>,
     },
     /// Look up BibTeX citation keys (CryptoBib)
     Bib {
@@ -112,12 +120,50 @@ enum Cmd {
     },
 }
 
+/// `-n 0` is not "no limit", it is a query that can only return nothing, so
+/// reject it at parse time rather than printing "No matches."
+fn positive(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum WatchCmd {
+    /// Save a search. Same query syntax and filters as `eprint search`
+    Add {
+        /// Query terms. Supports "quoted phrases", AND/OR/NOT and prefix*
+        query: Vec<String>,
+        /// Watch an author instead of, or as well as, query terms
+        #[arg(long)]
+        author: Option<String>,
+        /// Watch an IACR category
+        #[arg(long)]
+        category: Option<String>,
+        /// Match titles and authors only, ignoring abstracts
+        #[arg(short = 't', long)]
+        title: bool,
+    },
+    /// Remove a watch by the number `eprint watch` shows
+    Rm {
+        /// Watch number
+        id: Option<i64>,
+        /// Remove every watch
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
+    /// List saved watches (the default)
+    List,
+}
+
 #[derive(Args, Debug, Default)]
 struct BrowseArgs {
     /// Starting query. Edit it live inside the browser with `/`
     query: Vec<String>,
     /// Maximum results to load
-    #[arg(short = 'n', long, default_value_t = 500)]
+    #[arg(short = 'n', long, default_value_t = 500, value_parser = positive)]
     limit: usize,
     /// Match titles and authors only, ignoring abstracts
     #[arg(short = 't', long)]
@@ -150,7 +196,7 @@ struct SearchArgs {
     /// Query terms. Supports "quoted phrases", AND/OR/NOT and prefix*
     query: Vec<String>,
     /// Maximum results to show
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, value_parser = positive)]
     limit: Option<usize>,
     /// Restrict to a publication year
     #[arg(long)]
@@ -457,6 +503,56 @@ pub fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Open a paper the way the user means it: the filed PDF if we have one, else the
+/// browser — and in that case start watching for the download, because opening a
+/// paper is the only signal needed that it is worth keeping.
+///
+/// The archive serves PDFs behind a Cloudflare challenge and denies `*pdf` in
+/// `robots.txt`, so the browser does the fetching and we only file the result.
+fn open_paper(conn: &rusqlite::Connection, id: &str) -> Result<()> {
+    if let Some(path) = pdf::cached(id) {
+        return open_url(&path.to_string_lossy());
+    }
+    // Straight to the PDF: the landing page is a detour, and `eprint show` already
+    // holds the metadata it would have shown.
+    open_url(&format!("https://eprint.iacr.org/{id}.pdf"))?;
+    let title = db::get(conn, id)?.map(|p| p.title).unwrap_or_default();
+    spawn_adopter(id, &title);
+    // stderr, so piping stays clean.
+    eprintln!("{}", save_hint());
+    Ok(())
+}
+
+/// Printed on the first open of a paper. Deliberately does *not* ask the user to
+/// navigate anywhere: the browser suggests whatever folder it last used, so the
+/// hint names the places already being watched instead.
+fn save_hint() -> String {
+    let names = pdf::watched_names();
+    let places = match names.split_last() {
+        None => return "save the PDF and it will be kept".to_string(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    };
+    format!("⌘S anywhere in {places} and it will be kept")
+}
+
+/// Detached child that files the PDF once the browser has saved it. Same recipe
+/// as `spawn_background_refresh`, and like it the child is fire-and-forget: the
+/// caller must not wait, so `browse` stays interactive and the shell prompt
+/// returns immediately.
+fn spawn_adopter(id: &str, title: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .env(ADOPT_ID_VAR, id)
+        .env(ADOPT_TITLE_VAR, title)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn normalise_id(raw: &str) -> String {
     let id = raw
         .trim()
@@ -508,6 +604,9 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         terms: &terms,
         year: a.year,
         since,
+        added_since: None,
+        only_ids: None,
+        only_watched: false,
         author: a.author.clone(),
         category: a.category.clone(),
         limit: a.limit.unwrap_or(if a.is_latest() {
@@ -537,8 +636,10 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
     render::render_header(&mut out, hits.len(), total, age, scope.label(), st);
     let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
+    let watched = db::watched_ids(&conn, &ids).unwrap_or_default();
     for hit in &hits {
-        render::render_hit(&mut out, hit, st, a.abstracts, bibs.get(&hit.paper.id));
+        let w = watched.contains(&hit.paper.id);
+        render::render_hit(&mut out, hit, st, a.abstracts, bibs.get(&hit.paper.id), w);
     }
     page(&out, st, a.no_pager)
 }
@@ -642,33 +743,145 @@ fn do_new_inner(
             .unwrap_or_else(|| format_iso(now() - 7 * 86400)),
     };
 
-    let hits = db::added_since(&conn, &watermark, limit)?;
-    let total = db::count_added_since(&conn, &watermark)?;
+    let day = |ts: &str| ts.chars().take(10).collect::<String>();
+
+    let mut hits = db::added_since(&conn, &watermark, limit)?;
+    // The window whose papers are on screen: the fresh diff normally, the
+    // remembered one when there is no fresh diff to show.
+    let mut window = watermark.clone();
+    let mut replayed = false;
+
+    // ePrint posts in bursts, so most runs find nothing. Rather than report an
+    // empty diff, show the last one again until the archive actually moves. An
+    // explicit --since is a question about a specific window, so it opts out.
+    if hits.is_empty() && since.is_none() {
+        if let Some(prev) = db::meta_get(&conn, harvest::KEY_NEW_BATCH)? {
+            let again = db::added_since(&conn, &prev, limit)?;
+            if !again.is_empty() {
+                hits = again;
+                window = prev;
+                replayed = true;
+            }
+        }
+    }
+    let total = db::count_added_since(&conn, &window)?;
 
     if hits.is_empty() {
-        println!(
-            "\nNothing new since {}.\n",
-            &watermark.chars().take(10).collect::<String>()
-        );
+        println!("\nNothing new since {}.\n", day(&watermark));
     } else {
+        let label = if replayed {
+            // Name what is on screen, and when it stopped being news. Same-day
+            // repeats read as a typo, so collapse them.
+            let (batch, seen) = (day(&window), day(&watermark));
+            if batch == seen {
+                format!("last batch, from {batch} · nothing new yet")
+            } else {
+                format!("last batch, from {batch} · nothing new since {seen}")
+            }
+        } else {
+            format!("since {}", day(&window))
+        };
         let mut out = String::new();
-        render::render_header(
-            &mut out,
-            hits.len(),
-            total,
-            None,
-            &format!("since {}", &watermark.chars().take(10).collect::<String>()),
-            &st,
-        );
+        render::render_header(&mut out, hits.len(), total, None, &label, &st);
+        let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
+        let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
+        let watched = db::watched_ids(&conn, &ids).unwrap_or_default();
         for hit in &hits {
-            render::render_hit(&mut out, hit, &st, false, None);
+            let w = watched.contains(&hit.paper.id);
+            render::render_hit(&mut out, hit, &st, false, bibs.get(&hit.paper.id), w);
         }
         page(&out, &st, false)?;
     }
 
     if !peek {
+        // Remember a *fresh* diff so later runs can replay it. Not a replay (the
+        // pointer already names that window) and not an explicit --since window,
+        // which would overwrite the real batch with an arbitrary one.
+        if !replayed && !hits.is_empty() && since.is_none() {
+            db::meta_set(&conn, harvest::KEY_NEW_BATCH, &watermark)?;
+        }
         db::meta_set(&conn, harvest::KEY_LAST_SEEN, &format_iso(now()))?;
     }
+    Ok(())
+}
+
+fn do_watch(action: Option<WatchCmd>) -> Result<()> {
+    let conn = db::open()?;
+    match action.unwrap_or(WatchCmd::List) {
+        WatchCmd::Add {
+            query,
+            author,
+            category,
+            title,
+        } => {
+            let terms = query.join(" ");
+            // Blank means absent: `--author ''` is the user saying nothing, and
+            // storing it as an empty filter would save a watch that matches every
+            // paper in the archive.
+            let author = author.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let category = category
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if terms.trim().is_empty() && author.is_none() && category.is_none() {
+                bail!("nothing to watch — give query terms, --author or --category");
+            }
+            let cfg = config::load();
+            let scope = effective_scope(title, None, &cfg);
+            match db::watch_add(
+                &conn,
+                &terms,
+                author.as_deref(),
+                category.as_deref(),
+                scope,
+                &format_iso(now()),
+            )? {
+                Some(_) => {
+                    println!();
+                    list_watches(&conn)?;
+                }
+                None => bail!("you are already watching that"),
+            }
+        }
+        WatchCmd::Rm { id, all } => {
+            if all {
+                let n = db::watch_clear(&conn)?;
+                println!("\n  removed {n} watch{}\n", if n == 1 { "" } else { "es" });
+            } else {
+                let Some(id) = id else {
+                    bail!("which watch? give a number from `eprint watch`, or --all");
+                };
+                if !db::watch_delete(&conn, id)? {
+                    bail!("no watch {id} — `eprint watch` lists them");
+                }
+                println!();
+                list_watches(&conn)?;
+            }
+        }
+        WatchCmd::List => {
+            println!();
+            list_watches(&conn)?;
+        }
+    }
+    Ok(())
+}
+
+fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
+    let watches = db::watch_list(conn)?;
+    if watches.is_empty() {
+        println!("  No watches yet. Save one with:\n");
+        println!("    eprint watch add \"lattice OR LWE\"");
+        println!("    eprint watch add --author Boneh\n");
+        println!("  Matching papers are then marked ✱ wherever they appear.\n");
+        return Ok(());
+    }
+    for w in &watches {
+        // The index-wide count is the useful sanity check on a new watch: it
+        // says "this expression does match things" before you wait a day for
+        // `new` to prove it the hard way.
+        let total = db::count_matches(conn, &w.query(None, 1)).unwrap_or(0);
+        println!("  {:<3} {:<44} {total} in the index", w.id, w.label());
+    }
+    println!("\n  matches are marked ✱ in search, `new` and `browse` · `w` in browse filters to them\n");
     Ok(())
 }
 
@@ -872,6 +1085,13 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
+    // Checked before argument parsing: this process was spawned to wait for a
+    // download, not to run a command.
+    if let Ok(id) = std::env::var(ADOPT_ID_VAR) {
+        let title = std::env::var(ADOPT_TITLE_VAR).unwrap_or_default();
+        pdf::adopt(&id, &title);
+        return Ok(());
+    }
     let cli = Cli::parse();
     match cli.cmd {
         None => do_search(&cli.search),
@@ -879,6 +1099,7 @@ fn real_main() -> Result<()> {
         Some(Cmd::Browse(a)) => do_browse(&a),
         Some(Cmd::Update { full, quiet }) => do_update(full, quiet),
         Some(Cmd::New { limit, peek, since }) => do_new(limit, peek, since.as_deref()),
+        Some(Cmd::Watch { action }) => do_watch(action),
         Some(Cmd::Bib {
             id,
             update,
@@ -907,14 +1128,9 @@ fn real_main() -> Result<()> {
                 None => bail!("no paper {id} in the local index (try `eprint update`)"),
             }
         }
-        Some(Cmd::Open { id, pdf }) => {
-            let id = normalise_id(&id);
-            let url = if pdf {
-                format!("https://eprint.iacr.org/{id}.pdf")
-            } else {
-                format!("https://eprint.iacr.org/{id}")
-            };
-            open_url(&url)
+        Some(Cmd::Open { id }) => {
+            let conn = db::open()?;
+            open_paper(&conn, &normalise_id(&id))
         }
     }
 }

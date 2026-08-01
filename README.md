@@ -31,6 +31,49 @@ Force either behaviour with `--urls` / `--no-urls`.
 
 `eprint open <id>` works everywhere regardless of terminal.
 
+### Papers you open are kept
+
+`eprint open <id>` goes straight to the PDF — the landing page is a detour, and `eprint show`
+already holds the metadata it would have given you. Opening a paper is also taken as a signal
+that you want it, so the tool quietly builds a local library at `~/Documents/eprint/`:
+
+- **First open** — the PDF opens in your browser:
+
+  ```
+  $ eprint open 1523
+  ⌘S anywhere in Downloads, Desktop or your home folder and it will be kept
+  ```
+
+  Press ⌘S (browsers display PDFs inline rather than downloading them) and accept whatever
+  folder the dialog suggests — no navigating. Downloads, Desktop, your home folder and the
+  library itself are all watched, because a browser suggests wherever it last saved and no
+  command-line tool can change that. The file is filed as
+  `2026-1523-catching-many-traitors.pdf`.
+- **Every open after that** — the local PDF opens directly. Instant, offline, no browser.
+
+The same applies to `enter` in `browse`, which shows the same hint in its status line. There are
+no flags and no settings for this; the only visible difference is that the second open is
+instant. Set `EPRINT_PAPERS_DIR` or `EPRINT_DOWNLOAD_DIR` if the defaults are wrong for you.
+
+Filing is deliberately conservative. A download in a **watched folder** is only adopted if
+it is named for the paper (ePrint serves `/YYYY/NNNN.pdf`, so browsers save `1523.pdf`), appeared
+after you opened the paper, is not a partial download, starts with the `%PDF-` magic bytes, and
+has stopped changing size. It is **copied**, not moved, so nothing vanishes from where you saved
+it. `EPRINT_DOWNLOAD_DIR` replaces the watched set if your browser saves somewhere unusual.
+
+A PDF saved into the **library folder** is treated as deliberate: it is renamed to the canonical
+name and used, whenever it arrives — so saving there works even hours later, long after the
+watcher has exited. A file whose name claims a different paper (`2025-1523-…`) is never served
+for `2026/1523`, and a file that is not really a PDF is ignored.
+
+Clicking an OSC 8 link in your terminal bypasses the tool entirely, so those opens cannot be
+cached — use `eprint open` or `browse` if you want the local copy.
+
+**The tool never downloads a PDF itself, by design.** The archive serves them behind a Cloudflare
+challenge, and its `robots.txt` says *"Full text PDFs are only available under a license specific
+to each paper"* while denying `*pdf` to every agent. Metadata is offered to machines over OAI-PMH;
+full text is not. So your browser does the fetching, and this only files what your browser saved.
+
 ## Install
 
 Requires a Rust toolchain (1.86 or newer). If you do not have one:
@@ -107,10 +150,10 @@ eprint garbled --year 2024 -n 50      # filter by year, more results
 eprint --author Boneh --since 2y      # browse without a query
 eprint --category "Public-key" -n 5   # filter by IACR category
 eprint show 2026/1538                 # one paper in full
-eprint open 2026/1538                 # open in browser
-eprint open 2026/1538 --pdf           # straight to the PDF
+eprint open 2026/1538                 # the PDF — your local copy once you have one
 eprint new                            # papers that arrived since you last looked
 eprint new --since 30d --peek         # a window, without moving the marker
+eprint watch add "lattice OR LWE"     # mark matching papers with a ✱ everywhere
 eprint status                         # index stats
 eprint update                         # refresh now
 eprint update --full                  # rebuild from scratch
@@ -135,6 +178,7 @@ collapse in place, and matches stay highlighted inside the expanded text.
 | `space` / `tab` | expand or collapse the abstract |
 | `a` | expand or collapse everything |
 | `t` | toggle where the query is matched: `in: title, authors, abstract` ⇄ `in: title, authors` |
+| `w` | show only papers matching a watch — searches apply within that subset |
 | `/` | edit the query — results filter live as you type |
 | `ctrl-u` | clear the query (while editing) |
 | `enter` / `o` | open the paper in your browser |
@@ -164,6 +208,61 @@ would silently skip late-published submissions.
 
 Unlike `search`, this refreshes the index synchronously when it is more than an hour old —
 stale data is the entire failure mode for a "what's new" command.
+
+**The last batch sticks around.** ePrint posts in bursts, so most runs of `new` find nothing
+at all. Rather than print "nothing new" for the rest of the day, `new` shows the last batch it
+found again, and says so:
+
+```
+4 results  last batch, from 2026-07-30 · nothing new yet
+```
+
+When the archive does move, you get only the genuinely new papers and *those* become the
+remembered batch — so each burst is shown until the next one replaces it, and nothing is ever
+silently skipped. `--peek` still changes no state, and `--since` is an ad-hoc question about a
+specific window: it neither replays nor overwrites the remembered batch.
+
+### Watches
+
+A watch is a saved search that marks the papers you care about. It is **purely a highlighting
+feature**: it never changes which papers are shown, how many, or in what order.
+
+```sh
+eprint watch add "lattice OR LWE"     # any `search` query works
+eprint watch add --author Boneh       # an author, with or without terms
+eprint watch add zk --category "Public-key"
+eprint watch add "proof of work" -t   # titles and authors only
+eprint watch                          # list them, numbered
+eprint watch rm 2                     # remove one
+eprint watch rm --all
+```
+
+Matching papers get a gold `✱` after the title and their id in the same gold, everywhere a
+list of papers appears — `search`, a bare `eprint`, `new` and `browse`:
+
+```
+  2026/1523    Catching Many Traitors in Threshold Traitor Tracing: Lower Bounds and
+               Constructions ✱
+  2026/1268    Decentralized Multi-Authority (Attribute-Based) Traitor Tracing
+```
+
+The badge follows the title text rather than sitting in a fixed column, so only a watched
+row gives up any width for it — its title wraps two columns narrower, leaving room on the last
+line. On a wrapped title the badge lands at the end of the final line. The glyph is U+2731
+HEAVY ASTERISK, single-width in every terminal where `★` and `◆` are East-Asian-Ambiguous and
+could overrun the line. It degrades to a plain `✱` under `NO_COLOR` or `theme = "mono"`.
+
+The gold is 256-colour index 136 (`#af8700`), the one place this tool does not use a plain
+16-colour index: "a shade darker than the match highlight" is not something a palette index
+can promise, since a theme's yellow could be anything.
+
+In `browse`, **`w`** filters the listing down to watched papers, and any query you then type
+searches within that subset. The header shows `· watched only` while it is on; `w` again
+restores everything.
+
+Watches store no year filter — that would date a standing watch — and the count `eprint
+watch` shows next to each one is its total across the whole index, which is the quick check
+that a new expression actually matches something.
 
 ## Citation keys (CryptoBib)
 
@@ -340,10 +439,11 @@ this purpose. Search covers **title, authors, abstract and IACR category**. Auth
 keywords are not part of the `oai_dc` feed and so are not indexed; abstracts generally
 contain the same terminology.
 
-Full-text PDFs are licensed individually per paper and are deliberately not bulk
-downloaded. `eprint open --pdf` hands the URL to your browser so the download happens in a
-normal browser session under that paper's licence. Each result displays its licence
-(`CC-BY-4.0`, `CC-BY-NC-ND-4.0`, `CC0`, …) so you can see the terms before opening.
+Full-text PDFs are licensed individually per paper and are never fetched by this tool.
+`eprint open` hands the URL to your browser, so the download happens in a normal browser
+session under that paper's licence; the tool only files a copy your browser has already
+saved. Each result displays its licence (`CC-BY-4.0`, `CC-BY-NC-ND-4.0`, `CC0`, …) so you
+can see the terms before opening.
 
 The harvester identifies itself honestly by User-Agent, paces requests, and honours
 `Retry-After` on 503/429.

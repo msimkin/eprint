@@ -10,6 +10,11 @@ pub enum Mode {
 /// Semantic slots rather than colour names, so the two palettes stay in step
 /// and the inline renderer and the TUI cannot drift apart.
 #[derive(Clone, Copy, PartialEq)]
+/// Semantic slots, not colours. The `dark`/`light` palettes are 256-colour
+/// indices rather than the 16 ANSI ones: "brass and verdigris" needs *muted*
+/// mid-tones, and the 16-colour palette offers no muted anything — only "cyan"
+/// and "blue", at whatever brightness the terminal theme happens to pick. The
+/// cost is that these no longer follow the user's theme; `mono` still does.
 pub enum Tone {
     Id,
     Title,
@@ -19,6 +24,12 @@ pub enum Tone {
     Match,
     Marker,
     Head,
+    /// A paper matching a saved watch. Dark gold (256-colour 136): the one
+    /// deliberate exception to the 16-colour rule, because "a bit darker than
+    /// the match highlight" is not expressible as a palette index — a theme's
+    /// yellow could be anything. Chosen to stay legible on white as well as
+    /// black, which the 16-colour brights do not.
+    Watch,
 }
 
 #[derive(Clone, Copy)]
@@ -65,21 +76,23 @@ impl Theme {
         match (self.mode, t) {
             // Dark backgrounds: bright variants, never the dim end of the
             // palette (blue 4 and dark-gray 8 are unreadable on black).
-            (Mode::Dark, Tone::Id) => "\x1b[96m",
+            (Mode::Dark, Tone::Id) => "\x1b[38;5;66m",
             (Mode::Dark, Tone::Title) => "\x1b[1m",
-            (Mode::Dark, Tone::Meta) => "\x1b[37m",
+            (Mode::Dark, Tone::Meta) => "\x1b[38;5;102m",
             (Mode::Dark, Tone::Body) => "",
-            (Mode::Dark, Tone::Url) => "\x1b[94m",
-            (Mode::Dark, Tone::Marker) => "\x1b[96m",
+            (Mode::Dark, Tone::Url) => "\x1b[4;38;5;103m",
+            (Mode::Dark, Tone::Marker) => "\x1b[38;5;66m",
             (Mode::Dark, Tone::Head) => "\x1b[1m",
+            (Mode::Dark, Tone::Watch) => "\x1b[1;38;5;136m",
 
-            (Mode::Light, Tone::Id) => "\x1b[34m",
+            (Mode::Light, Tone::Id) => "\x1b[38;5;30m",
             (Mode::Light, Tone::Title) => "\x1b[1m",
-            (Mode::Light, Tone::Meta) => "\x1b[90m",
+            (Mode::Light, Tone::Meta) => "\x1b[38;5;240m",
             (Mode::Light, Tone::Body) => "",
-            (Mode::Light, Tone::Url) => "\x1b[34m",
-            (Mode::Light, Tone::Marker) => "\x1b[34m",
+            (Mode::Light, Tone::Url) => "\x1b[4;38;5;61m",
+            (Mode::Light, Tone::Marker) => "\x1b[38;5;30m",
             (Mode::Light, Tone::Head) => "\x1b[1m",
+            (Mode::Light, Tone::Watch) => "\x1b[1;38;5;136m",
 
             (Mode::Mono, Tone::Id) => "\x1b[1m",
             (Mode::Mono, Tone::Title) => "\x1b[1m",
@@ -88,6 +101,7 @@ impl Theme {
             (Mode::Mono, Tone::Url) => "\x1b[4m",
             (Mode::Mono, Tone::Marker) => "\x1b[1m",
             (Mode::Mono, Tone::Head) => "\x1b[1m",
+            (Mode::Mono, Tone::Watch) => "\x1b[1m",
 
             // Matches set both foreground and background, so they keep their
             // contrast whatever the terminal background is.
@@ -118,7 +132,7 @@ impl Theme {
         let s = Style::default();
         if !self.color {
             return match t {
-                Tone::Title | Tone::Id | Tone::Marker | Tone::Head => {
+                Tone::Title | Tone::Id | Tone::Marker | Tone::Head | Tone::Watch => {
                     s.add_modifier(Modifier::BOLD)
                 }
                 Tone::Meta => s.add_modifier(Modifier::DIM),
@@ -128,21 +142,23 @@ impl Theme {
             };
         }
         match (self.mode, t) {
-            (Mode::Dark, Tone::Id) => s.fg(Color::LightCyan),
+            (Mode::Dark, Tone::Id) => s.fg(Color::Indexed(66)),
             (Mode::Dark, Tone::Title) => s.add_modifier(Modifier::BOLD),
-            (Mode::Dark, Tone::Meta) => s.fg(Color::Gray),
+            (Mode::Dark, Tone::Meta) => s.fg(Color::Indexed(102)),
             (Mode::Dark, Tone::Body) => s,
-            (Mode::Dark, Tone::Url) => s.fg(Color::LightBlue),
-            (Mode::Dark, Tone::Marker) => s.fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            (Mode::Dark, Tone::Url) => s.fg(Color::Indexed(103)).add_modifier(Modifier::UNDERLINED),
+            (Mode::Dark, Tone::Marker) => s.fg(Color::Indexed(66)).add_modifier(Modifier::BOLD),
             (Mode::Dark, Tone::Head) => s.add_modifier(Modifier::BOLD),
+            (Mode::Dark, Tone::Watch) => s.fg(Color::Indexed(136)).add_modifier(Modifier::BOLD),
 
-            (Mode::Light, Tone::Id) => s.fg(Color::Blue),
+            (Mode::Light, Tone::Id) => s.fg(Color::Indexed(30)),
             (Mode::Light, Tone::Title) => s.add_modifier(Modifier::BOLD),
-            (Mode::Light, Tone::Meta) => s.fg(Color::DarkGray),
+            (Mode::Light, Tone::Meta) => s.fg(Color::Indexed(240)),
             (Mode::Light, Tone::Body) => s,
-            (Mode::Light, Tone::Url) => s.fg(Color::Blue),
-            (Mode::Light, Tone::Marker) => s.fg(Color::Blue).add_modifier(Modifier::BOLD),
+            (Mode::Light, Tone::Url) => s.fg(Color::Indexed(61)).add_modifier(Modifier::UNDERLINED),
+            (Mode::Light, Tone::Marker) => s.fg(Color::Indexed(30)).add_modifier(Modifier::BOLD),
             (Mode::Light, Tone::Head) => s.add_modifier(Modifier::BOLD),
+            (Mode::Light, Tone::Watch) => s.fg(Color::Indexed(136)).add_modifier(Modifier::BOLD),
 
             (Mode::Mono, _) => s,
 

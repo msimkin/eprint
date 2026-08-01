@@ -15,6 +15,10 @@ const PAGE_DELAY: Duration = Duration::from_millis(200);
 pub const KEY_LAST_HARVEST: &str = "last_harvest";
 pub const KEY_LAST_ATTEMPT: &str = "last_attempt";
 pub const KEY_LAST_SEEN: &str = "last_seen";
+/// Start of the window that produced the last non-empty `eprint new`. The
+/// archive posts in bursts, so most runs land on an empty diff; re-showing that
+/// batch beats printing "nothing new" for the rest of the day.
+pub const KEY_NEW_BATCH: &str = "new_batch_from";
 
 struct Page {
     records: Vec<Record>,
