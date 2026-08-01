@@ -60,6 +60,9 @@ enum Cmd {
         /// Paper id, e.g. 2026/1539, or just 1539 for this year. Omit to list
         /// the papers you have already downloaded
         id: Option<String>,
+        /// Delete downloaded copies instead of opening them, e.g. 1539 1540
+        #[arg(long, value_name = "ID", num_args = 1.., conflicts_with = "id")]
+        rm: Vec<String>,
     },
     /// Show one paper in full
     Show {
@@ -672,8 +675,8 @@ fn open_paper(conn: &rusqlite::Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The papers already downloaded, id and title, newest first.
-fn library_listing() -> Vec<(String, String)> {
+/// The papers already downloaded, id, title and file, newest first.
+fn library_listing() -> Vec<(String, String, PathBuf)> {
     let files = pdf::library();
     let ids: Vec<String> = files.iter().map(|(id, _)| id.clone()).collect();
     let titles = db::open()
@@ -689,9 +692,15 @@ fn library_listing() -> Vec<(String, String)> {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| pdf::slug_words(&path));
-            (id, t)
+            (id, t, path)
         })
         .collect()
+}
+
+/// Decimal MB with one place, matching `status` and the CryptoBib download rather
+/// than introducing a second size convention.
+fn mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1e6)
 }
 
 fn do_library() -> Result<()> {
@@ -702,23 +711,82 @@ fn do_library() -> Result<()> {
     }
     let th = Theme::resolve(&config::load().theme, std::io::stdout().is_terminal());
     println!();
-    for (id, title) in &papers {
-        println!("  {}  {}", th.paint(Tone::Id, &format!("{id:<9}")), title);
+    // Sizes are here because "which of these should I drop?" is the question that
+    // comes before `open --rm`.
+    let mut total = 0u64;
+    for (id, title, path) in &papers {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        total += size;
+        println!(
+            "  {}  {}  {}",
+            th.paint(Tone::Id, &format!("{id:<9}")),
+            th.paint(Tone::Meta, &format!("{:>8}", mb(size))),
+            title
+        );
     }
     println!(
         "\n  {}\n",
         th.paint(
             Tone::Meta,
             &format!(
-                "{} paper{} in {}",
+                "{} paper{}, {} in {}",
                 papers.len(),
                 if papers.len() == 1 { "" } else { "s" },
+                mb(total),
                 pdf::library_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
             )
         )
     );
+    Ok(())
+}
+
+/// `open --rm`: drop filed copies. Unprompted on purpose — naming ids is already
+/// explicit, and opening the paper again fetches it back — but each file that goes
+/// is named, so a deletion is never silent.
+fn do_forget(ids: &[String]) -> Result<()> {
+    let th = Theme::resolve(&config::load().theme, std::io::stdout().is_terminal());
+    println!();
+    let mut gone = 0usize;
+    let mut freed = 0u64;
+    for raw in ids {
+        let id = normalise_id(raw);
+        let size = pdf::cached(&id)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        match pdf::remove(&id)? {
+            Some(path) => {
+                gone += 1;
+                freed += size;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                println!(
+                    "  {}  removed {}",
+                    th.paint(Tone::Id, &format!("{id:<9}")),
+                    th.paint(Tone::Meta, &name)
+                );
+            }
+            None => println!(
+                "  {}  {}",
+                th.paint(Tone::Id, &format!("{id:<9}")),
+                th.paint(Tone::Meta, "no downloaded copy")
+            ),
+        }
+    }
+    let summary = if gone == 0 {
+        "nothing removed".to_string()
+    } else {
+        format!(
+            "{gone} paper{} removed, {} freed",
+            if gone == 1 { "" } else { "s" },
+            mb(freed)
+        )
+    };
+    println!("\n  {}\n", th.paint(Tone::Meta, &summary));
     Ok(())
 }
 
@@ -738,7 +806,7 @@ if ! whence compdef > /dev/null 2>&1; then
 fi
 
 _eprint() {
-  local -a cmds papers
+  local -a cmds papers values
   cmds=(
     'browse:Interactive full-screen browser'
     'open:Open a paper PDF'
@@ -753,13 +821,95 @@ _eprint() {
     _describe -t commands 'eprint command' cmds
     return
   fi
+  local cur=${words[CURRENT]} flag=${words[CURRENT-1]}
+  # `--flag=value` reaches us as a single word, so strip the prefix and complete
+  # the value. `compset -P` moves the matched part into IPREFIX, which keeps it in
+  # the line when a match is inserted.
+  case $cur in
+    --*=*)
+      flag=${cur%%=*}
+      compset -P "${flag}="
+      cur=
+      ;;
+  esac
+
+  # Values for the flags with a closed, knowable set. Before the per-command arms,
+  # because --category is taken by searches, browse and `watch add` alike and the
+  # answer is the same in all three.
+  case $flag in
+    --category)
+      values=(${(f)"$(eprint completions categories 2>/dev/null)"})
+      (( ${#values} )) && _describe -t categories 'IACR category' values
+      return
+      ;;
+    --scope)
+      _values 'scope' 'all[title, authors and abstract]' 'title[titles and authors only]'
+      return
+      ;;
+    --theme)
+      _values 'theme' 'auto[follow the terminal]' 'dark' 'light' 'mono[attributes only]'
+      return
+      ;;
+  esac
+
+  # A word being typed as a flag. Without this, `--categ<TAB>` and even a complete
+  # `--category<TAB>` (no trailing space yet) did nothing at all, which reads as
+  # broken completion rather than as "add a space". These lists mirror the flags
+  # clap shows in --help, so they must be updated alongside it; deliberately
+  # hidden flags stay out, since completion is a discovery surface too.
+  if [[ $cur == -* ]]; then
+    local -a flags
+    local search_flags=(
+      '-n[maximum results]' '--limit[maximum results]'
+      '--date[date or range, e.g. 2023..2024]'
+      '--author[filter by author name]' '--category[filter by IACR category]'
+      '-t[titles and authors only]' '--title[titles and authors only]'
+    )
+    case ${words[2]} in
+      open) flags=('--rm[delete downloaded copies]') ;;
+      show|status) ;;
+      browse) flags=($search_flags) ;;
+      bib) flags=(
+        '--entry[print the full BibTeX record]'
+        '--update[download or refresh CryptoBib]'
+        '--force[re-download even if unchanged]'
+      ) ;;
+      update) flags=('--full[re-harvest everything]' '--quiet[suppress progress]') ;;
+      config) flags=(
+        '--init[write a default config file]'
+        '-e[open the config in $EDITOR]' '--edit[open the config in $EDITOR]'
+        '--completions[switch on Tab completion]'
+      ) ;;
+      watch)
+        case ${words[3]} in
+          add) flags=(
+            '--author[watch an author]' '--category[watch an IACR category]'
+            '-t[titles and authors only]' '--title[titles and authors only]'
+          ) ;;
+          rm) flags=('--all[remove every watch]') ;;
+        esac
+        ;;
+      # A bare `eprint`, a query, or the hidden `search`: the feed's own flags.
+      *) flags=($search_flags '-a[include full abstracts]' '--abstracts[include full abstracts]') ;;
+    esac
+    (( ${#flags} )) && _values 'option' $flags
+    return
+  fi
   case ${words[2]} in
     open|show|bib)
       papers=(${(f)"$(eprint completions ids 2>/dev/null)"})
       (( ${#papers} )) && _describe -t papers 'downloaded papers' papers
       ;;
     watch)
-      (( CURRENT == 3 )) && _values 'watch command' 'add[save a search]' 'rm[remove one]' 'list[show them]'
+      if (( CURRENT == 3 )); then
+        _values 'watch command' 'add[save a search]' 'rm[remove one]' 'list[show them]'
+      elif [[ ${words[3]} == rm ]]; then
+        # `watch rm` takes the position `eprint watch` prints, and those numbers
+        # renumber after a removal — so they are worth showing with their labels
+        # rather than counted by hand.
+        values=(${(f)"$(eprint completions watches 2>/dev/null)"})
+        (( ${#values} )) && _describe -t watches 'saved watch' values
+      fi
       ;;
   esac
 }
@@ -770,12 +920,30 @@ fn do_completions(what: &str) -> Result<()> {
     match what {
         "zsh" => print!("{ZSH_COMPLETION}"),
         "ids" => {
-            for (id, title) in library_listing() {
+            for (id, title, _) in library_listing() {
                 // `id:title`, the shape `_describe` expects.
                 println!("{id}:{title}");
             }
         }
-        other => bail!("unknown completion target {other:?} — try `zsh` or `ids`"),
+        // The other value sets small enough to be worth offering whole. Both are
+        // read from live data, so neither can go stale against a release.
+        "categories" => {
+            let conn = db::open()?;
+            for (name, n) in db::categories(&conn)? {
+                println!("{name}:{n} papers");
+            }
+        }
+        "watches" => {
+            let conn = db::open()?;
+            // The number is the position `eprint watch` prints, which is what
+            // `watch rm` takes; the description is how the watch was saved.
+            for (i, w) in watches(&conn).iter().enumerate() {
+                println!("{}:{}", i + 1, w.label());
+            }
+        }
+        other => bail!(
+            "unknown completion target {other:?} — try `zsh`, `ids`, `categories` or `watches`"
+        ),
     }
     Ok(())
 }
@@ -1549,7 +1717,11 @@ fn real_main() -> Result<()> {
                 None => bail!("no paper {id} in the local index (try `eprint update`)"),
             }
         }
-        Some(Cmd::Open { id }) => match id {
+        Some(Cmd::Open { id, rm }) if !rm.is_empty() => {
+            debug_assert!(id.is_none(), "clap declares --rm as conflicting with id");
+            do_forget(&rm)
+        }
+        Some(Cmd::Open { id, .. }) => match id {
             Some(id) => {
                 let conn = db::open()?;
                 open_paper(&conn, &normalise_id(&id))

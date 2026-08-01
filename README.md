@@ -73,6 +73,17 @@ for `2026/1523`, and a file that is not really a PDF is ignored.
 Clicking an OSC 8 link in your terminal bypasses the tool entirely, so those opens cannot be
 cached — use `eprint open` or `browse` if you want the local copy.
 
+To drop a paper you are done with:
+
+```sh
+eprint open --rm 1499              # or several: --rm 1499 2026/1464
+```
+
+It names each file it deletes and reports what was freed, and it only ever touches the library
+folder. Nothing is lost for good — opening the paper again fetches it back. The filenames are
+canonical and readable precisely so that `rm ~/Documents/eprint/2026-1499-*.pdf` works just as
+well if you would rather not go through the tool.
+
 **The tool never downloads a PDF itself, by design.** The archive serves them behind a Cloudflare
 challenge, and its `robots.txt` says *"Full text PDFs are only available under a license specific
 to each paper"* while denying `*pdf` to every agent. Metadata is offered to machines over OAI-PMH;
@@ -84,7 +95,7 @@ Requires a Rust toolchain (1.86 or newer). If you do not have one:
 <https://rustup.rs>
 
 ```sh
-git clone <repository-url> eprint
+git clone https://github.com/msimkin/eprint.git
 cd eprint
 cargo install --path . --locked
 ```
@@ -161,12 +172,18 @@ eprint --author Boudgoust --date 2y   # filter without a query
 eprint --category "Public-key" -n 5   # filter by IACR category
 eprint show 2026/1538                 # one paper in full
 eprint open 2026/1538                 # the PDF — your local copy once you have one
+eprint open                           # list the papers you have downloaded
+eprint open --rm 1538                 # delete a downloaded copy
 eprint watch add "lattice OR LWE"     # mark matching papers with a ✱ everywhere
 eprint bib 2018/116 --entry           # the whole BibTeX record
 eprint status                         # index stats
 eprint update                         # refresh now
 eprint update --full                  # rebuild from scratch
+eprint update --quiet                 # refresh with no progress output
+eprint config --completions           # switch on Tab completion (zsh)
 ```
+
+Every short flag has a long form: `-n` is `--limit`, `-a` is `--abstracts`, `-t` is `--title`.
 
 A query is just the first argument, so `eprint search <query>` and `eprint <query>` are the same
 thing; `search` is kept for the fingers that expect it. `new` and `Bib` are not — those words are
@@ -189,7 +206,7 @@ want a smaller set.
 | Key | Action |
 |---|---|
 | `j` / `k`, arrows | move |
-| `g` / `G` | first / last |
+| `g` / `G`, home / end | first / last |
 | `ctrl-d` / `ctrl-u`, page keys | jump |
 | `space` / `tab` | expand or collapse the abstract |
 | `a` | expand or collapse everything |
@@ -202,7 +219,7 @@ want a smaller set.
 | `y` | copy the URL to the clipboard |
 | `b` | copy the CryptoBib citation key (published version when known) |
 | `B` | copy the full BibTeX record |
-| `q` / `esc` | quit |
+| `q` / `esc` / `ctrl-c` | quit |
 
 `/` refines the current query rather than replacing it, so you can narrow a search by
 typing more terms; `ctrl-u` clears it to start fresh. Expansion is tracked per paper id, so
@@ -241,19 +258,59 @@ $ eprint open <TAB>
 `show` and `bib` complete the same set, `eprint <TAB>` the commands, `eprint watch <TAB>` its three
 verbs. Typing an id that is not in the library still works — it just opens online, as always.
 
+**`--category <TAB>` offers the archive's categories** — there are only seven, nobody remembers their
+exact wording, and they are the one filter you cannot guess:
+
+```
+$ eprint watch add --category <TAB>
+Applications               -- 2024 papers
+Attacks and cryptanalysis  -- 1272 papers
+Cryptographic protocols    -- 6210 papers
+Foundations                -- 3088 papers
+Implementation             -- 2360 papers
+Public-key cryptography    -- 4783 papers
+Secret-key cryptography    -- 2882 papers
+```
+
+The list is read from your index rather than baked into the binary, so a category the archive adds
+shows up without a new release, and the counts tell you whether a filter is worth having. Any
+substring works too — `--category proto` is the same filter — and a name with a space is quoted for
+you as you complete it. This works wherever `--category` does: searches, `browse` and `watch add`.
+
+**`eprint watch rm <TAB>`** offers your saved watches by number, with what each one is:
+
+```
+$ eprint watch rm <TAB>
+1  -- --author Boudgoust
+2  -- lattice OR LWE
+3  -- --category Foundations
+```
+
+Those numbers are positions that renumber after every removal, so having them listed beats counting
+by hand. `--scope` and `--theme` complete their values too, and **flag names complete as well** —
+`eprint lattice -<TAB>` lists what a search takes, `eprint bib -<TAB>` what `bib` takes. Both
+`--category <value>` and `--category=<value>` are understood.
+
+Changing completion means starting a new shell, or `exec zsh` — the function is loaded once when the
+shell starts, so an already-open terminal keeps the version it read at login.
+
 Completion covers your **library**, not the whole archive: a short changing list is what completion
-is good at, and 26,000 candidates would mean megabytes of output on every keypress. Nothing
-completes for `--date` or watch expressions, where the candidate set is "anything you might type".
+is good at, and 26,000 candidates would mean megabytes of output on every keypress. `--author` is
+left out for the same reason — 21,466 distinct names is 1.1 MB per keypress. Nothing completes for
+`--date` or watch query terms either, where the candidate set is "anything you might type".
 
 Without any shell setup, **`eprint open` with no id lists the same thing**:
 
 ```
 $ eprint open
-  2026/1523  Catching Many Traitors in Threshold Traitor Tracing: Lower Bounds and Constructions
-  2026/1522  Efficient Ternary Computation of Optimal Ate Pairing on BLS27 Curves
+  2026/1523    1.2 MB  Catching Many Traitors in Threshold Traitor Tracing: Lower Bounds and Constructions
+  2026/1522    0.4 MB  Efficient Ternary Computation of Optimal Ate Pairing on BLS27 Curves
   …
-  6 papers in /Users/you/Documents/eprint
+  6 papers, 5.5 MB in /Users/you/Documents/eprint
 ```
+
+The sizes are there because "which of these can go?" is the question that comes before
+`eprint open --rm`.
 
 ## Keeping up
 
@@ -366,6 +423,7 @@ newer build moves them into the config for you and says so.
 
 ```sh
 eprint bib --update          # download / refresh the CryptoBib database
+eprint bib --update --force  # re-download even if unchanged
 eprint bib 2018/116          # citation key only
 eprint bib 2018/116 --entry  # the whole BibTeX record
 eprint bib                   # database status
@@ -573,8 +631,8 @@ contain the same terminology.
 Full-text PDFs are licensed individually per paper and are never fetched by this tool.
 `eprint open` hands the URL to your browser, so the download happens in a normal browser
 session under that paper's licence; the tool only files a copy your browser has already
-saved. Each result displays its licence (`CC-BY-4.0`, `CC-BY-NC-ND-4.0`, `CC0`, …) so you
-can see the terms before opening.
+saved. `eprint show` displays a paper's licence (`CC-BY-4.0`, `CC-BY-NC-ND-4.0`, `CC0`, …) so
+you can see the terms before opening.
 
 The harvester identifies itself honestly by User-Agent, paces requests, and honours
 `Retry-After` on 503/429.
@@ -588,7 +646,7 @@ Everything lives in two places, both safe to delete — the index rebuilds from 
 | Index + citation keys | `~/Library/Application Support/eprint/eprint.db` | `$XDG_DATA_HOME/eprint/eprint.db` |
 | Config | `~/.config/eprint/config.toml` | `~/.config/eprint/config.toml` |
 
-The database is roughly 95 MB with metadata only, or ~107 MB once CryptoBib entries are
+The database is roughly 94 MB with metadata only, or ~112 MB once CryptoBib entries are
 stored. Saved PDFs live separately, in `~/Documents/eprint/`. Override the locations with `$EPRINT_DB` and `$EPRINT_CONFIG`.
 
 ## Development

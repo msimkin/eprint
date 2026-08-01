@@ -155,6 +155,29 @@ pub fn cached(id: &str) -> Option<PathBuf> {
     }
 }
 
+/// Delete a paper's filed copy, returning the path that went. `None` means there
+/// was nothing filed for that id — a miss, not a failure.
+///
+/// The path comes from `cached()`, so it is inside the library by construction;
+/// it is re-checked anyway, because this is the only destructive operation in the
+/// tool and a future change to `cached` must not be able to aim it at a file the
+/// user did not put here.
+pub fn remove(id: &str) -> Result<Option<PathBuf>> {
+    let Some(path) = cached(id) else {
+        return Ok(None);
+    };
+    let dir = library_dir()?;
+    if path.parent() != Some(dir.as_path()) {
+        anyhow::bail!(
+            "refusing to delete {}: it is not in {}",
+            path.display(),
+            dir.display()
+        );
+    }
+    fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    Ok(Some(path))
+}
+
 /// The title is only needed to build a filename, and the caller of `cached` may
 /// not have a database handle, so look it up on demand and shrug off failure.
 fn title_of(id: &str) -> Option<String> {

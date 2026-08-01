@@ -281,6 +281,19 @@ pub fn titles(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Strin
     Ok(out)
 }
 
+/// The categories actually present in the index, with how many papers carry each,
+/// commonest first. Read from the data rather than hard-coded: the archive owns
+/// this list, so a category it adds should appear here without a release. Papers
+/// with no category at all are left out — there is nothing to type for them.
+pub fn categories(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT category, COUNT(*) FROM papers
+         WHERE category <> '' GROUP BY category ORDER BY 2 DESC, 1",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 pub fn bib_map(conn: &Connection, ids: &[String]) -> Result<HashMap<String, (String, bool)>> {
     let mut out = HashMap::new();
     if ids.is_empty() || bib_count(conn)? == 0 {
