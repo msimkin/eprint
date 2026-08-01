@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 
 use crate::db::{self, Hit, Query, Scope, MARK_END, MARK_START};
-use crate::render::{full_authors, short_authors, wrap, wrap_body, BADGE, BADGE_W};
+use crate::render::{
+    full_authors, loved, short_authors, wrap, wrap_body, BADGE, BADGE_W, LOVE_W,
+};
 use crate::theme::{Theme, Tone};
 
 #[derive(Default, Clone)]
@@ -61,6 +63,8 @@ struct App {
     watch_list: Vec<db::Watch>,
     /// Age of the CryptoBib data in days, when it is old enough to mention.
     bib_stale_days: Option<i64>,
+    /// The one name to wrap in hearts, if the config names one.
+    favourite: Option<String>,
 }
 
 impl App {
@@ -208,10 +212,11 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         // Surnames while collapsed, so rows stay scannable. Expanding gives the
         // full byline its own line — as `eprint show` does — because appending
         // eight first names to the `·`-joined line buries the date behind them.
+        let fav = app.favourite.as_deref();
         let mut meta = vec![if is_open {
-            full_authors(&p.authors)
+            full_authors(&p.authors, fav)
         } else {
-            short_authors(&p.authors)
+            short_authors(&p.authors, fav)
         }];
         if is_open {
             let mut trailer: Vec<String> = Vec::new();
@@ -225,12 +230,19 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
                 meta.push(trailer.join(" · "));
             }
         }
+        // Same reservation as the inline renderer: a heart may be two cells wide.
+        let meta_w = if loved(&p.authors, fav) {
+            body_w.saturating_sub(LOVE_W)
+        } else {
+            body_w
+        };
+        let love_s = th.style(Tone::Love);
+        let mut lopen = false;
         for src in &meta {
-            for m in wrap(src, body_w) {
-                lines.push(Line::from(vec![
-                    Span::raw(pad.clone()),
-                    Span::styled(m, meta_s),
-                ]));
+            for m in wrap(src, meta_w) {
+                let mut spans = vec![Span::raw(pad.clone())];
+                spans.extend(marked_spans(&m, meta_s, love_s, &mut lopen));
+                lines.push(Line::from(spans));
             }
         }
 
@@ -319,6 +331,7 @@ pub fn run(
         watched: HashSet::new(),
         watched_only: false,
         watch_list,
+        favourite: crate::config::load().favourite_author,
         status: None,
         filters,
         theme,

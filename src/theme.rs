@@ -24,6 +24,9 @@ pub enum Tone {
     Match,
     Marker,
     Head,
+    /// The one author named by `favourite_author`. Dusty rose: warm enough to
+    /// read as affection, muted enough to sit beside the brass and verdigris.
+    Love,
     /// A paper matching a saved watch. Dark gold (256-colour 136): the one
     /// deliberate exception to the 16-colour rule, because "a bit darker than
     /// the match highlight" is not expressible as a palette index — a theme's
@@ -84,6 +87,7 @@ impl Theme {
             (Mode::Dark, Tone::Marker) => "\x1b[38;5;66m",
             (Mode::Dark, Tone::Head) => "\x1b[1m",
             (Mode::Dark, Tone::Watch) => "\x1b[1;38;5;136m",
+            (Mode::Dark, Tone::Love) => "\x1b[38;5;131m",
 
             (Mode::Light, Tone::Id) => "\x1b[38;5;30m",
             (Mode::Light, Tone::Title) => "\x1b[1m",
@@ -93,6 +97,7 @@ impl Theme {
             (Mode::Light, Tone::Marker) => "\x1b[38;5;30m",
             (Mode::Light, Tone::Head) => "\x1b[1m",
             (Mode::Light, Tone::Watch) => "\x1b[1;38;5;136m",
+            (Mode::Light, Tone::Love) => "\x1b[38;5;95m",
 
             (Mode::Mono, Tone::Id) => "\x1b[1m",
             (Mode::Mono, Tone::Title) => "\x1b[1m",
@@ -102,6 +107,8 @@ impl Theme {
             (Mode::Mono, Tone::Marker) => "\x1b[1m",
             (Mode::Mono, Tone::Head) => "\x1b[1m",
             (Mode::Mono, Tone::Watch) => "\x1b[1m",
+            // No colour to give, and none needed: a heart is legible as itself.
+            (Mode::Mono, Tone::Love) => "",
 
             // Matches set both foreground and background, so they keep their
             // contrast whatever the terminal background is.
@@ -132,7 +139,7 @@ impl Theme {
         let s = Style::default();
         if !self.color {
             return match t {
-                Tone::Title | Tone::Id | Tone::Marker | Tone::Head | Tone::Watch => {
+                Tone::Title | Tone::Id | Tone::Marker | Tone::Head | Tone::Watch | Tone::Love => {
                     s.add_modifier(Modifier::BOLD)
                 }
                 Tone::Meta => s.add_modifier(Modifier::DIM),
@@ -150,6 +157,7 @@ impl Theme {
             (Mode::Dark, Tone::Marker) => s.fg(Color::Indexed(66)).add_modifier(Modifier::BOLD),
             (Mode::Dark, Tone::Head) => s.add_modifier(Modifier::BOLD),
             (Mode::Dark, Tone::Watch) => s.fg(Color::Indexed(136)).add_modifier(Modifier::BOLD),
+            (Mode::Dark, Tone::Love) => s.fg(Color::Indexed(131)),
 
             (Mode::Light, Tone::Id) => s.fg(Color::Indexed(30)),
             (Mode::Light, Tone::Title) => s.add_modifier(Modifier::BOLD),
@@ -159,6 +167,7 @@ impl Theme {
             (Mode::Light, Tone::Marker) => s.fg(Color::Indexed(30)).add_modifier(Modifier::BOLD),
             (Mode::Light, Tone::Head) => s.add_modifier(Modifier::BOLD),
             (Mode::Light, Tone::Watch) => s.fg(Color::Indexed(136)).add_modifier(Modifier::BOLD),
+            (Mode::Light, Tone::Love) => s.fg(Color::Indexed(95)),
 
             (Mode::Mono, _) => s,
 

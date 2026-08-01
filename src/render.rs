@@ -12,6 +12,8 @@ pub struct Style {
     pub bare_urls: bool,
     pub width: usize,
     pub height: usize,
+    /// The one name to wrap in hearts, if the config names one.
+    pub favourite: Option<String>,
 }
 
 /// macOS Terminal.app does not implement OSC 8; it does cmd-click plain URLs.
@@ -31,6 +33,7 @@ pub struct StyleOpts {
     /// None = auto-detect
     pub urls: Option<bool>,
     pub theme: String,
+    pub favourite: Option<String>,
 }
 
 impl Style {
@@ -43,6 +46,7 @@ impl Style {
             .unwrap_or((100, 40));
         let osc8 = on && terminal_supports_osc8();
         Style {
+            favourite: o.favourite,
             theme: Theme::resolve(&o.theme, on),
             links: osc8,
             bare_urls: o.urls.unwrap_or(on && !osc8),
@@ -62,14 +66,14 @@ impl Style {
     /// Render one already-wrapped line, converting FTS5 match markers into the
     /// theme's match colour. `open` carries highlight state across a line
     /// break so a match split by wrapping still closes cleanly on each line.
-    fn marked(&self, s: &str, base: Tone, open: &mut bool) -> String {
+    fn marked(&self, s: &str, base: Tone, hl: Tone, open: &mut bool) -> String {
         if !self.theme.color {
             *open = false;
             return s.replace(MARK_START, "").replace(MARK_END, "");
         }
         let reset = self.theme.reset();
         let base_code = self.theme.ansi(base);
-        let hit_code = self.theme.ansi(Tone::Match);
+        let hit_code = self.theme.ansi(hl);
         let mut out = String::new();
         let mut on = *open;
         let mut cur = String::new();
@@ -192,10 +196,34 @@ pub fn wrap_body(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Hearts either side of a favourite author, with the name between them marked so
+/// the renderer can colour the whole `♥ Name ♥` run. `♥` is East-Asian Ambiguous,
+/// so a decorated byline reserves `LOVE_W` extra columns when wrapping — the same
+/// concession the watch badge avoids by using a narrow glyph.
+pub const LOVE_W: usize = 2;
+
+fn adore(name: &str) -> String {
+    format!("{MARK_START}♥ {name} ♥{MARK_END}")
+}
+
+/// Case-insensitive substring, the same rule as the `--author` filter, so
+/// "simkin" matches "Mark Simkin".
+fn is_favourite(name: &str, fav: Option<&str>) -> bool {
+    match fav {
+        Some(f) => name.to_lowercase().contains(&f.trim().to_lowercase()),
+        None => false,
+    }
+}
+
+/// Does this paper have the favourite author on it at all?
+pub fn loved(authors: &str, fav: Option<&str>) -> bool {
+    authors.split(';').any(|n| is_favourite(n, fav))
+}
+
 /// Every author, first names included. `short_authors` reduces to surnames so a
 /// list of results stays scannable; this is for the single-paper views, where the
 /// byline is worth the lines it takes.
-pub fn full_authors(authors: &str) -> String {
+pub fn full_authors(authors: &str, fav: Option<&str>) -> String {
     let names: Vec<&str> = authors
         .split(';')
         .map(|s| s.trim())
@@ -204,10 +232,20 @@ pub fn full_authors(authors: &str) -> String {
     if names.is_empty() {
         return "—".to_string();
     }
-    names.join(", ")
+    names
+        .iter()
+        .map(|n| {
+            if is_favourite(n, fav) {
+                adore(n)
+            } else {
+                n.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-pub fn short_authors(authors: &str) -> String {
+pub fn short_authors(authors: &str, fav: Option<&str>) -> String {
     let names: Vec<&str> = authors
         .split(';')
         .map(|s| s.trim())
@@ -216,15 +254,25 @@ pub fn short_authors(authors: &str) -> String {
     if names.is_empty() {
         return "—".to_string();
     }
-    let last = |n: &str| -> String { n.split_whitespace().last().unwrap_or(n).to_string() };
+    let show = |n: &str| -> String {
+        let surname = n.split_whitespace().last().unwrap_or(n).to_string();
+        if is_favourite(n, fav) {
+            adore(&surname)
+        } else {
+            surname
+        }
+    };
     if names.len() <= 3 {
-        names.iter().map(|n| last(n)).collect::<Vec<_>>().join(", ")
-    } else {
-        format!(
-            "{}, et al.",
-            names.iter().take(2).map(|n| last(n)).collect::<Vec<_>>().join(", ")
-        )
+        return names.iter().map(|n| show(n)).collect::<Vec<_>>().join(", ");
     }
+    let mut head: Vec<String> = names.iter().take(2).map(|n| show(n)).collect();
+    // A favourite hiding in the tail would be collapsed into "et al.", leaving
+    // nothing to decorate on exactly the many-author papers this field is full
+    // of — so she takes the last visible slot instead.
+    if let Some(f) = names.iter().skip(2).find(|n| is_favourite(n, fav)) {
+        head.push(show(f));
+    }
+    format!("{}, et al.", head.join(", "))
 }
 
 pub fn short_license(rights: &str) -> String {
@@ -311,7 +359,7 @@ pub fn render_hit(
         String::new()
     };
     let mut topen = false;
-    let first = st.marked(&title_lines[0], Tone::Title, &mut topen);
+    let first = st.marked(&title_lines[0], Tone::Title, Tone::Match, &mut topen);
     let _ = writeln!(
         out,
         "  {}{}",
@@ -322,14 +370,15 @@ pub fn render_hit(
         let _ = writeln!(
             out,
             "{pad}{}{}",
-            st.marked(line, Tone::Title, &mut topen),
+            st.marked(line, Tone::Title, Tone::Match, &mut topen),
             if i == last { badge.as_str() } else { "" }
         );
     }
 
     // Authors only in the list; date and citation key join once an abstract
     // is open.
-    let mut meta: Vec<String> = vec![short_authors(&p.authors)];
+    let fav = st.favourite.as_deref();
+    let mut meta: Vec<String> = vec![short_authors(&p.authors, fav)];
     if show_abstract && !p.date.is_empty() {
         meta.push(p.date.chars().take(10).collect());
     }
@@ -338,8 +387,17 @@ pub fn render_hit(
             meta.push(key.clone());
         }
     }
-    for line in wrap(&meta.join(" · "), body_width) {
-        let _ = writeln!(out, "{pad}{}", th.paint(Tone::Meta, &line));
+    // Hearts may be drawn two cells wide, so a decorated byline gets the columns
+    // back before wrapping. Styling is per line, after the wrap, as everywhere.
+    let byline = meta.join(" · ");
+    let width = if loved(&p.authors, fav) {
+        body_width.saturating_sub(LOVE_W)
+    } else {
+        body_width
+    };
+    let mut lopen = false;
+    for line in wrap(&byline, width) {
+        let _ = writeln!(out, "{pad}{}", st.marked(&line, Tone::Meta, Tone::Love, &mut lopen));
     }
 
     if st.bare_urls {
@@ -355,7 +413,7 @@ pub fn render_hit(
             if line.is_empty() {
                 let _ = writeln!(out);
             } else {
-                let _ = writeln!(out, "{pad}{}", st.marked(&line, Tone::Body, &mut open));
+                let _ = writeln!(out, "{pad}{}", st.marked(&line, Tone::Body, Tone::Match, &mut open));
             }
         }
     }
@@ -394,8 +452,16 @@ pub fn render_full(out: &mut String, p: &Paper, st: &Style, bib: Option<&(String
     for line in wrap(&p.title, width) {
         let _ = writeln!(out, "{}", th.paint(Tone::Title, &line));
     }
-    for line in wrap(&full_authors(&p.authors), width) {
-        let _ = writeln!(out, "{}", th.paint(Tone::Meta, &line));
+    let fav = st.favourite.as_deref();
+    let byline = full_authors(&p.authors, fav);
+    let bw = if loved(&p.authors, fav) {
+        width.saturating_sub(LOVE_W)
+    } else {
+        width
+    };
+    let mut lopen = false;
+    for line in wrap(&byline, bw) {
+        let _ = writeln!(out, "{}", st.marked(&line, Tone::Meta, Tone::Love, &mut lopen));
     }
     let _ = writeln!(out);
     let mut meta = vec![format!("ePrint {}", p.id)];

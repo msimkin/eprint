@@ -17,6 +17,10 @@ pub struct Config {
     /// Saved searches, in file order. They live here rather than in the index so
     /// that copying this one file to another machine copies your whole setup.
     pub watches: Vec<Watch>,
+    /// An author to mark with a heart wherever their name appears in a byline.
+    /// Matched case-insensitively as a substring, like `--author`. Undocumented
+    /// on purpose; it lives in the config so no name is ever committed.
+    pub favourite_author: Option<String>,
 }
 
 impl Default for Config {
@@ -27,6 +31,7 @@ impl Default for Config {
             limit: 20,
             latest_limit: 10,
             watches: Vec::new(),
+            favourite_author: None,
         }
     }
 }
@@ -226,6 +231,9 @@ pub fn load() -> Config {
             }
             // Repeated, unlike every other key: each line is one saved search.
             // Numbered by position, which is what `eprint watch rm <n>` takes.
+            "favourite_author" => {
+                c.favourite_author = Some(v).filter(|s| !s.trim().is_empty());
+            }
             "watch" => {
                 let next = c.watches.len() as i64 + 1;
                 if let Some(w) = parse_watch(next, &raw) {

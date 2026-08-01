@@ -103,6 +103,13 @@ enum Cmd {
         #[arg(short = 'e', long, conflicts_with = "init")]
         edit: bool,
     },
+    /// Kept working, kept out of `--help`. Removing it entirely turned
+    /// `eprint search NAPs` into a search for the words "search" and "NAPs",
+    /// which silently returns junk instead of erroring — a trap that caught its
+    /// own author within a day. Hiding it shortens the command list, which was
+    /// the point, without punishing muscle memory.
+    #[command(hide = true)]
+    Search(SearchArgs),
 }
 
 /// `-n 0` is not "no limit", it is a query that can only return nothing, so
@@ -411,6 +418,7 @@ fn style_for(a: &SearchArgs, cfg: &config::Config) -> Style {
         force_color: a.color && !a.json,
         urls,
         theme: a.theme.clone().unwrap_or_else(|| cfg.theme.clone()),
+        favourite: cfg.favourite_author.clone(),
     })
 }
 
@@ -687,6 +695,16 @@ fn bib_stale_days(conn: &rusqlite::Connection) -> Result<Option<i64>> {
     } else {
         None
     })
+}
+
+/// No query and no filters is not an empty search, it is "what is new?". Shared by
+/// the bare invocation and the hidden `search` alias so the two cannot diverge.
+fn query_or_feed(a: &SearchArgs) -> Result<()> {
+    if a.is_latest() {
+        do_feed(a)
+    } else {
+        do_search(a)
+    }
 }
 
 /// A bare `eprint`: the papers that have arrived since you last looked. Refreshes
@@ -1112,6 +1130,7 @@ fn do_status() -> Result<()> {
         force_color: false,
         urls: None,
         theme: config::load().theme,
+        favourite: config::load().favourite_author,
     });
     let total = db::count(&conn)?;
     let path = db::db_path()?;
@@ -1154,9 +1173,8 @@ fn real_main() -> Result<()> {
     }
     let cli = Cli::parse();
     match cli.cmd {
-        // No query and no filters is not an empty search, it is "what is new?".
-        None if cli.search.is_latest() => do_feed(&cli.search),
-        None => do_search(&cli.search),
+        None => query_or_feed(&cli.search),
+        Some(Cmd::Search(a)) => query_or_feed(&a),
         Some(Cmd::Browse(a)) => do_browse(&a),
         Some(Cmd::Update { full, quiet }) => do_update(full, quiet),
         Some(Cmd::Watch { action }) => do_watch(action),
@@ -1175,6 +1193,7 @@ fn real_main() -> Result<()> {
                 force_color: false,
                 urls: None,
                 theme: config::load().theme,
+                favourite: config::load().favourite_author,
             });
             let id = normalise_id(&id);
             match db::get(&conn, &id)? {

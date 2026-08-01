@@ -149,9 +149,9 @@ too.
 eprint                                # papers that arrived since you last looked
 eprint "threshold ecdsa"              # search
 eprint "fully homomorphic" -a         # include full abstracts
-eprint "Dan Boneh" -t                 # match titles and authors only
+eprint "Katharina Boudgoust" -t       # match titles and authors only
 eprint garbled --year 2024 -n 50      # filter by year, more results
-eprint --author Boneh --since 2y      # browse without a query
+eprint --author Boudgoust --since 2y  # filter without a query
 eprint --category "Public-key" -n 5   # filter by IACR category
 eprint show 2026/1538                 # one paper in full
 eprint open 2026/1538                 # the PDF — your local copy once you have one
@@ -162,15 +162,16 @@ eprint update                         # refresh now
 eprint update --full                  # rebuild from scratch
 ```
 
-There is no `search` subcommand: a query is just the first argument. Anything you type is
-therefore treated as query terms, so `eprint search foo` searches for the words "search foo".
+A query is just the first argument, so `eprint search <query>` and `eprint <query>` are the same
+thing; `search` is kept for the fingers that expect it. `new` and `Bib` are not — those words are
+now ordinary query terms.
 
 ## Interactive browser
 
 ```sh
 eprint browse                      # everything, newest first
 eprint browse "lattice signature"  # start from a query
-eprint browse --author Boneh --since 2y
+eprint browse --author Boudgoust --since 2y
 ```
 
 A full-screen browser for exploring rather than looking something up. Abstracts expand and
@@ -187,7 +188,7 @@ collapse in place, and matches stay highlighted inside the expanded text.
 | `w` | show only papers matching a watch — searches apply within that subset |
 | `/` | edit the query — results filter live as you type |
 | `ctrl-u` | clear the query (while editing) |
-| `enter` / `o` | open the paper in your browser |
+| `enter` / `o` | open the PDF — your local copy once you have one |
 | `y` | copy the URL to the clipboard |
 | `b` | copy the CryptoBib citation key (published version when known) |
 | `B` | copy the full BibTeX record |
@@ -245,25 +246,24 @@ A watch is a saved search that marks the papers you care about. It is **purely a
 feature**: it never changes which papers are shown, how many, or in what order.
 
 ```sh
-eprint watch add "lattice OR LWE"     # any `search` query works
-eprint watch add --author Boneh       # an author, with or without terms
-eprint watch add zk --category "Public-key"
-eprint watch add "proof of work" -t   # titles and authors only
-eprint watch                          # list them, numbered
-eprint watch rm 2                     # remove one
+eprint watch add "lattice OR LWE"            # papers mentioning either term
+eprint watch add --author Boudgoust          # everything by one author
+eprint watch add zk --category "Public-key"  # "zk" AND in that IACR category
+eprint watch add "proof of work" -t          # those words in the title or authors
+eprint watch                                 # list them, numbered
+eprint watch rm 2                            # remove one
 eprint watch rm --all
 ```
 
-Matching papers get a gold `✱` after the title and their id in the same gold, everywhere a
-list of papers appears — `search`, a bare `eprint`, `new` and `browse`:
+Matching papers get a gold `✱` after the title and their id in the same gold, everywhere a list
+of papers appears — searches, the feed and `browse`:
 
 ```
-  2026/1523    Catching Many Traitors in Threshold Traitor Tracing: Lower Bounds and
-               Constructions ✱
-               Boneh, Partap, Zhandry
+  2026/833     Scale, Round, Break: Simple Leakage Attacks on Secret Sharing Schemes ✱
+               Boudgoust, Simkin
 
-  2026/1268    Decentralized Multi-Authority (Attribute-Based) Traitor Tracing
-               Datta, Schädlich, Tairi
+  2026/459     Naor-Yung Transform for IND-CCA Probing Security with Lattice Instantiations ✱
+               Boudgoust, Imbert, et al.
 ```
 
 The badge follows the title text rather than sitting in a fixed column, so only a watched
@@ -285,8 +285,8 @@ them:
 
 ```toml
 watch = "lattice OR LWE"
-watch = --author Boneh
-watch = zk --category "Public-key"
+watch = --author Boudgoust
+watch = zk --category "Public-key"   # terms and filters combine: both must hold
 watch = "proof of work" --title
 ```
 
@@ -373,32 +373,40 @@ Lives at `~/.config/eprint/config.toml` (override with `$EPRINT_CONFIG`):
 theme = "auto"       # auto | dark | light | mono
 scope = "all"        # all | title
 limit = 20           # results for a search
-latest_limit = 10    # results for a bare `eprint`
-watch = --author Boneh    # zero or more; see Watches below
+latest_limit = 10    # fewest shown by a bare `eprint`
+watch = --author Boudgoust   # zero or more; see Watches below
 ```
 
-`latest_limit` covers only the no-argument case — a bare `eprint`, which lists the newest
-papers and defaults to 10 however large `limit` is. Any query term or filter (`--author`,
-`--year`, `--since`, `--category`) makes it a search and uses `limit`. `-n` overrides both.
+`limit` caps a search. `latest_limit` is the floor under a bare `eprint` — see
+[Keeping up](#keeping-up) — and applies only when there is no query and no filter; any query
+term or filter (`--author`, `--year`, `--since`, `--category`) makes it a search. `-n` overrides
+both.
 
-Results list authors only. The date joins them once an abstract is open (`space` in
-`browse`, `-a` in `search`). Category and licence are shown by `eprint show`.
+Results list authors only. The date joins them once an abstract is open (`space` in `browse`,
+`-a` inline). Category and licence are shown by `eprint show`.
 
 Command-line flags override the config file, which overrides the built-in defaults.
 
 ### Colour
 
-The palette uses your terminal's own 16 ANSI colours rather than fixed RGB values, so it
-inherits whatever theme you have configured. Two variants avoid the ends of the palette
-that go unreadable:
+A muted 256-colour palette — brass and verdigris — picked so that the watch badge is the
+loudest thing on screen:
 
-- `dark` — bright cyan / silver / bright blue, avoiding ANSI blue 4 and dark-gray 8, which
-  are near-invisible on a black background
-- `light` — blue and dark gray, which would wash out on a dark background
-- `mono` — no colour at all, only bold, dim, underline and reverse
+| | `dark` | `light` |
+|---|---|---|
+| paper ids | 66 `#5f8787` | 30 `#008787` |
+| URLs (underlined) | 103 `#8787af` | 61 `#5f5faf` |
+| authors, dates, footers | 102 `#878787` | 240 `#585858` |
+| watch badge | 136 `#af8700` | 136 `#af8700` |
+| query matches | black on bright yellow | black on bright yellow |
 
-Matches set both foreground *and* background (black on yellow), so highlighting keeps its
-contrast under either variant.
+Matches set both foreground *and* background, so highlighting keeps its contrast on either
+ground. `mono` drops colour entirely and uses only bold, dim, underline and reverse.
+
+These are fixed indices rather than your terminal's own first sixteen colours, which is a
+deliberate trade: the sixteen offer no muted mid-tones and their brightness is whatever your
+theme decides, so a palette built on them could not stay balanced. `mono` still inherits
+everything.
 
 `auto` reads `COLORFGBG` when the terminal sets it — rxvt and Konsole do, but macOS
 Terminal.app and iTerm2 do not — and otherwise assumes a dark background. If that guess is
@@ -428,15 +436,10 @@ Queries use SQLite FTS5 syntax with Porter stemming, so `signature` also matches
 Punctuation that FTS5 would reject (`zero-knowledge`, `MPC (dishonest majority)!`) is
 handled automatically — the query is retried with each term quoted.
 
-**Partial words match.** The index matches whole tokens, so `bone` would not find `Boneh`
-on its own. Bare terms are therefore treated as prefixes automatically: `bone` behaves as
-`bone*`. Quoted phrases, operators, column filters and terms already ending in `*` are left
+**Partial words match.** The index matches whole tokens, so `boud` would not find `Boudgoust`
+on its own. Bare terms are therefore treated as prefixes automatically: `boud` behaves as
+`boud*`. Quoted phrases, operators, column filters and terms already ending in `*` are left
 exactly as written. Pass `--exact` for strict whole-word matching.
-
-### Sorting
-
-Results are always **newest first**, in `search`, `browse` and `new` alike. There is no
-ordering to choose and nothing to configure.
 
 ### Search scope
 
@@ -445,8 +448,8 @@ title and authors only — useful when searching for a person, where abstract ma
 mostly papers *citing* them rather than papers *by* them.
 
 ```sh
-eprint "Dan Boneh"        # 109 hits, includes papers citing him
-eprint "Dan Boneh" -t     # title and authors only
+eprint Boudgoust          # 21 hits, three of them papers *citing* her
+eprint Boudgoust -t       # 18 — title and authors only
 ```
 
 In `browse`, press `t` to toggle scope and watch the result count change live.
@@ -457,7 +460,7 @@ In `browse`, press `t` to toggle scope and watch the result count change live.
 when output is piped.
 
 ```sh
-eprint "verifiable delay" --json | jq -r '.[].url'
+eprint "threshold signature" --json | jq -r '.[].url'
 eprint zk --color | less -R        # force colour through a pager
 ```
 
@@ -497,8 +500,8 @@ Everything lives in two places, both safe to delete — the index rebuilds from 
 | Index + citation keys | `~/Library/Application Support/eprint/eprint.db` | `$XDG_DATA_HOME/eprint/eprint.db` |
 | Config | `~/.config/eprint/config.toml` | `~/.config/eprint/config.toml` |
 
-The database is roughly 95 MB with metadata only, or ~105 MB once CryptoBib entries are
-stored. Override the locations with `$EPRINT_DB` and `$EPRINT_CONFIG`.
+The database is roughly 95 MB with metadata only, or ~107 MB once CryptoBib entries are
+stored. Saved PDFs live separately, in `~/Documents/eprint/`. Override the locations with `$EPRINT_DB` and `$EPRINT_CONFIG`.
 
 ## Development
 
@@ -516,13 +519,14 @@ Pass `EPRINT_DB=/tmp/scratch.db` to work against a throwaway index instead of yo
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | CLI definition, command dispatch, config/flag resolution |
-| `src/db.rs` | SQLite schema, migrations, FTS5 search and ranking |
+| `src/db.rs` | SQLite schema, migrations, FTS5 query building |
 | `src/harvest.rs` | OAI-PMH harvester for paper metadata |
 | `src/bib.rs` | CryptoBib fetch, BibTeX parsing, `@String` macro expansion |
 | `src/render.rs` | Inline output: wrapping, highlighting, hyperlinks |
+| `src/pdf.rs` | The local PDF library: filing and finding saved papers |
 | `src/tui.rs` | Interactive browser (ratatui) |
 | `src/theme.rs` | Colour palettes shared by both front-ends |
-| `src/config.rs` | Config file reading |
+| `src/config.rs` | Config file reading and writing (settings and watches) |
 
 Two independent data sources feed one SQLite database: ePrint's OAI-PMH endpoint supplies
 paper metadata (`papers`, plus an FTS5 index), and CryptoBib supplies citation keys
