@@ -106,6 +106,15 @@ fn unquote(s: &str) -> String {
 /// which is also what `Watch::label()` writes, so a round trip is lossless.
 /// Returns `None` for a line that would watch nothing.
 fn parse_watch(id: i64, value: &str) -> Option<Watch> {
+    // The file is named `.toml`, which invites wrapping the whole value in quotes
+    // — `watch = "--author Boudgoust"`. Left alone that parses as a phrase query
+    // for the literal text and matches nothing, silently. Unwrap it when the
+    // inside carries a flag, which leaves a genuine phrase like
+    // `watch = "proof of work"` untouched.
+    let value = match value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        Some(inner) if inner.starts_with('-') || inner.contains(" --") => inner,
+        _ => value,
+    };
     let toks = tokens(value);
     let mut terms: Vec<String> = Vec::new();
     let mut author = None;

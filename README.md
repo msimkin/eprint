@@ -283,12 +283,17 @@ restores everything.
 Watches live in the **config file**, one `watch` line each, written exactly as you would type
 them:
 
-```toml
-watch = "lattice OR LWE"
+```ini
+watch = lattice OR LWE
 watch = --author Boudgoust
-watch = zk --category "Public-key"   # terms and filters combine: both must hold
-watch = "proof of work" --title
+watch = zk --category Public-key   # terms and filters combine: both must hold
+watch = proof of work --title
 ```
+
+Values are written the way the tool writes them, and quoting means the same thing it means on
+the command line: bare words are separate terms, `"a b"` is an exact phrase. So
+`watch = lattice OR LWE` is an OR, while `watch = "lattice OR LWE"` would look for that literal
+phrase and match nothing.
 
 So copying `~/.config/eprint/config.toml` to another machine copies your whole setup — theme,
 limits and watches together — and you can add or remove them by hand with `eprint config --edit`
@@ -369,13 +374,16 @@ eprint config --init   # write a commented default file without opening it
 
 Lives at `~/.config/eprint/config.toml` (override with `$EPRINT_CONFIG`):
 
-```toml
+```ini
 theme = "auto"       # auto | dark | light | mono
 scope = "all"        # all | title
 limit = 20           # results for a search
 latest_limit = 10    # fewest shown by a bare `eprint`
 watch = --author Boudgoust   # zero or more; see Watches below
 ```
+
+Despite the `.toml` name the format is a plain `key = value` reader — no tables, no arrays, and
+`watch` may repeat, which real TOML forbids. Values may be quoted or bare.
 
 `limit` caps a search. `latest_limit` is the floor under a bare `eprint` — see
 [Keeping up](#keeping-up) — and applies only when there is no query and no filter; any query
