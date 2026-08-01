@@ -106,6 +106,12 @@ eprint --version
 
 The first search builds the local index automatically — about 30 seconds, once.
 
+Switch on Tab completion while you are here (zsh):
+
+```sh
+eprint config --completions
+```
+
 ### Without installing
 
 To run it from the build directory instead:
@@ -150,8 +156,8 @@ eprint                                # papers that arrived since you last looke
 eprint "threshold ecdsa"              # search
 eprint "fully homomorphic" -a         # include full abstracts
 eprint "Katharina Boudgoust" -t       # match titles and authors only
-eprint garbled --year 2024 -n 50      # filter by year, more results
-eprint --author Boudgoust --since 2y  # filter without a query
+eprint garbled --date 2024 -n 50      # one year, more results
+eprint --author Boudgoust --date 2y   # filter without a query
 eprint --category "Public-key" -n 5   # filter by IACR category
 eprint show 2026/1538                 # one paper in full
 eprint open 2026/1538                 # the PDF — your local copy once you have one
@@ -171,11 +177,14 @@ now ordinary query terms.
 ```sh
 eprint browse                      # everything, newest first
 eprint browse "lattice signature"  # start from a query
-eprint browse --author Boudgoust --since 2y
+eprint browse --author Boudgoust --date 2023..2024
 ```
 
 A full-screen browser for exploring rather than looking something up. Abstracts expand and
-collapse in place, and matches stay highlighted inside the expanded text.
+collapse in place, and matches stay highlighted inside the expanded text. There is no cap on how
+much it loads — a bare `eprint browse` holds all ~26,000 papers and `G` really does reach the
+oldest one from 1996 — because only the rows on screen are ever laid out. `-n` still exists if you
+want a smaller set.
 
 | Key | Action |
 |---|---|
@@ -185,6 +194,7 @@ collapse in place, and matches stay highlighted inside the expanded text.
 | `space` / `tab` | expand or collapse the abstract |
 | `a` | expand or collapse everything |
 | `t` | toggle where the query is matched: `in: title, authors, abstract` ⇄ `in: title, authors` |
+| `d` | filter by date — same grammar as `--date`; empty clears it |
 | `w` | show only papers matching a watch — searches apply within that subset |
 | `/` | edit the query — results filter live as you type |
 | `ctrl-u` | clear the query (while editing) |
@@ -201,6 +211,50 @@ it survives re-searching.
 Because nothing needs to be clicked, `browse` works identically on terminals without OSC 8
 support — press `enter` instead.
 
+### Tab completion (zsh)
+
+```sh
+eprint config --completions      # adds one line to ~/.zshrc, then open a new shell
+```
+
+It is idempotent, tells you the file it touched, and does nothing if the line is already there.
+`eprint config` reports whether completion is on. To do it by hand instead:
+
+```sh
+echo 'eval "$(eprint completions zsh)"' >> ~/.zshrc
+```
+
+Either way that one line is enough even on a bare `.zshrc`: the function ships inside the binary and
+initialises zsh's completion system itself if your shell has not already done so. Without that,
+`compdef` is undefined and Tab does nothing **anywhere** — not just for `eprint` — which is a
+confusing way to discover that your shell never ran `compinit`.
+
+`eprint open <TAB>` then offers the papers you have already downloaded, with their titles:
+
+```
+$ eprint open <TAB>
+2026/1464  -- Optimal Distributed Monotone-Policy Encryption for DNFs and More from Lattices
+2026/1499  -- BF²: A Bloom-Filtered Brute-Force Framework for Multi-Target Password Recovery
+2026/1523  -- Catching Many Traitors in Threshold Traitor Tracing: Lower Bounds and Constructions
+```
+
+`show` and `bib` complete the same set, `eprint <TAB>` the commands, `eprint watch <TAB>` its three
+verbs. Typing an id that is not in the library still works — it just opens online, as always.
+
+Completion covers your **library**, not the whole archive: a short changing list is what completion
+is good at, and 26,000 candidates would mean megabytes of output on every keypress. Nothing
+completes for `--date` or watch expressions, where the candidate set is "anything you might type".
+
+Without any shell setup, **`eprint open` with no id lists the same thing**:
+
+```
+$ eprint open
+  2026/1523  Catching Many Traitors in Threshold Traitor Tracing: Lower Bounds and Constructions
+  2026/1522  Efficient Ternary Computation of Optimal Ate Pairing on BLS27 Curves
+  …
+  6 papers in /Users/you/Documents/eprint
+```
+
 ## Keeping up
 
 ```sh
@@ -214,8 +268,8 @@ something:
 - **More arrived than `latest_limit`?** You get the whole batch. Seventeen papers means seventeen
   lines, not a number chosen in advance.
 - **Fewer, or nothing new?** The list is topped up with the most recent arrivals to `latest_limit`
-  (10 by default), and the header says how many are actually new — `2 new since 2026-08-01`, or
-  `nothing new since 2026-08-01`.
+  (10 by default), and the header says how many are actually new — `2 new since 01/08/2026`, or
+  `nothing new since 01/08/2026`.
 - **`-n N`** overrides both as an exact count.
 
 So `latest_limit` is a floor, not a ceiling.
@@ -233,7 +287,7 @@ Rather than print "nothing new" for the rest of the day, the feed shows the last
 again, and says so:
 
 ```
-4 results  last batch, from 2026-07-30 · nothing new yet
+4 results  last batch, from 30/07/2026 · nothing new yet
 ```
 
 When the archive does move, you get only the genuinely new papers and *those* become the
@@ -387,7 +441,7 @@ Despite the `.toml` name the format is a plain `key = value` reader — no table
 
 `limit` caps a search. `latest_limit` is the floor under a bare `eprint` — see
 [Keeping up](#keeping-up) — and applies only when there is no query and no filter; any query
-term or filter (`--author`, `--year`, `--since`, `--category`) makes it a search. `-n` overrides
+term or filter (`--author`, `--date`, `--category`) makes it a search. `-n` overrides
 both.
 
 Results list authors only. The date joins them once an abstract is open (`space` in `browse`,
@@ -448,6 +502,32 @@ handled automatically — the query is retried with each term quoted.
 on its own. Bare terms are therefore treated as prefixes automatically: `boud` behaves as
 `boud*`. Quoted phrases, operators, column filters and terms already ending in `*` are left
 exactly as written. Pass `--exact` for strict whole-word matching.
+
+### Dates
+
+Dates are shown and accepted day-first: `28/04/2026`. One flag, `--date`, carries a single date or
+a range, at whatever granularity you feel like:
+
+| Example | Meaning |
+|---|---|
+| `--date 2024` | all of 2024 |
+| `--date 04/2024` | that month |
+| `--date 28/04/2024` | that day |
+| `--date 2023..2024` | both years |
+| `--date 04/2024..06/2024` | April to June |
+| `--date 2023..` | 2023 onwards |
+| `--date ..2020` | everything up to the end of 2020 |
+| `--date 30d` | the last 30 days; also `2y`, `1w`, `1m` |
+
+Both ends of a range may be a year, a month or a day, and they need not match. An upper bound
+always includes the whole period it names, so `..2020` runs to 31 December.
+
+`04/28/2026` is rejected rather than guessed at — 28 is not a month, and the error says so.
+
+In `browse`, **`d`** opens the same thing as a prompt: type `2023..2024`, enter to apply, an empty
+prompt to clear, `esc` to cancel. A misparse keeps the prompt open with the error in the footer, so
+you correct it rather than retype it. The active range shows in the header — including one that came
+from `--date` on the command line, which was previously invisible once you were inside.
 
 ### Search scope
 

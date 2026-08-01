@@ -162,6 +162,45 @@ fn title_of(id: &str) -> Option<String> {
     crate::db::get(&conn, id).ok()?.map(|p| p.title)
 }
 
+/// Every paper in the library, newest first. The listing counterpart to `cached`,
+/// which does the same scan looking for one id.
+pub fn library() -> Vec<(String, PathBuf)> {
+    let Ok(dir) = library_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<((i64, i64), String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pdf") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some((y, n)) = split_id(stem) {
+            out.push(((y, n), format!("{y}/{n}"), path));
+        }
+    }
+    // Numerically, not by string: "2026/674" sorts above "2026/1523" as text.
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, id, path)| (id, path)).collect()
+}
+
+/// The filename's own words, for a paper the index has never heard of: the slug
+/// read back as a sentence beats showing nothing.
+pub fn slug_words(path: &Path) -> String {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return String::new();
+    };
+    stem.splitn(3, '-')
+        .nth(2)
+        .unwrap_or("")
+        .replace('-', " ")
+}
+
 /// True when this download plausibly *is* the paper: ePrint serves
 /// `/YYYY/NNNN.pdf`, so browsers save `NNNN.pdf`. Requiring the number rules out
 /// filing an unrelated download that happened to finish inside the window.

@@ -12,7 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use db::{Query, Scope};
 use render::{Style, StyleOpts};
 use std::io::{IsTerminal, Write};
-use theme::Theme;
+use std::path::PathBuf;
+use theme::{Theme, Tone};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Refresh the index in the background when it is older than this.
@@ -56,8 +57,9 @@ enum Cmd {
     Browse(BrowseArgs),
     /// Open a paper's PDF — your local copy once you have one
     Open {
-        /// Paper id, e.g. 2026/1539, or just 1539 for this year
-        id: String,
+        /// Paper id, e.g. 2026/1539, or just 1539 for this year. Omit to list
+        /// the papers you have already downloaded
+        id: Option<String>,
     },
     /// Show one paper in full
     Show {
@@ -102,6 +104,16 @@ enum Cmd {
         /// Open the config file in $EDITOR, creating it first if needed
         #[arg(short = 'e', long, conflicts_with = "init")]
         edit: bool,
+        /// Switch on Tab completion by adding one line to your shell's rc file
+        #[arg(long)]
+        completions: bool,
+    },
+    /// Shell completion, hidden because it is plumbing: `completions zsh` prints
+    /// the function to install, `completions ids` prints the candidates it offers.
+    #[command(hide = true)]
+    Completions {
+        /// `zsh` or `ids`
+        what: String,
     },
     /// Kept working, kept out of `--help`. Removing it entirely turned
     /// `eprint search NAPs` into a search for the words "search" and "NAPs",
@@ -154,9 +166,9 @@ enum WatchCmd {
 struct BrowseArgs {
     /// Starting query. Edit it live inside the browser with `/`
     query: Vec<String>,
-    /// Maximum results to load
-    #[arg(short = 'n', long, default_value_t = 500, value_parser = positive)]
-    limit: usize,
+    /// Maximum results to load. Everything, unless you say otherwise
+    #[arg(short = 'n', long, value_parser = positive)]
+    limit: Option<usize>,
     /// Match titles and authors only, ignoring abstracts
     #[arg(short = 't', long)]
     title: bool,
@@ -166,12 +178,15 @@ struct BrowseArgs {
     /// Colour palette: auto, dark, light or mono
     #[arg(long, value_name = "auto|dark|light|mono", hide = true)]
     theme: Option<String>,
-    /// Restrict to a publication year
-    #[arg(long)]
-    year: Option<i64>,
-    /// Only papers on or after this date (YYYY-MM-DD, or e.g. 30d)
-    #[arg(long)]
+    /// Date or range: 2024, 04/2024, 28/04/2024, 2023..2024, ..2020, or 30d
+    #[arg(long, value_name = "RANGE")]
+    date: Option<String>,
+    /// Superseded by `--date`, kept so old habits and scripts keep working.
+    #[arg(long, hide = true)]
     since: Option<String>,
+    /// Superseded by `--date 2024`, kept for the same reason.
+    #[arg(long, hide = true)]
+    year: Option<i64>,
     /// Filter by author name (substring match)
     #[arg(long)]
     author: Option<String>,
@@ -190,12 +205,9 @@ struct SearchArgs {
     /// Maximum results to show
     #[arg(short = 'n', long, value_parser = positive)]
     limit: Option<usize>,
-    /// Restrict to a publication year
-    #[arg(long)]
-    year: Option<i64>,
-    /// Only papers on or after this date (YYYY-MM-DD, or e.g. 30d)
-    #[arg(long)]
-    since: Option<String>,
+    /// Date or range: 2024, 04/2024, 28/04/2024, 2023..2024, ..2020, or 30d
+    #[arg(long, value_name = "RANGE")]
+    date: Option<String>,
     /// Filter by author name (substring match)
     #[arg(long)]
     author: Option<String>,
@@ -208,6 +220,13 @@ struct SearchArgs {
     /// Include full abstracts (omitted by default)
     #[arg(short = 'a', long)]
     abstracts: bool,
+
+    /// Superseded by `--date`, kept so old habits and scripts keep working.
+    #[arg(long, hide = true)]
+    since: Option<String>,
+    /// Superseded by `--date 2024`, kept for the same reason.
+    #[arg(long, hide = true)]
+    year: Option<i64>,
 
     // --- Rarely needed; functional but kept out of --help to keep it short.
     /// Search scope: all (title, authors, abstract) or title
@@ -249,6 +268,7 @@ impl SearchArgs {
     fn is_latest(&self) -> bool {
         self.query.join(" ").trim().is_empty()
             && self.year.is_none()
+            && self.date.is_none()
             && self.since.is_none()
             && self.author.is_none()
             && self.category.is_none()
@@ -326,26 +346,161 @@ fn human_age(secs: i64) -> String {
 }
 
 /// Accepts `YYYY-MM-DD` or a relative window like `30d` / `6m` / `2y`.
-fn resolve_since(s: &str) -> Result<String> {
-    let t = s.trim();
-    if t.len() >= 8 && t.contains('-') {
-        return Ok(t.to_string());
+/// The date window a set of flags asks for. `--date` is the documented spelling;
+/// `--since` predates it and means the same thing, so whichever is present wins.
+fn date_window(
+    date: &Option<String>,
+    since: &Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    if let Some(v) = date.as_deref() {
+        return parse_range(v);
     }
-    let (num, unit) = t.split_at(t.len().saturating_sub(1));
-    let n: i64 = num
-        .parse()
-        .with_context(|| format!("could not read --since {s}"))?;
-    let days = match unit {
-        "d" => n,
-        "w" => n * 7,
-        "m" => n * 30,
-        "y" => n * 365,
-        _ => bail!("--since unit must be d, w, m or y (got {unit:?})"),
+    if let Some(v) = since.as_deref() {
+        // The names mean different things and both should keep their meaning:
+        // `--date 2024` is *that year*, while `--since 2024` has always been
+        // "2024 onwards". Routing the alias through `parse_range` would have
+        // silently turned `--since 2026-07-01` into a one-day window.
+        if v.contains("..") {
+            return parse_range(v);
+        }
+        return Ok((Some(parse_bound(v, false)?), None));
+    }
+    Ok((None, None))
+}
+
+/// `30d`, `2y`, `1w`, `1m`: a number and a unit, meaning "since then, until now".
+fn is_relative(t: &str) -> bool {
+    let (n, unit) = t.split_at(t.len().saturating_sub(1));
+    matches!(unit, "d" | "w" | "m" | "y") && !n.is_empty() && n.parse::<i64>().is_ok()
+}
+
+/// One end of a `--date` range, expanded by how coarse it is.
+///
+/// With `upper`, the value returned is **exclusive**: the first day *after* the
+/// period named, so `..2024` becomes `2025-01-01`. That is not a stylistic choice —
+/// `papers.date` holds a full timestamp (`2026-04-28T02:25:24Z`), so an inclusive
+/// `date <= "2026-04-28"` excludes everything that actually happened that day. A
+/// `<` against the following midnight is both correct and still an index range
+/// scan.
+///
+/// Accepts `28/04/2024`, `04/2024` and `2024` — the same day/month/year shape the
+/// tool prints — plus ISO `2024-04-28`, which stays parseable but undocumented so
+/// older scripts and habits keep working.
+fn parse_bound(s: &str, upper: bool) -> Result<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        bail!("empty date");
+    }
+    let last_day = |y: i64, m: i64| -> i64 {
+        // First of the following month, minus a day: no month-length table, and
+        // leap years fall out of the civil-date maths for free.
+        let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        let (_, _, d) = civil_from_days(days_from_civil(ny, nm, 1) - 1);
+        d
     };
-    Ok(format_iso(now() - days * 86400)
-        .chars()
-        .take(10)
-        .collect())
+    let build = |y: i64, m: i64, d: i64| -> Result<String> {
+        if !(1..=12).contains(&m) {
+            bail!("{m} is not a month — dates are day/month/year, as displayed");
+        }
+        if !(1..=last_day(y, m)).contains(&d) {
+            bail!("{d} is not a day in {m:02}/{y}");
+        }
+        let (y, m, d) = if upper {
+            // One day on, so the comparison can be `<` and still include every
+            // timestamp within the named period.
+            civil_from_days(days_from_civil(y, m, d) + 1)
+        } else {
+            (y, m, d)
+        };
+        Ok(format!("{y:04}-{m:02}-{d:02}"))
+    };
+
+    // ISO, kept for compatibility.
+    if t.len() >= 8 && t.contains('-') && !t.contains('/') {
+        let p: Vec<&str> = t.splitn(3, '-').collect();
+        let (y, m, d) = (
+            p.first().and_then(|v| v.parse().ok()).unwrap_or(0),
+            p.get(1).and_then(|v| v.parse().ok()).unwrap_or(1),
+            p.get(2).and_then(|v| v.parse().ok()).unwrap_or(1),
+        );
+        return build(y, m, d);
+    }
+
+    let parts: Vec<&str> = t.split('/').collect();
+    let num = |v: &str| -> Result<i64> {
+        v.trim()
+            .parse()
+            .with_context(|| format!("could not read date {t:?}"))
+    };
+    match parts.as_slice() {
+        // A bare number is a year, unless it carries a relative unit.
+        [one] => {
+            let one = one.trim();
+            if one.len() == 4 && one.chars().all(|c| c.is_ascii_digit()) {
+                let y = num(one)?;
+                return if upper { build(y, 12, 31) } else { build(y, 1, 1) };
+            }
+            // 30d, 2y, 1w, 1m — a window ending now.
+            let (n, unit) = one.split_at(one.len().saturating_sub(1));
+            let n: i64 = n
+                .parse()
+                .with_context(|| format!("could not read date {t:?}"))?;
+            let days = match unit {
+                "d" => n,
+                "w" => n * 7,
+                "m" => n * 30,
+                "y" => n * 365,
+                _ => bail!("{t:?} is not a date — try 28/04/2024, 04/2024, 2024 or 30d"),
+            };
+            Ok(format_iso(now() - days * 86400)
+                .chars()
+                .take(10)
+                .collect())
+        }
+        [m, y] => {
+            let (m, y) = (num(m)?, num(y)?);
+            if upper {
+                build(y, m, last_day(y, m))
+            } else {
+                build(y, m, 1)
+            }
+        }
+        [d, m, y] => build(num(y)?, num(m)?, num(d)?),
+        _ => bail!("{t:?} is not a date — try 28/04/2024, 04/2024, 2024 or 30d"),
+    }
+}
+
+/// `--date` in full: one flag carrying both ends. `2023..2024`, `2023..`, `..2020`,
+/// or a single bound standing for the whole period it names.
+pub(crate) fn parse_range(s: &str) -> Result<(Option<String>, Option<String>)> {
+    let t = s.trim();
+    if let Some((lo, hi)) = t.split_once("..") {
+        let (lo, hi) = (lo.trim(), hi.trim());
+        if lo.is_empty() && hi.is_empty() {
+            bail!("{t:?} has no dates in it");
+        }
+        let from = if lo.is_empty() {
+            None
+        } else {
+            Some(parse_bound(lo, false)?)
+        };
+        let till = if hi.is_empty() {
+            None
+        } else {
+            Some(parse_bound(hi, true)?)
+        };
+        return Ok((from, till));
+    }
+    // No `..`, so the value names a single period and both ends come from it: a
+    // year means all of that year, a day means just that day. Only a relative
+    // window is open-ended, and that has to be detected positively — treating
+    // "anything not a slash date" as relative silently dropped the upper bound
+    // from ISO input.
+    let from = parse_bound(t, false)?;
+    if is_relative(t) {
+        return Ok((Some(from), None));
+    }
+    Ok((Some(from), Some(parse_bound(t, true)?)))
 }
 
 // ---------- index freshness ----------
@@ -511,8 +666,117 @@ fn open_paper(conn: &rusqlite::Connection, id: &str) -> Result<()> {
     open_url(&format!("https://eprint.iacr.org/{id}.pdf"))?;
     let title = db::get(conn, id)?.map(|p| p.title).unwrap_or_default();
     spawn_adopter(id, &title);
+    nudge_completions(conn);
     // stderr, so piping stays clean.
     eprintln!("{}", save_hint());
+    Ok(())
+}
+
+/// The papers already downloaded, id and title, newest first.
+fn library_listing() -> Vec<(String, String)> {
+    let files = pdf::library();
+    let ids: Vec<String> = files.iter().map(|(id, _)| id.clone()).collect();
+    let titles = db::open()
+        .ok()
+        .and_then(|c| db::titles(&c, &ids).ok())
+        .unwrap_or_default();
+    files
+        .into_iter()
+        .map(|(id, path)| {
+            // The real title beats the filename slug; the slug is the fallback for
+            // a paper the index has never seen.
+            let t = titles
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| pdf::slug_words(&path));
+            (id, t)
+        })
+        .collect()
+}
+
+fn do_library() -> Result<()> {
+    let papers = library_listing();
+    if papers.is_empty() {
+        println!("\nNo papers downloaded yet — `eprint open <id>` and save the PDF.\n");
+        return Ok(());
+    }
+    let th = Theme::resolve(&config::load().theme, std::io::stdout().is_terminal());
+    println!();
+    for (id, title) in &papers {
+        println!("  {}  {}", th.paint(Tone::Id, &format!("{id:<9}")), title);
+    }
+    println!(
+        "\n  {}\n",
+        th.paint(
+            Tone::Meta,
+            &format!(
+                "{} paper{} in {}",
+                papers.len(),
+                if papers.len() == 1 { "" } else { "s" },
+                pdf::library_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            )
+        )
+    );
+    Ok(())
+}
+
+/// Hand-written rather than generated: `clap_complete` would be a tenth dependency
+/// and still could not offer the downloaded papers, which is the only part worth
+/// completing. `_describe` splits each entry on its *first* colon, so a title
+/// containing one is safe.
+const ZSH_COMPLETION: &str = r#"# eprint zsh completion. Install with:
+#   echo 'eval "$(eprint completions zsh)"' >> ~/.zshrc
+#
+# Bootstraps zsh's completion system if the shell has not already done so. A bare
+# .zshrc has no compinit, which leaves `compdef` undefined and Tab doing nothing
+# anywhere — not just for eprint. `-i` skips insecure completion files rather than
+# trusting them, so this stays quiet without lowering the bar.
+if ! whence compdef > /dev/null 2>&1; then
+  autoload -Uz compinit && compinit -i
+fi
+
+_eprint() {
+  local -a cmds papers
+  cmds=(
+    'browse:Interactive full-screen browser'
+    'open:Open a paper PDF'
+    'show:Show one paper in full'
+    'watch:Saved searches that mark papers'
+    'bib:Citation keys from CryptoBib'
+    'status:Index statistics'
+    'update:Refresh the local index'
+    'config:Show or create the configuration file'
+  )
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'eprint command' cmds
+    return
+  fi
+  case ${words[2]} in
+    open|show|bib)
+      papers=(${(f)"$(eprint completions ids 2>/dev/null)"})
+      (( ${#papers} )) && _describe -t papers 'downloaded papers' papers
+      ;;
+    watch)
+      (( CURRENT == 3 )) && _values 'watch command' 'add[save a search]' 'rm[remove one]' 'list[show them]'
+      ;;
+  esac
+}
+compdef _eprint eprint
+"#;
+
+fn do_completions(what: &str) -> Result<()> {
+    match what {
+        "zsh" => print!("{ZSH_COMPLETION}"),
+        "ids" => {
+            for (id, title) in library_listing() {
+                // `id:title`, the shape `_describe` expects.
+                println!("{id}:{title}");
+            }
+        }
+        other => bail!("unknown completion target {other:?} — try `zsh` or `ids`"),
+    }
     Ok(())
 }
 
@@ -587,18 +851,15 @@ fn do_search(a: &SearchArgs) -> Result<()> {
 fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<()> {
     let conn = db::open()?;
     let terms = a.query.join(" ");
-    let since = match &a.since {
-        Some(s) => Some(resolve_since(s)?),
-        None => None,
-    };
+    let (since, before) = date_window(&a.date, &a.since)?;
     let scope = effective_scope(a.title, a.scope.as_deref(), cfg);
 
     let q = Query {
         terms: &terms,
         year: a.year,
         since,
+        before,
         added_since: None,
-        only_ids: None,
         only_watched: false,
         author: a.author.clone(),
         category: a.category.clone(),
@@ -652,17 +913,18 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
     if index_age(&conn)?.map(|s| s as u64 > STALE_SECS).unwrap_or(true) {
         let _ = spawn_background_refresh(&conn);
     }
-    let since = match &a.since {
-        Some(s) => Some(resolve_since(s)?),
-        None => None,
-    };
+    let (since, before) = date_window(&a.date, &a.since)?;
     let cfg = config::load();
     let filters = tui::Filters {
         year: a.year,
         since,
+        before,
+        date_text: a.date.clone().or_else(|| a.since.clone()).unwrap_or_default(),
         author: a.author.clone(),
         category: a.category.clone(),
-        limit: a.limit,
+        // No limit means no limit: laying out only the visible rows made loading
+        // the whole archive cost nothing measurable.
+        limit: a.limit.unwrap_or(usize::MAX),
         prefix: !a.exact,
     };
     let theme = Theme::resolve(
@@ -738,7 +1000,7 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
     let watermark = db::meta_get(&conn, harvest::KEY_LAST_SEEN)?
         .unwrap_or_else(|| format_iso(now() - 7 * 86400));
 
-    let day = |ts: &str| ts.chars().take(10).collect::<String>();
+    let day = |ts: &str| render::fmt_date(ts);
 
     // No cap on the batch itself, only a sanity bound for the case where someone
     // returns from a long absence.
@@ -1079,7 +1341,75 @@ fn edit_config() -> Result<()> {
     Ok(())
 }
 
-fn do_config(init: bool, edit: bool) -> Result<()> {
+/// The line a shell needs to load the completion function, and where it goes.
+/// Cargo has no post-install hook, so someone has to put it there; this makes it
+/// one command instead of an editor session.
+const COMPLETION_LINE: &str = r#"eval "$(eprint completions zsh)"   # eprint Tab completion"#;
+
+fn rc_path() -> Option<PathBuf> {
+    let dir = std::env::var("ZDOTDIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(dir.join(".zshrc"))
+}
+
+/// Has the line already been added? Matched loosely, so a hand-written variant
+/// still counts and nothing is ever appended twice.
+fn completions_installed() -> bool {
+    rc_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| t.contains("eprint completions zsh"))
+        .unwrap_or(false)
+}
+
+fn install_completions() -> Result<()> {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    if !shell.ends_with("zsh") {
+        bail!(
+            "only zsh completion exists so far, and $SHELL is {:?}.\n       \
+             The function itself is `eprint completions zsh` if you want to adapt it.",
+            shell
+        );
+    }
+    let path = rc_path().context("could not determine your home directory")?;
+    if completions_installed() {
+        println!("\n  already set up in {}\n", path.display());
+        return Ok(());
+    }
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(COMPLETION_LINE);
+    text.push('\n');
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "\n  added one line to {}\n  open a new shell, then `eprint open <TAB>`\n",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Mentioned once, ever, and only to someone who could act on it: a hint that
+/// repeats is nagging, and one that appears in a pipe is noise.
+fn nudge_completions(conn: &rusqlite::Connection) {
+    const KEY: &str = "completions_hint";
+    if !std::io::stderr().is_terminal()
+        || !std::env::var("SHELL").unwrap_or_default().ends_with("zsh")
+        || completions_installed()
+        || db::meta_get(conn, KEY).unwrap_or(None).is_some()
+    {
+        return;
+    }
+    let _ = db::meta_set(conn, KEY, "shown");
+    eprintln!("tip: `eprint config --completions` switches on Tab completion for paper ids");
+}
+
+fn do_config(init: bool, edit: bool, completions: bool) -> Result<()> {
+    if completions {
+        return install_completions();
+    }
     if edit {
         return edit_config();
     }
@@ -1116,6 +1446,14 @@ fn do_config(init: bool, edit: bool) -> Result<()> {
             "eprint watch".to_string()
         }
     );
+    println!(
+        "  completions   {}",
+        if completions_installed() {
+            "on".to_string()
+        } else {
+            "off  (eprint config --completions)".to_string()
+        }
+    );
     if path.is_some() {
         println!("\n  edit with `eprint config --edit`");
     }
@@ -1138,14 +1476,19 @@ fn do_status() -> Result<()> {
     let age = index_age(&conn)?
         .map(human_age)
         .unwrap_or_else(|| "never updated".to_string());
-    let last = db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?.unwrap_or_else(|| "—".into());
-    let newest: String = conn
+    // Both go through the same formatter as everything else, so `status` cannot be
+    // the one place still speaking ISO at the user.
+    let last = db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?
+        .map(|v| render::fmt_date(&v))
+        .unwrap_or_else(|| "—".into());
+    let newest: (String, String) = conn
         .query_row(
-            "SELECT id || '  ' || substr(date,1,10) FROM papers ORDER BY date DESC LIMIT 1",
+            "SELECT id, substr(date,1,10) FROM papers ORDER BY date DESC LIMIT 1",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .unwrap_or_else(|_| "—".into());
+        .unwrap_or_else(|_| ("—".into(), String::new()));
+    let newest = format!("{}  {}", newest.0, render::fmt_date(&newest.1));
     let _ = &st;
     println!();
     println!("  papers indexed  {total}");
@@ -1185,7 +1528,7 @@ fn real_main() -> Result<()> {
             entry,
         }) => do_bib(id.as_deref(), update, force, entry),
         Some(Cmd::Status) => do_status(),
-        Some(Cmd::Config { init, edit }) => do_config(init, edit),
+        Some(Cmd::Config { init, edit, completions }) => do_config(init, edit, completions),
         Some(Cmd::Show { id }) => {
             let conn = db::open()?;
             let st = Style::detect(StyleOpts {
@@ -1206,9 +1549,15 @@ fn real_main() -> Result<()> {
                 None => bail!("no paper {id} in the local index (try `eprint update`)"),
             }
         }
-        Some(Cmd::Open { id }) => {
-            let conn = db::open()?;
-            open_paper(&conn, &normalise_id(&id))
-        }
+        Some(Cmd::Open { id }) => match id {
+            Some(id) => {
+                let conn = db::open()?;
+                open_paper(&conn, &normalise_id(&id))
+            }
+            // No id: answer "what do I have?" rather than erroring. Works
+            // everywhere, including shells with no completion installed.
+            None => do_library(),
+        },
+        Some(Cmd::Completions { what }) => do_completions(&what),
     }
 }

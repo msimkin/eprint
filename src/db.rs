@@ -62,6 +62,10 @@ fn scoped(expr: &str, scope: Scope) -> String {
     }
 }
 
+/// Ceiling on how many ids one watch contributes when deciding which rows to badge.
+/// Far above any realistic watch, and only a guard against a pathological one.
+const WATCH_MATCH_CAP: usize = 50_000;
+
 pub const MARK_START: char = '\x01';
 pub const MARK_END: char = '\x02';
 
@@ -254,6 +258,29 @@ pub fn bib_for(conn: &Connection, id: &str) -> Result<Option<(String, bool)>> {
 }
 
 /// Batch form for result lists, so rendering does not issue a query per row.
+/// Titles for a set of ids, in one query. `pdf::title_of` opens the database per
+/// call, which is fine for one paper and wrong for a whole library.
+pub fn titles(conn: &Connection, ids: &[String]) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let slots = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id, title FROM papers WHERE id IN ({slots})");
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn ToSql> = ids.iter().map(|s| s as &dyn ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, title) = row?;
+        out.insert(id, title);
+    }
+    Ok(out)
+}
+
 pub fn bib_map(conn: &Connection, ids: &[String]) -> Result<HashMap<String, (String, bool)>> {
     let mut out = HashMap::new();
     if ids.is_empty() || bib_count(conn)? == 0 {
@@ -443,8 +470,8 @@ impl Watch {
             terms: &self.terms,
             year: None,
             since: None,
+            before: None,
             added_since: watermark.map(|w| w.to_string()),
-            only_ids: None,
             only_watched: false,
             author: self.author.clone(),
             category: self.category.clone(),
@@ -517,9 +544,13 @@ pub fn stage_watched(conn: &Connection, watches: &[Watch], cap_per_watch: usize)
     Ok(conn.query_row("SELECT COUNT(*) FROM watched_stage", [], |r| r.get::<_, i64>(0))? as usize)
 }
 
-/// Which of `ids` match at least one saved watch. One small FTS query per watch,
-/// restricted to the ids already on screen, so this costs the same whether the
-/// caller is showing 5 results or 500.
+/// Which of `ids` match at least one saved watch.
+///
+/// One query per watch over the whole index, intersected in memory — *not* one
+/// query per watch per chunk of on-screen ids. The chunked version cost 66 queries
+/// per watch on a full 26,000-paper listing and dominated the search; this is ten
+/// queries whatever the listing size, because a watch's match set is small (an
+/// author is tens of papers, a broad term a few thousand ids).
 pub fn watched_ids(
     conn: &Connection,
     ids: &[String],
@@ -529,17 +560,14 @@ pub fn watched_ids(
     if ids.is_empty() || watches.is_empty() {
         return Ok(out);
     }
-    // `browse` loads 500 ids by default and `-n` can raise that, so chunk rather
-    // than betting on SQLite's bound-parameter ceiling.
-    for chunk in ids.chunks(400) {
-        for w in watches {
-            let mut q = w.query(None, chunk.len());
-            q.only_ids = Some(chunk.to_vec());
-            // A watch with a broken expression must not break the listing it is
-            // annotating, so a failed match just contributes nothing.
-            if let Ok(hits) = search(conn, &q) {
-                for h in hits {
-                    out.insert(h.paper.id);
+    let want: HashSet<&String> = ids.iter().collect();
+    for w in watches {
+        // A watch with a broken expression must not break the listing it is
+        // annotating, so a failed match just contributes nothing.
+        if let Ok(matched) = matching_ids(conn, &w.query(None, WATCH_MATCH_CAP)) {
+            for id in matched {
+                if want.contains(&id) {
+                    out.insert(id);
                 }
             }
         }
@@ -591,12 +619,13 @@ pub struct Query<'a> {
     pub terms: &'a str,
     pub year: Option<i64>,
     pub since: Option<String>,
+    /// **Exclusive** upper bound: the first day after the period asked for. Stored
+    /// dates are full timestamps, so an inclusive `<=` on a date-only string would
+    /// exclude the whole of that final day.
+    pub before: Option<String>,
     /// Filters on when the paper entered *this* index, not its own date, so
     /// `new` can ask a watch "anything since I last looked?".
     pub added_since: Option<String>,
-    /// Restricts the query to these ids, so a watch can be asked "which of the
-    /// papers already on screen do you match?" without re-running it wholesale.
-    pub only_ids: Option<Vec<String>>,
     /// Restricts the query to papers matching some watch. Requires a preceding
     /// `stage_watched()` on the same connection to fill `watched_stage`.
     pub only_watched: bool,
@@ -732,6 +761,10 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
         args.push(Box::new(s.clone()));
         sql.push_str(&format!(" AND p.date >= ?{}", args.len()));
     }
+    if let Some(s) = &q.before {
+        args.push(Box::new(s.clone()));
+        sql.push_str(&format!(" AND p.date < ?{}", args.len()));
+    }
     // `>` not `>=`, to agree with `added_since()` — the watermark is the last
     // moment already seen, not the first unseen one.
     if let Some(s) = &q.added_since {
@@ -740,20 +773,6 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     }
     if q.only_watched {
         sql.push_str(" AND p.id IN (SELECT id FROM watched_stage)");
-    }
-    if let Some(ids) = &q.only_ids {
-        if ids.is_empty() {
-            // `IN ()` is a syntax error, and an empty restriction must match
-            // nothing rather than silently matching everything.
-            sql.push_str(" AND 0");
-        } else {
-            let mut slots = Vec::with_capacity(ids.len());
-            for id in ids {
-                args.push(Box::new(id.clone()));
-                slots.push(format!("?{}", args.len()));
-            }
-            sql.push_str(&format!(" AND p.id IN ({})", slots.join(",")));
-        }
     }
     if let Some(a) = &q.author {
         args.push(Box::new(format!("%{}%", a.to_lowercase())));

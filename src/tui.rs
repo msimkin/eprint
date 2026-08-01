@@ -16,14 +16,27 @@ use crate::render::{
 };
 use crate::theme::{Theme, Tone};
 
+/// Which prompt, if any, is taking keystrokes. Was a bool when the query was the
+/// only thing you could edit.
+#[derive(PartialEq, Clone, Copy)]
+enum Editing {
+    None,
+    Query,
+    Date,
+}
+
 #[derive(Default, Clone)]
 pub struct Filters {
     pub year: Option<i64>,
     pub since: Option<String>,
+    pub before: Option<String>,
     pub author: Option<String>,
     pub category: Option<String>,
     pub limit: usize,
     pub prefix: bool,
+    /// What the user typed for the date, kept verbatim so the header can show it
+    /// and `d` can reopen with it. The parsed bounds live in `since`/`before`.
+    pub date_text: String,
 }
 
 const ID_W: usize = 11;
@@ -44,7 +57,9 @@ struct App {
     total: usize,
     selected: usize,
     scroll: usize,
-    editing: bool,
+    editing: Editing,
+    /// The date prompt's buffer, separate from `query` so cancelling restores.
+    date_input: String,
     /// Keyed by paper id so expansion survives re-searching.
     expanded: HashSet<String>,
     status: Option<String>,
@@ -73,9 +88,9 @@ impl App {
             terms: &self.query,
             year: self.filters.year,
             since: self.filters.since.clone(),
+            before: self.filters.before.clone(),
             added_since: None,
-            only_ids: None,
-            only_watched: self.watched_only,
+                only_watched: self.watched_only,
             author: self.filters.author.clone(),
             category: self.filters.category.clone(),
             limit: self.filters.limit,
@@ -143,19 +158,69 @@ fn marked_spans(s: &str, base: Style, hl: Style, open: &mut bool) -> Vec<Span<'s
     spans
 }
 
-/// Build the whole scrollable document, plus the starting line index of each
-/// hit so selection can drive scrolling.
-fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+/// The widths a hit is laid out in. Derived in one place so the height calculation
+/// and the renderer cannot disagree about them.
+fn widths(app: &App, hit: &Hit, width: usize) -> (usize, usize, usize) {
     let body_w = width.saturating_sub(INDENT + 2).max(20);
+    let fav = app.favourite.as_deref();
+    let title_w = if app.watched.contains(&hit.paper.id) {
+        body_w.saturating_sub(BADGE_W)
+    } else {
+        body_w
+    };
+    let meta_w = if loved(&hit.paper.authors, fav) {
+        body_w.saturating_sub(LOVE_W)
+    } else {
+        body_w
+    };
+    (body_w, title_w, meta_w)
+}
+
+/// How many lines a hit occupies, counted without building any of them. This is
+/// what lets the viewport be found without laying out all 26,000 papers, and it
+/// **must** agree with `hit_lines` — `hit_lines` debug-asserts that it does.
+fn hit_height(app: &App, hit: &Hit, width: usize) -> usize {
+    let p = &hit.paper;
+    let is_open = app.expanded.contains(&p.id);
+    let fav = app.favourite.as_deref();
+    let (body_w, title_w, meta_w) = widths(app, hit, width);
+    let title_src = if hit.title_hl.is_empty() {
+        &p.title
+    } else {
+        &hit.title_hl
+    };
+    let mut n = crate::render::wrap_count(title_src, title_w);
+    let byline = if is_open {
+        full_authors(&p.authors, fav)
+    } else {
+        short_authors(&p.authors, fav)
+    };
+    n += crate::render::wrap_count(&byline, meta_w);
+    if is_open {
+        let mut trailer: Vec<String> = Vec::new();
+        if !p.date.is_empty() {
+            trailer.push(crate::render::fmt_date(&p.date));
+        }
+        if let Some((key, _)) = app.bib.get(&p.id) {
+            trailer.push(key.clone());
+        }
+        if !trailer.is_empty() {
+            n += crate::render::wrap_count(&trailer.join(" · "), meta_w);
+        }
+        n += crate::render::wrap_body_count(&hit.abstract_hl, body_w);
+    }
+    n + 1 // the blank line between entries
+}
+
+/// Lay out one hit. Only ever called for rows on screen.
+fn hit_lines(app: &App, i: usize, hit: &Hit, width: usize) -> Vec<Line<'static>> {
+    let (body_w, _, _) = widths(app, hit, width);
     let pad = " ".repeat(INDENT);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut starts: Vec<usize> = Vec::new();
     let th = &app.theme;
     let hl = th.style(Tone::Match);
     let meta_s = th.style(Tone::Meta);
-
-    for (i, hit) in app.hits.iter().enumerate() {
-        starts.push(lines.len());
+    {
         let p = &hit.paper;
         let is_sel = i == app.selected;
         let is_open = app.expanded.contains(&p.id);
@@ -221,7 +286,7 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         if is_open {
             let mut trailer: Vec<String> = Vec::new();
             if !p.date.is_empty() {
-                trailer.push(p.date.chars().take(10).collect());
+                trailer.push(crate::render::fmt_date(&p.date));
             }
             if let Some((key, _)) = app.bib.get(&p.id) {
                 trailer.push(key.clone());
@@ -265,13 +330,12 @@ fn build(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
 
         lines.push(Line::raw(""));
     }
-
-    if app.hits.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("  No matches.", meta_s)));
-    }
-
-    (lines, starts)
+    debug_assert_eq!(
+        lines.len(),
+        hit_height(app, hit, width),
+        "hit_height disagrees with hit_lines — the viewport would drift"
+    );
+    lines
 }
 
 /// The citation key the archive itself uses. Once CryptoBib is wired in this
@@ -326,7 +390,8 @@ pub fn run(
         total: 0,
         selected: 0,
         scroll: 0,
-        editing: false,
+        editing: Editing::None,
+        date_input: String::new(),
         expanded: HashSet::new(),
         watched: HashSet::new(),
         watched_only: false,
@@ -385,10 +450,21 @@ pub fn run(
             if app.watched_only {
                 modes.push_str(" · watched only");
             }
+            // A date filter used to be invisible once you were inside, whether it
+            // came from `--date` or from `d`.
+            if !app.filters.date_text.is_empty() {
+                modes.push_str(&format!(" · {}", app.filters.date_text));
+            }
             if let Some(d) = app.bib_stale_days {
                 modes.push_str(&format!(" · bib {d}d old"));
             }
-            let head = if app.editing {
+            let head = if app.editing == Editing::Date {
+                Line::from(vec![
+                    Span::styled("  date ", th.style(Tone::Meta)),
+                    Span::styled(app.date_input.clone(), th.style(Tone::Title)),
+                    Span::styled("▏", th.style(Tone::Marker)),
+                ])
+            } else if app.editing == Editing::Query {
                 Line::from(vec![
                     Span::styled("  search ", th.style(Tone::Meta)),
                     Span::styled(app.query.clone(), th.style(Tone::Title)),
@@ -409,33 +485,71 @@ pub fn run(
             f.render_widget(Paragraph::new(vec![head, Line::raw("")]), chunks[0]);
 
             // --- results ---
-            let (lines, starts) = build(&app, width);
+            // Heights only: counting is cheap enough to do for every hit on every
+            // frame, where laying them all out is not. This is what removed the
+            // entry limit.
+            let heights: Vec<usize> = app
+                .hits
+                .iter()
+                .map(|h| hit_height(&app, h, width))
+                .collect();
+            let mut starts: Vec<usize> = Vec::with_capacity(heights.len() + 1);
+            let mut acc = 0usize;
+            for h in &heights {
+                starts.push(acc);
+                acc += h;
+            }
+            let total = acc;
 
             // Keep the selected entry on screen.
             if let Some(&start) = starts.get(app.selected) {
-                let end = starts.get(app.selected + 1).copied().unwrap_or(lines.len());
+                let end = start + heights[app.selected];
                 if start < app.scroll {
                     app.scroll = start;
                 } else if end > app.scroll + view_h {
                     app.scroll = end.saturating_sub(view_h);
                 }
-                if end.saturating_sub(start) > view_h {
+                if heights[app.selected] > view_h {
                     app.scroll = start;
                 }
             }
-            let max_scroll = lines.len().saturating_sub(view_h);
-            app.scroll = app.scroll.min(max_scroll);
+            app.scroll = app.scroll.min(total.saturating_sub(view_h));
 
+            // Lay out only what the viewport can show, starting from the hit the
+            // scroll offset falls inside.
+            let first = starts.partition_point(|&s| s <= app.scroll).saturating_sub(1);
+            let intra = app.scroll - starts.get(first).copied().unwrap_or(0);
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            let mut i = first;
+            while i < app.hits.len() && lines.len() < view_h + intra {
+                lines.extend(hit_lines(&app, i, &app.hits[i], width));
+                i += 1;
+            }
+            if app.hits.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "  No matches.",
+                    app.theme.style(Tone::Meta),
+                )));
+            }
+
+            // `intra` is at most one entry's height, so this cast is safe. Passing
+            // the absolute line offset here was the old bug: past ~65,535 lines the
+            // u16 truncated and scrolling landed somewhere arbitrary.
             f.render_widget(
-                Paragraph::new(lines).scroll((app.scroll as u16, 0)),
+                Paragraph::new(lines).scroll((intra as u16, 0)),
                 chunks[1],
             );
 
             // --- footer ---
-            let help = if app.editing {
-                "  type to filter · enter accept · ctrl-u clear · esc cancel"
-            } else {
-                "  j/k move · space expand · t scope · w watched · enter open · y url · b key · B entry · / search · q quit"
+            let help = match app.editing {
+                Editing::Date => {
+                    "  2024 · 04/2024 · 28/04/2024 · 2023..2024 · 30d · enter apply · empty clears · esc cancel"
+                }
+                Editing::Query => "  type to filter · enter accept · ctrl-u clear · esc cancel",
+                Editing::None => {
+                    "  j/k move · space expand · t scope · d date · w watched · enter open · y url · b key · B entry · / search · q quit"
+                }
             };
             let foot = match &app.status {
                 Some(s) => Line::from(Span::styled(format!("  {s}"), th.style(Tone::Id))),
@@ -450,10 +564,54 @@ pub fn run(
             _ => continue,
         };
 
-        if app.editing {
+        if app.editing == Editing::Date {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => app.editing = false,
+                KeyCode::Char('c') if ctrl => break,
+                KeyCode::Esc => {
+                    app.editing = Editing::None;
+                    app.status = None;
+                }
+                KeyCode::Enter => {
+                    let typed = app.date_input.trim().to_string();
+                    if typed.is_empty() {
+                        // An empty prompt is how you clear the filter.
+                        app.filters.since = None;
+                        app.filters.before = None;
+                        app.filters.date_text.clear();
+                        app.editing = Editing::None;
+                        app.search(&conn);
+                    } else {
+                        // The same parser the flag uses, so the grammar cannot
+                        // drift between `--date` and `d`.
+                        match crate::parse_range(&typed) {
+                            Ok((since, before)) => {
+                                app.filters.since = since;
+                                app.filters.before = before;
+                                app.filters.date_text = typed;
+                                app.editing = Editing::None;
+                                app.search(&conn);
+                            }
+                            // Stay in the prompt so the mistake can be corrected
+                            // rather than retyped.
+                            Err(e) => app.status = Some(format!("{e}")),
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.date_input.pop();
+                }
+                KeyCode::Char('u') if ctrl => app.date_input.clear(),
+                KeyCode::Char(c) if !ctrl => app.date_input.push(c),
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.editing == Editing::Query {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => app.editing = Editing::None,
                 // Ctrl-C has to work here too. Without this arm it fell through to
                 // `Char(c)` and typed a "c" — an app that swallows Ctrl-C is worse
                 // than one that ignores the key.
@@ -537,7 +695,12 @@ pub fn run(
                     }
                 }
             }
-            KeyCode::Char('/') => app.editing = true,
+            KeyCode::Char('/') => app.editing = Editing::Query,
+            KeyCode::Char('d') => {
+                app.date_input = app.filters.date_text.clone();
+                app.editing = Editing::Date;
+                app.status = None;
+            }
             KeyCode::Enter | KeyCode::Char('o') => {
                 if let Some(h) = app.selected_hit() {
                     let id = h.paper.id.clone();

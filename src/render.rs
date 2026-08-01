@@ -155,6 +155,34 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// How many lines `wrap` would produce, without building any of them. The TUI needs
+/// this for every hit on every frame to know where the viewport falls, and doing it
+/// by wrapping and counting allocated a `Vec<String>` per paper per keystroke.
+pub fn wrap_count(text: &str, width: usize) -> usize {
+    let mut lines = 1;
+    let mut cur = 0usize;
+    for word in text.split_whitespace() {
+        let w = visible_len(word);
+        let add = if cur == 0 { 0 } else { 1 };
+        if cur > 0 && cur + add + w > width {
+            lines += 1;
+            cur = w;
+        } else {
+            cur += add + w;
+        }
+    }
+    lines
+}
+
+/// Same for `wrap_body`: paragraphs separated by a blank line.
+pub fn wrap_body_count(text: &str, width: usize) -> usize {
+    let paras = paragraphs(text);
+    if paras.is_empty() {
+        return 0;
+    }
+    paras.iter().map(|p| wrap_count(p, width)).sum::<usize>() + paras.len() - 1
+}
+
 /// Split on blank lines. Roughly 37% of ePrint abstracts carry real paragraph
 /// breaks, which plain whitespace-wrapping would throw away.
 pub fn paragraphs(text: &str) -> Vec<String> {
@@ -218,6 +246,21 @@ fn is_favourite(name: &str, fav: Option<&str>) -> bool {
 /// Does this paper have the favourite author on it at all?
 pub fn loved(authors: &str, fav: Option<&str>) -> bool {
     authors.split(';').any(|n| is_favourite(n, fav))
+}
+
+/// ISO in, day/month/year out. Storage stays ISO because the index compares dates
+/// as fixed-width text in SQL — that is the only reason the comparisons work — so
+/// this is the single place the two conventions meet. Anything that is not a date
+/// is passed through untouched rather than mangled.
+pub fn fmt_date(iso: &str) -> String {
+    let d = &iso[..iso.len().min(10)];
+    let p: Vec<&str> = d.split('-').collect();
+    match p.as_slice() {
+        [y, m, day] if y.len() == 4 && m.len() == 2 && day.len() == 2 => {
+            format!("{day}/{m}/{y}")
+        }
+        _ => iso.to_string(),
+    }
 }
 
 /// Every author, first names included. `short_authors` reduces to surnames so a
@@ -380,7 +423,7 @@ pub fn render_hit(
     let fav = st.favourite.as_deref();
     let mut meta: Vec<String> = vec![short_authors(&p.authors, fav)];
     if show_abstract && !p.date.is_empty() {
-        meta.push(p.date.chars().take(10).collect());
+        meta.push(fmt_date(&p.date));
     }
     if show_abstract {
         if let Some((key, _)) = bib {
@@ -469,7 +512,7 @@ pub fn render_full(out: &mut String, p: &Paper, st: &Style, bib: Option<&(String
         meta.push(p.category.clone());
     }
     if !p.date.is_empty() {
-        meta.push(p.date.chars().take(10).collect());
+        meta.push(fmt_date(&p.date));
     }
     let lic = short_license(&p.rights);
     if !lic.is_empty() {
@@ -517,4 +560,28 @@ pub fn json_of(hits: &[Hit]) -> String {
         })
         .collect();
     serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The counters must agree with the wrappers exactly, or the viewport maths
+    /// drifts from what is drawn.
+    #[test]
+    fn counts_match_wrapping() {
+        let samples = [
+            "Scale, Round, Break: Simple Leakage Attacks on Secret Sharing Schemes",
+            "short",
+            "",
+            "a b c d e f g h i j k l m n o p q r s t u v w x y z 1 2 3 4 5 6 7 8 9",
+            "one\n\ntwo paragraphs here\n\nand a third that is quite a lot longer than the others",
+        ];
+        for w in [20usize, 40, 83, 200] {
+            for s in samples {
+                assert_eq!(wrap(s, w).len(), wrap_count(s, w), "wrap {s:?} at {w}");
+                assert_eq!(wrap_body(s, w).len(), wrap_body_count(s, w), "body {s:?} at {w}");
+            }
+        }
+    }
 }
