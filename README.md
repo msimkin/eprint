@@ -6,19 +6,23 @@ Metadata for all ~26,000 papers is harvested from the archive's OAI-PMH interfac
 local SQLite FTS5 index, so searching is instant and works offline.
 
 ```
-$ eprint "lattice signature" -n 3
+$ eprint "threshold ecdsa" -n 3
 
-3 of 590 results  (index: just now)
+3 of 61 results  in: title, authors, abstract · index 8m old
 
-  2025/1492    Comment on On Gaussian sampling, smoothing parameter and application to
-               lattice signatures
-               Ling · Foundations · CC-BY-4.0 · 2025-08-19
-               We show the key ideas of the above-referenced work for lattice Gaussian…
+  2026/1455    Trout++: Robust Asynchronous Two-Round ECDSA for Arbitrary Thresholds
+               Nof, Parker
 
-  2022/097     Lattice Signature can be as Simple as Lattice Encryption
-               Ye, Xu, et al. · Public-key cryptography · CC-BY-4.0 · 2022-01-31
-               Existing lattice signature schemes are much less efficient than encryption…
+  2026/1103    Jevil: A Catastrophic-Failure-by-Design Signature Scheme
+               Kobeissi
+
+  2026/976     Revisiting DKLs Threshold ECDSA: Enhanced OT-based VOLE and Two-Party Signing
+               Asharov
 ```
+
+Results are titles and authors, newest first — the second hit above matches in its abstract
+rather than its title. Add `-a` for full abstracts, `-t` to match titles and authors only, or
+`eprint show <id>` for one paper in full.
 
 ### Opening papers
 
@@ -243,7 +247,10 @@ list of papers appears — `search`, a bare `eprint`, `new` and `browse`:
 ```
   2026/1523    Catching Many Traitors in Threshold Traitor Tracing: Lower Bounds and
                Constructions ✱
+               Boneh, Partap, Zhandry
+
   2026/1268    Decentralized Multi-Authority (Attribute-Based) Traitor Tracing
+               Datta, Schädlich, Tairi
 ```
 
 The badge follows the title text rather than sitting in a fixed column, so only a watched
