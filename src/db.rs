@@ -462,15 +462,66 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
             })
             .map(|(n, _)| n.clone())
             .unwrap_or_default();
-        // Both orders, because zsh completes on a prefix and a name can be reached
-        // from either end: typing "Adi" finds "Adi Shamir", typing "Shamir" finds
-        // "Shamir, Adi". `--author` ignores the comma and matches word by word, so
-        // the two are the same filter — this is only about what can be *typed*.
-        if let Some((surname, rest)) = split_surname(&name) {
-            out.push((format!("{surname}, {rest}"), total));
-        }
         out.push((name, total));
     }
+    // One person can still arrive as several candidates when the archive writes
+    // their name with and without a middle name. Picking the shorter one already
+    // finds the longer one's papers — its words are a subset — so the longer is
+    // not a separate choice, only a longer thing to read. Merged only when the
+    // shorter is also the commoner, or `I. Damgard` would swallow `Ivan Damgård`.
+    let words_of = |n: &str| -> Vec<String> {
+        fold_name(n)
+            .split_whitespace()
+            .filter(|w| w.len() > 1)
+            .map(|w| w.to_string())
+            .collect()
+    };
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut people: Vec<(String, i64)> = Vec::new();
+    for (name, count) in out {
+        let mine = words_of(&name);
+        match people.iter_mut().find(|(kept, kept_count)| {
+            *kept_count >= count && {
+                let theirs = words_of(kept);
+                // At least a first name and a surname. A candidate that reduces to
+                // a bare surname — `I. Damgard`, whose initial is too short to
+                // match on — would otherwise swallow everyone who shares it, and
+                // Kasper Damgård is not Ivan.
+                theirs.len() >= 2 && theirs.iter().all(|w| mine.contains(w))
+            }
+        }) {
+            Some((_, kept_count)) => *kept_count += count,
+            None => people.push((name, count)),
+        }
+    }
+
+    // Both orders, because zsh completes on a prefix and a name can be reached
+    // from either end: typing "Adi" finds "Adi Shamir", typing "Shamir" finds
+    // "Shamir, Adi". `--author` ignores the comma and matches word by word, so the
+    // two are the same filter — this is only about what can be *typed*.
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for (name, count) in people {
+        if let Some((surname, rest)) = split_surname(&name) {
+            out.push((format!("{surname}, {rest}"), count));
+        }
+        out.push((name, count));
+    }
+
+    // An accented spelling cannot be reached by typing ASCII, so offer the
+    // accent-free rendering alongside it — but only when that is what stands in
+    // the way, or every accented name would appear twice.
+    let mut plain: Vec<(String, i64)> = Vec::new();
+    for (name, count) in &out {
+        let stripped = deaccent(name);
+        if stripped != *name
+            && !name.to_lowercase().starts_with(&needle)
+            && fold_name(&stripped).starts_with(&needle)
+        {
+            plain.push((stripped, *count));
+        }
+    }
+    out.extend(plain);
+
     // Candidates the shell can actually offer come first. zsh keeps only what
     // starts with the typed text, so a name matching in the middle — "Sullivan"
     // for "ivan" — is dead weight, and sorting it below the prefix matches stops
@@ -500,6 +551,30 @@ fn split_surname(name: &str) -> Option<(&str, String)> {
         return None;
     }
     Some((surname, words.join(" ")))
+}
+
+/// The name with its accents removed but its case and spacing intact, so it can
+/// be *offered* as a candidate: `Damgård, Ivan` -> `Damgard, Ivan`.
+///
+/// zsh keeps only candidates starting with what was typed, and it compares
+/// characters — `damga` cannot reach `Damgård`, so the busiest spelling of the
+/// name silently vanished from the menu while two rare ones survived. The
+/// accent-free rendering inserts cleanly and is the same filter, since matching
+/// folds both sides.
+pub fn deaccent(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let lower = ch.to_lowercase().next().unwrap_or(ch);
+        let folded = fold_name(&lower.to_string());
+        if folded.is_empty() || folded == lower.to_string() {
+            out.push(ch);
+        } else if ch.is_uppercase() {
+            out.push_str(&folded.to_uppercase());
+        } else {
+            out.push_str(&folded);
+        }
+    }
+    out
 }
 
 /// The *other* spelling convention: an umlaut written as a digraph, as it is
@@ -1551,6 +1626,20 @@ mod tests {
         assert_ne!(expand_name("Xue Liu"), expand_name("Xu Liu"));
         // Expansion leaves a name with no umlaut exactly as folding does.
         assert_eq!(expand_name("Adi Shamir"), fold_name("Adi Shamir"));
+    }
+
+    #[test]
+    fn an_accent_does_not_hide_a_name() {
+        // zsh keeps only candidates starting with what was typed, and compares
+        // characters: "damga" cannot reach "Damgård". The accent-free rendering
+        // can be typed, keeps its capitals, and is the same filter.
+        assert_eq!(deaccent("Damgård, Ivan"), "Damgard, Ivan");
+        assert_eq!(deaccent("Nico Döttling"), "Nico Dottling");
+        assert_eq!(deaccent("Peter B. Rønne"), "Peter B. Ronne");
+        // Nothing to strip, nothing to change — including the punctuation and
+        // spacing that `fold_name` would have flattened.
+        assert_eq!(deaccent("Ron D.  Rothblum"), "Ron D.  Rothblum");
+        assert_eq!(deaccent("Adi Shamir"), "Adi Shamir");
     }
 
     #[test]
