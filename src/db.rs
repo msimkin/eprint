@@ -98,6 +98,18 @@ pub fn open() -> Result<Connection> {
     // rebuild — would otherwise fail instantly rather than wait the few
     // milliseconds the writer actually needs.
     conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+    // `fold` is the same normalisation the completion list groups by, exposed to
+    // SQL so an author filter matches every spelling shown as one person. A
+    // function rather than a stored column: no migration, no backfill, and no way
+    // for the two to drift. It costs one call per row of a query that already
+    // scans the table.
+    conn.create_scalar_function(
+        "fold",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+            | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        |ctx| Ok(fold_name(&ctx.get::<String>(0)?)),
+    )?;
     init(&conn)?;
     Ok(conn)
 }
@@ -318,36 +330,140 @@ pub fn newest(conn: &Connection) -> Result<Option<(String, String)>> {
 /// The needle is not optional: the whole author list is 21,000 names and over a
 /// megabyte, and narrowing first is what makes this cheap enough for a keypress.
 pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result<Vec<(String, i64)>> {
-    let needle = needle.trim().to_lowercase();
+    // Folded on both sides, like the filter: typing "Damgard" has to find
+    // "Damgård", and typing "Damgård" has to find the papers filed without the
+    // accent.
+    let needle = fold_name(needle);
     if needle.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare("SELECT authors FROM papers WHERE lower(authors) LIKE ?1")?;
+    let mut stmt = conn.prepare("SELECT authors FROM papers WHERE fold(authors) LIKE ?1")?;
     let rows = stmt.query_map([format!("%{needle}%")], |r| r.get::<_, String>(0))?;
-    let mut counts: HashMap<String, i64> = HashMap::new();
+    // Grouped by folded name, so the archive's duplicate spellings of one person
+    // arrive as one candidate: "Ron D.  Rothblum" with two spaces and "Ron D.
+    // Rothblum" with one, or the same "Damgård" written pre-composed and
+    // decomposed. The spelling shown is whichever the archive uses most.
+    let mut groups: HashMap<String, (HashMap<String, i64>, i64)> = HashMap::new();
+    let mut surnames: HashMap<String, (String, i64)> = HashMap::new();
     for row in rows {
         // The column holds the whole byline, so split it and keep only the names
         // that actually matched — the others are co-authors, not candidates.
         for name in row?.split(';') {
-            let name = name.trim();
-            if name.is_empty() || !name.to_lowercase().contains(&needle) {
+            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+            if name.is_empty() || !fold_name(&name).contains(&needle) {
                 continue;
             }
-            *counts.entry(name.to_string()).or_insert(0) += 1;
-            // The surname on its own, when that is the part being typed. Shared
-            // surnames collapse into one candidate, which is the point: "Wang"
-            // is one thing to watch, not four hundred.
+            let g = groups.entry(fold_name(&name)).or_default();
+            *g.0.entry(name.clone()).or_insert(0) += 1;
+            g.1 += 1;
+            // The surname alone, when that is the part being typed: one candidate
+            // for everyone who shares it, which is the point — "Wang" is one thing
+            // to watch, not four hundred.
             if let Some(surname) = name.split_whitespace().next_back() {
-                if surname.to_lowercase().contains(&needle) && surname != name {
-                    *counts.entry(surname.to_string()).or_insert(0) += 1;
+                if fold_name(surname).contains(&needle) && surname != name {
+                    let e = surnames
+                        .entry(fold_name(surname))
+                        .or_insert_with(|| (surname.to_string(), 0));
+                    e.1 += 1;
                 }
             }
         }
     }
-    let mut out: Vec<(String, i64)> = counts.into_iter().collect();
+
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for (spellings, total) in groups.into_values() {
+        let name = spellings
+            .into_iter()
+            .max_by_key(|(n, c)| (*c, std::cmp::Reverse(n.clone())))
+            .map(|(n, _)| n)
+            .unwrap_or_default();
+        // Both orders, because zsh completes on a prefix and a name can be reached
+        // from either end: typing "Adi" finds "Adi Shamir", typing "Shamir" finds
+        // "Shamir, Adi". `--author` ignores the comma and matches word by word, so
+        // the two are the same filter — this is only about what can be *typed*.
+        if let Some((surname, rest)) = split_surname(&name) {
+            out.push((format!("{surname}, {rest}"), total));
+        }
+        out.push((name, total));
+    }
+    out.extend(surnames.into_values());
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.retain(|(n, _)| fold_name(n).contains(&needle));
     out.truncate(limit);
     Ok(out)
+}
+
+/// `"Adi Shamir"` -> `("Shamir", "Adi")`. `None` for a single-word name.
+fn split_surname(name: &str) -> Option<(&str, String)> {
+    let mut words: Vec<&str> = name.split_whitespace().collect();
+    let surname = words.pop()?;
+    if words.is_empty() {
+        return None;
+    }
+    Some((surname, words.join(" ")))
+}
+
+/// A name reduced to something comparable: lowercase, ASCII-folded, punctuation
+/// and repeated spaces gone. Two spellings that differ only in those respects are
+/// the same person, and the archive contains plenty of both.
+///
+/// Hand-rolled rather than pulled from a crate, in keeping with the rest: the
+/// table covers Latin-1 and Latin Extended-A, which is what author names use, and
+/// combining marks are dropped so a decomposed "å" folds the same as a composed
+/// one.
+pub fn fold_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut space = true;
+    for ch in s.chars().flat_map(|c| c.to_lowercase()) {
+        // A decomposed letter has already contributed its base character.
+        if ('\u{0300}'..='\u{036f}').contains(&ch) {
+            continue;
+        }
+        let mapped: Option<&str> = match ch {
+            'à'..='å' | 'ā' | 'ă' | 'ą' => Some("a"),
+            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => Some("c"),
+            'ď' | 'đ' => Some("d"),
+            'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => Some("e"),
+            'ĝ' | 'ğ' | 'ġ' | 'ģ' => Some("g"),
+            'ĥ' | 'ħ' => Some("h"),
+            'ì'..='ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => Some("i"),
+            'ĵ' => Some("j"),
+            'ķ' => Some("k"),
+            'ĺ' | 'ļ' | 'ľ' | 'ł' => Some("l"),
+            'ñ' | 'ń' | 'ņ' | 'ň' => Some("n"),
+            'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => Some("o"),
+            'ŕ' | 'ŗ' | 'ř' => Some("r"),
+            'ś' | 'ŝ' | 'ş' | 'š' => Some("s"),
+            'ţ' | 'ť' | 'ŧ' => Some("t"),
+            'ù'..='ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => Some("u"),
+            'ŵ' => Some("w"),
+            'ý' | 'ÿ' | 'ŷ' => Some("y"),
+            'ź' | 'ż' | 'ž' => Some("z"),
+            'æ' => Some("ae"),
+            'œ' => Some("oe"),
+            'ß' => Some("ss"),
+            _ => None,
+        };
+        match mapped {
+            Some(rep) => {
+                out.push_str(rep);
+                space = false;
+            }
+            None if ch.is_alphanumeric() => {
+                out.push(ch);
+                space = false;
+            }
+            // Punctuation and whitespace both collapse to a single separator, so
+            // "Ron D.  Rothblum" and "Ron D. Rothblum" fold alike.
+            None => {
+                if !space {
+                    out.push(' ');
+                    space = true;
+                }
+            }
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// The categories actually present in the index, with how many papers carry each,
@@ -652,9 +768,10 @@ pub fn watched(conn: &Connection, watches: &[Watch]) -> Result<HashSet<String>> 
 /// Identifies the watch list the cache was built from. Labels are what the config
 /// stores, so two lists differ here exactly when they differ on disk.
 fn watch_fingerprint(watches: &[Watch]) -> String {
-    watches
-        .iter()
-        .map(|w| w.label())
+    // Versioned: a change to how matching works invalidates every cached set just
+    // as surely as an edited watch does, and a stale cache would be invisible.
+    std::iter::once("v2".to_string())
+        .chain(watches.iter().map(|w| w.label()))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -932,18 +1049,26 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     // have to know whether the archive stored "Katharina Boudgoust" or "Boudgoust
     // Katharina" to watch a person. One `LIKE` per word, ANDed. A single word
     // behaves exactly as it did before, which is the common case.
+    //
+    // Punctuation is dropped from each word, which is what lets completion offer a
+    // name surname-first — "Shamir, Adi" has to be the same filter as "Adi Shamir",
+    // since the comma is there only so the candidate starts with what was typed.
     if let Some(a) = &q.author {
-        let mut words = a.split_whitespace().peekable();
-        if words.peek().is_some() {
-            for word in words {
-                args.push(Box::new(format!("%{}%", word.to_lowercase())));
-                sql.push_str(&format!(" AND lower(p.authors) LIKE ?{}", args.len()));
-            }
-        } else {
-            // All whitespace: keep the literal rather than silently matching every
-            // paper in the archive.
+        let folded = fold_name(a);
+        // Single letters are dropped: an initial as its own `LIKE '%d%'` matches
+        // almost every byline in the archive, and dropping it is also what makes
+        // "Ron D. Rothblum" and "Ron Rothblum" — the same person, filed both ways —
+        // one filter rather than two.
+        let words: Vec<&str> = folded.split_whitespace().filter(|w| w.len() > 1).collect();
+        if words.is_empty() {
+            // Nothing usable: keep the literal rather than matching the archive.
             args.push(Box::new(format!("%{}%", a.to_lowercase())));
             sql.push_str(&format!(" AND lower(p.authors) LIKE ?{}", args.len()));
+        } else {
+            for word in words {
+                args.push(Box::new(format!("%{word}%")));
+                sql.push_str(&format!(" AND fold(p.authors) LIKE ?{}", args.len()));
+            }
         }
     }
     if let Some(c) = &q.category {

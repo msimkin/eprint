@@ -288,9 +288,19 @@ Boudguiga  -- 13 papers
 $ eprint watch add --author Katharina\ B<TAB>      → Katharina\ Boudgoust
 ```
 
-Every match is offered twice, as the surname alone and as the full name, so it works whichever end
-of the name you start from. Both are valid filters, and completing a full name escapes the space,
-which removes the one real trap in `--author`.
+Names are offered in both orders, because completion matches on a prefix and you may start from
+either end:
+
+```
+$ eprint watch add --author Shamir<TAB>
+Shamir        -- 54 papers
+Shamir, Adi   -- 53 papers
+Shamir, Dana  -- 1 paper
+```
+
+`Shamir, Adi` and `Adi Shamir` are the same filter — the comma is there only so the candidate
+starts with what you typed. Spellings that differ by accents, punctuation or spacing are shown as
+one person, with their papers added together.
 
 **`eprint watch rm <TAB>`** offers your saved watches by number, with what each one is:
 
@@ -400,9 +410,11 @@ $ eprint watch
   4   proof of work · titles only                  56 in the index
 ```
 
-An author filter matches **every word of the name, in any order**, so
-`--author "Katharina Boudgoust"` and `--author "Boudgoust Katharina"` find the same 18 papers and
-you need not know which way round the archive stored it. A full name has to be quoted, or the shell
+An author filter matches **every word of the name, in any order, ignoring accents, punctuation and
+case**. `--author "Katharina Boudgoust"` and `--author "Boudgoust Katharina"` are the same filter,
+and so are `Damgård` and `Damgard` — the archive contains both spellings of the same person, along
+with `Ron D.  Rothblum` and `Ron D. Rothblum` differing only by a stray space. Single letters are
+dropped, which is what makes `Ron D. Rothblum` and `Ron Rothblum` one filter rather than two. A full name has to be quoted, or the shell
 hands `Boudgoust` to the query instead of to `--author` — which is what Tab completion is for
 (below): it fills in the whole name and escapes the space for you.
 
