@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, ToSql};
+pub(crate) use rusqlite::Connection;
+use rusqlite::ToSql;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -72,19 +73,11 @@ const WATCH_MATCH_CAP: usize = 50_000;
 const KEY_CACHE_FOR: &str = "watch_cache_for";
 /// What the cached `author_class` was built from: the harvest, and the aliases
 /// file verbatim. Both change what "the same author" means.
-const KEY_NAMES_FOR: &str = "author_class_for";
+pub(crate) const KEY_NAMES_FOR: &str = "author_class_for";
 
-/// The author classes, loaded once per process by `open()`. `filter_sql` builds
-/// SQL without a `Connection` in hand — and `Watch::query()` has none either — so
-/// the map lives here rather than travelling through `Query`.
-static CLASSES: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
-/// The same information the other way round and pre-folded: a folded name to the
-/// folded spellings of everyone it is the same person as. Built with `CLASSES`,
-/// because `author_match` runs per row and cannot afford to invert a map.
-static SPELLINGS: std::sync::OnceLock<HashMap<String, Vec<String>>> = std::sync::OnceLock::new();
 /// Bumped when matching changes, so every cache rebuilds once. v4 records which
 /// watch matched each paper; v3 and earlier stored ids alone.
-const CACHE_VERSION: &str = "v4";
+pub(crate) const CACHE_VERSION: &str = "v4";
 const KEY_CACHE_HARVEST: &str = "watch_cache_harvest";
 
 pub const MARK_START: char = '\x01';
@@ -113,25 +106,15 @@ pub fn open() -> Result<Connection> {
     // rebuild — would otherwise fail instantly rather than wait the few
     // milliseconds the writer actually needs.
     conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
-    // `fold` is the same normalisation the completion list groups by, exposed to
-    // SQL so an author filter matches every spelling shown as one person. A
-    // function rather than a stored column: no migration, no backfill, and no way
-    // for the two to drift. It costs one call per row of a query that already
-    // scans the table.
-    conn.create_scalar_function(
-        "fold",
-        1,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
-            | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-        |ctx| Ok(fold_name(&ctx.get::<String>(0)?)),
-    )?;
+    // Author matching is one predicate, evaluated per row. It replaced a `fold`
+    // function that compared whole bylines, which is why no query folds any more.
     conn.create_scalar_function(
         "author_match",
         2,
         rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
             | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            Ok(author_match(
+            Ok(crate::names::author_match(
                 &ctx.get::<String>(0)?,
                 &ctx.get::<String>(1)?,
             ))
@@ -140,27 +123,7 @@ pub fn open() -> Result<Connection> {
     init(&conn)?;
     // Rebuilt here only when the archive or the aliases file has moved; otherwise
     // this is one small query.
-    if CLASSES.get().is_none() {
-        let classes = author_classes(&conn).unwrap_or_default();
-        let mut groups: HashMap<&str, Vec<String>> = HashMap::new();
-        for (name, canonical) in &classes {
-            let group = groups.entry(canonical.as_str()).or_default();
-            for n in [name.as_str(), canonical.as_str()] {
-                let folded = fold_name(n);
-                if !group.contains(&folded) {
-                    group.push(folded);
-                }
-            }
-        }
-        let mut spellings: HashMap<String, Vec<String>> = HashMap::new();
-        for group in groups.values() {
-            for member in group {
-                spellings.insert(member.clone(), group.clone());
-            }
-        }
-        let _ = SPELLINGS.set(spellings);
-        let _ = CLASSES.set(classes);
-    }
+    crate::names::load(&conn);
     Ok(conn)
 }
 
@@ -408,327 +371,6 @@ pub fn newest(conn: &Connection) -> Result<Option<(String, String)>> {
     }
 }
 
-/// Candidates for completing `--author`: names containing `needle`, each offered
-/// both in full and as a bare surname, commonest first.
-///
-/// Two forms because zsh completes on a prefix and people start a name from either
-/// end. "boudg" then finds the surname `Boudgoust`, "kath" finds `Katharina
-/// Boudgoust`, and the shell filters to whichever fits what was typed. Both are
-/// valid filters, since `--author` matches every word of the name in any order.
-///
-/// The needle is not optional: the whole author list is 21,000 names and over a
-/// megabyte, and narrowing first is what makes this cheap enough for a keypress.
-pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result<Vec<Candidate>> {
-    let needle = fold_name(needle);
-    if needle.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // The same predicate the filter uses, so what is offered and what is found
-    // cannot disagree — including its widening to a person's other spellings.
-    let mut stmt = conn.prepare("SELECT authors FROM papers WHERE author_match(authors, ?1)")?;
-    let bylines: Vec<String> = stmt
-        .query_map([needle.as_str()], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 1).collect();
-
-    // One entry per person, and every spelling of their name the archive uses, so
-    // the one that was typed can be offered back.
-    let mut spellings: HashMap<String, HashMap<String, i64>> = HashMap::new();
-    for byline in &bylines {
-        for name in byline.split(';') {
-            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-            if name.is_empty() || !name_matches(&name, &words) {
-                continue;
-            }
-            *spellings
-                .entry(person_of(&name))
-                .or_default()
-                .entry(name)
-                .or_insert(0) += 1;
-        }
-    }
-
-    let mut out: Vec<Candidate> = Vec::new();
-    for person in spellings.keys().cloned().collect::<Vec<_>>() {
-        // Offer a spelling that can actually be typed: accents removed, and of the
-        // spellings the archive uses, one that contains what was typed. zsh keeps
-        // only candidates starting with the typed text and compares characters, so
-        // an accented candidate is one the shell silently discards.
-        let usable = spellings
-            .get(&person)
-            .filter(|_| true)
-            .and_then(|s| {
-                s.iter()
-                    .filter(|(n, _)| fold_name(&deaccent(n)).contains(&needle))
-                    .max_by_key(|(n, c)| (**c, std::cmp::Reverse((*n).clone())))
-                    .map(|(n, _)| n.clone())
-            })
-            .unwrap_or_else(|| person.clone());
-        let value = deaccent(&usable);
-        // The number is what picking this candidate actually returns — counted
-        // with the same predicate the filter uses, over the papers already in
-        // hand. Counting the person's class instead would under-report: choosing
-        // `Ivan Damgard` also finds `Ivan Bjerre Damgård`.
-        let folded_value = fold_name(&value);
-        let count = bylines
-            .iter()
-            .filter(|b| author_match(b, &folded_value))
-            .count() as i64;
-        // Name the person when the offered spelling is not how they are usually
-        // written, so it is clear what the watch will actually follow.
-        let person = if fold_name(&person) == folded_value {
-            String::new()
-        } else {
-            person.clone()
-        };
-        if let Some((surname, rest)) = split_surname(&value) {
-            out.push(Candidate {
-                value: format!("{surname}, {rest}"),
-                person: person.clone(),
-                papers: count,
-            });
-        }
-        out.push(Candidate {
-            value,
-            person,
-            papers: count,
-        });
-    }
-
-    // zsh keeps only what starts with the typed text, so a name matching in the
-    // middle — "Sullivan" for "ivan" — is dead weight, and sorting it last stops
-    // it from eating the budget before the truncation.
-    out.retain(|c| fold_name(&c.value).contains(&needle));
-    out.sort_by(|a, b| {
-        let starts = |c: &Candidate| !fold_name(&c.value).starts_with(&needle);
-        starts(a)
-            .cmp(&starts(b))
-            .then_with(|| b.papers.cmp(&a.papers))
-            .then_with(|| a.value.cmp(&b.value))
-    });
-    out.truncate(limit);
-    Ok(out)
-}
-
-/// Names that look like one person but cannot be proven to be, as
-/// `canonical = other, other` lines for the aliases file.
-///
-/// Suggestions only — the rules merge what they can show, and everything here is
-/// a judgement the tool is not entitled to make on its own: a shared surname with
-/// a matching first initial, or one name's words being a subset of another's
-/// (`Ivan Damgård` and `Ivan Bjerre Damgård`). Written commented out.
-pub fn alias_suggestions(conn: &Connection) -> Result<Vec<String>> {
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT authors FROM papers")?;
-    for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-        for name in row?.split(';') {
-            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !name.is_empty() {
-                *counts.entry(name).or_insert(0) += 1;
-            }
-        }
-    }
-    // Only spellings the rules left apart are worth suggesting.
-    let person = |n: &str| person_of(n);
-    let mut by_surname: HashMap<String, Vec<String>> = HashMap::new();
-    for name in counts.keys() {
-        if let Some(surname) = fold_name(name).split_whitespace().next_back() {
-            by_surname
-                .entry(surname.to_string())
-                .or_default()
-                .push(name.clone());
-        }
-    }
-
-    // An abbreviation of a name, not merely a name starting with the same letter:
-    // `I. Damgard` abbreviates `Ivan Damgård`, but `Yu Wang` and `Yang Wang` are
-    // two people who happen to share a Y. Requiring one side to be a bare initial
-    // took the suggestion list from 1,943 lines to something reviewable.
-    let abbreviates = |short: &str, long: &str| -> bool {
-        let (s, l) = (fold_name(short), fold_name(long));
-        let (mut sw, mut lw) = (s.split_whitespace(), l.split_whitespace());
-        match (sw.next(), lw.next()) {
-            (Some(a), Some(b)) => {
-                a.len() == 1 && b.starts_with(a) && sw.next_back() == lw.next_back()
-            }
-            _ => false,
-        }
-    };
-    let words = |n: &str| -> Vec<String> {
-        fold_name(n)
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .map(|w| w.to_string())
-            .collect()
-    };
-    let mut out: Vec<String> = Vec::new();
-    for (_, mut group) in by_surname {
-        if group.len() < 2 {
-            continue;
-        }
-        group.sort_by_key(|n| (-counts[n], n.clone()));
-        let mut taken: Vec<String> = Vec::new();
-        for anchor in &group {
-            if taken.contains(anchor) {
-                continue;
-            }
-            let mut others: Vec<String> = Vec::new();
-            for other in &group {
-                if other == anchor || taken.contains(other) || person(other) == person(anchor) {
-                    continue;
-                }
-                let (aw, ow) = (words(anchor), words(other));
-                // At least a first name and a surname, or `G. Stütz` — which
-                // reduces to its surname — would be suggested as an alias for
-                // every Stutz in the archive.
-                let subset = aw.len() >= 2 && aw.iter().all(|w| ow.contains(w));
-                if subset || abbreviates(other, anchor) || abbreviates(anchor, other) {
-                    others.push(other.clone());
-                    taken.push(other.clone());
-                }
-            }
-            if !others.is_empty() {
-                taken.push(anchor.clone());
-                out.push(format!("{anchor} = {}", others.join(", ")));
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// The spelling that stands for whoever this name belongs to.
-fn person_of(name: &str) -> String {
-    CLASSES
-        .get()
-        .and_then(|c| c.get(name))
-        .cloned()
-        .unwrap_or_else(|| name.to_string())
-}
-
-/// `"Adi Shamir"` -> `("Shamir", "Adi")`. `None` for a single-word name.
-fn split_surname(name: &str) -> Option<(&str, String)> {
-    let mut words: Vec<&str> = name.split_whitespace().collect();
-    let surname = words.pop()?;
-    if words.is_empty() {
-        return None;
-    }
-    Some((surname, words.join(" ")))
-}
-
-/// The name with its accents removed but its case and spacing intact, so it can
-/// be *offered* as a candidate: `Damgård, Ivan` -> `Damgard, Ivan`.
-///
-/// zsh keeps only candidates starting with what was typed, and it compares
-/// characters — `damga` cannot reach `Damgård`, so the busiest spelling of the
-/// name silently vanished from the menu while two rare ones survived. The
-/// accent-free rendering inserts cleanly and is the same filter, since matching
-/// folds both sides.
-pub fn deaccent(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let lower = ch.to_lowercase().next().unwrap_or(ch);
-        let folded = fold_name(&lower.to_string());
-        if folded.is_empty() || folded == lower.to_string() {
-            out.push(ch);
-        } else if ch.is_uppercase() {
-            out.push_str(&folded.to_uppercase());
-        } else {
-            out.push_str(&folded);
-        }
-    }
-    out
-}
-
-/// The *other* spelling convention: an umlaut written as a digraph, as it is
-/// written when the character is unavailable. Folded afterwards, so this and
-/// `fold_name` produce comparable keys.
-///
-/// Deliberately not the inverse of folding — collapsing `ue` to `u` would merge
-/// `Yue` with `Yu` and `Xue` with `Xu`, who are different people. Expanding fires
-/// only on a name that actually carries the umlaut, so it is evidence rather than
-/// guesswork: `Müller` links `Muller` through one key and `Mueller` through the
-/// other, while `Yu` and `Yue` share neither.
-pub fn expand_name(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for ch in s.chars() {
-        match ch {
-            'ä' | 'Ä' => out.push_str("ae"),
-            'ö' | 'Ö' | 'ø' | 'Ø' => out.push_str("oe"),
-            'ü' | 'Ü' => out.push_str("ue"),
-            'å' | 'Å' => out.push_str("aa"),
-            'æ' | 'Æ' => out.push_str("ae"),
-            'ß' => out.push_str("ss"),
-            _ => out.push(ch),
-        }
-    }
-    fold_name(&out)
-}
-
-/// A name reduced to something comparable: lowercase, ASCII-folded, punctuation
-/// and repeated spaces gone. Two spellings that differ only in those respects are
-/// the same person, and the archive contains plenty of both.
-///
-/// Hand-rolled rather than pulled from a crate, in keeping with the rest: the
-/// table covers Latin-1 and Latin Extended-A, which is what author names use, and
-/// combining marks are dropped so a decomposed "å" folds the same as a composed
-/// one.
-pub fn fold_name(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut space = true;
-    for ch in s.chars().flat_map(|c| c.to_lowercase()) {
-        // A decomposed letter has already contributed its base character.
-        if ('\u{0300}'..='\u{036f}').contains(&ch) {
-            continue;
-        }
-        let mapped: Option<&str> = match ch {
-            'à'..='å' | 'ā' | 'ă' | 'ą' => Some("a"),
-            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => Some("c"),
-            'ď' | 'đ' => Some("d"),
-            'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => Some("e"),
-            'ĝ' | 'ğ' | 'ġ' | 'ģ' => Some("g"),
-            'ĥ' | 'ħ' => Some("h"),
-            'ì'..='ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => Some("i"),
-            'ĵ' => Some("j"),
-            'ķ' => Some("k"),
-            'ĺ' | 'ļ' | 'ľ' | 'ł' => Some("l"),
-            'ñ' | 'ń' | 'ņ' | 'ň' => Some("n"),
-            'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => Some("o"),
-            'ŕ' | 'ŗ' | 'ř' => Some("r"),
-            'ś' | 'ŝ' | 'ş' | 'š' => Some("s"),
-            'ţ' | 'ť' | 'ŧ' => Some("t"),
-            'ù'..='ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => Some("u"),
-            'ŵ' => Some("w"),
-            'ý' | 'ÿ' | 'ŷ' => Some("y"),
-            'ź' | 'ż' | 'ž' => Some("z"),
-            'æ' => Some("ae"),
-            'œ' => Some("oe"),
-            'ß' => Some("ss"),
-            _ => None,
-        };
-        match mapped {
-            Some(rep) => {
-                out.push_str(rep);
-                space = false;
-            }
-            None if ch.is_alphanumeric() => {
-                out.push(ch);
-                space = false;
-            }
-            // Punctuation and whitespace both collapse to a single separator, so
-            // "Ron D.  Rothblum" and "Ron D. Rothblum" fold alike.
-            None => {
-                if !space {
-                    out.push(' ');
-                    space = true;
-                }
-            }
-        }
-    }
-    out.trim_end().to_string()
-}
-
 /// The categories actually present in the index, with how many papers carry each,
 /// commonest first. Read from the data rather than hard-coded: the archive owns
 /// this list, so a category it adds should appear here without a release. Papers
@@ -880,18 +522,6 @@ fn row_to_paper(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Paper> {
     })
 }
 
-/// One author to complete, as offered to the shell.
-pub struct Candidate {
-    /// What gets inserted. Accent-free, because zsh compares characters and will
-    /// not reach `Damgård` from `damga`.
-    pub value: String,
-    /// How the archive usually writes this person, when that differs from
-    /// `value` — so a rarer spelling says whose papers it will find. Empty when
-    /// the two agree.
-    pub person: String,
-    pub papers: i64,
-}
-
 /// A saved search. Mirrors the fields of `Query` that make sense to persist:
 /// no limit (the caller decides how much to show) and no year, which would
 /// date a standing watch.
@@ -1006,212 +636,7 @@ fn matching_ids(conn: &Connection, q: &Query) -> Result<Vec<String>> {
         return collect(None);
     }
     // Same verbatim-then-quoted fallback as `search`.
-    match collect(Some(primary_expr(q))) {
-        Ok(ids) => Ok(ids),
-        Err(e) => {
-            let fallback = fallback_expr(q);
-            if fallback.is_empty() {
-                return Err(e);
-            }
-            collect(Some(fallback))
-        }
-    }
-}
-
-/// Does one of this paper's authors match `needle`?
-///
-/// **Per author, not per byline.** Matching the words against the whole line made
-/// `--author "Kasper Damgård"` return six papers, because Kasper Green Larsen and
-/// Ivan Damgård write together — two different people, one line of text.
-///
-/// A name matches when every word of the needle appears in it, in any order,
-/// single letters ignored; or when another spelling of the same person does, so
-/// `Damgård` finds the papers filed as `Damgaard`.
-pub fn author_match(byline: &str, needle: &str) -> bool {
-    let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 1).collect();
-    if words.is_empty() {
-        // Nothing usable — a lone initial — so fall back to the literal text
-        // rather than matching every paper in the archive.
-        let needle = needle.trim();
-        return !needle.is_empty() && fold_name(byline).contains(needle);
-    }
-    byline.split(';').any(|name| name_matches(name, &words))
-}
-
-/// One author name against the needle's words, including the person's other
-/// spellings.
-fn name_matches(name: &str, words: &[&str]) -> bool {
-    let folded = fold_name(name);
-    if words.iter().all(|w| folded.contains(w)) {
-        return true;
-    }
-    SPELLINGS
-        .get()
-        .and_then(|s| s.get(&folded))
-        .is_some_and(|others| {
-            others
-                .iter()
-                .any(|other| words.iter().all(|w| other.contains(w)))
-        })
-}
-
-/// The author classes, cached in `author_class` and rebuilt when the archive or
-/// the aliases file moves. Every consumer — searching, badging, completion — goes
-/// through here, so they cannot disagree about who is who.
-pub fn author_classes(conn: &Connection) -> Result<HashMap<String, String>> {
-    let fingerprint = format!(
-        "{CACHE_VERSION}\n{}\n{}",
-        meta_get(conn, crate::harvest::KEY_LAST_HARVEST)?.unwrap_or_default(),
-        crate::config::aliases()
-            .iter()
-            .map(|(a, b, same)| format!("{a}{}{b}", if *same { "=" } else { "!=" }))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    if meta_get(conn, KEY_NAMES_FOR)?.as_deref() != Some(fingerprint.as_str()) {
-        let classes = build_author_classes(conn)?;
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let written = (|| -> Result<()> {
-            conn.execute("DELETE FROM author_class", [])?;
-            {
-                let mut stmt = conn
-                    .prepare("INSERT OR REPLACE INTO author_class (name, canonical) VALUES (?1,?2)")?;
-                // Only the names that actually stand for someone else are worth
-                // storing; a name that is its own canonical is the default.
-                for (name, canonical) in classes.iter().filter(|(n, c)| n != c) {
-                    stmt.execute([name, canonical])?;
-                }
-            }
-            meta_set(conn, KEY_NAMES_FOR, &fingerprint)?;
-            Ok(())
-        })();
-        conn.execute_batch(if written.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-        written?;
-    }
-    let mut stmt = conn.prepare("SELECT name, canonical FROM author_class")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
-}
-
-/// Every author spelling in the index, mapped to the one spelling that stands for
-/// the person. Built once and cached in `author_class`.
-///
-/// Two keys per name — `fold_name` and `expand_name` — joined transitively, so
-/// `Ivan Damgård`, `Ivan Damgard` and `Ivan Damgaard` become one person while
-/// `Yu Chen` and `Yue Chen` stay two. Measured over 20,071 distinct spellings:
-/// 28 groups merged, none of them wrong. Collapsing digraphs instead would merge
-/// 43 and get 11 wrong, all Chinese pinyin.
-///
-/// The aliases file is applied afterwards so it can override in both directions:
-/// `A = B` says the rules missed one, `A != B` says they overreached.
-fn build_author_classes(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT authors FROM papers")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    for row in rows {
-        for name in row?.split(';') {
-            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !name.is_empty() {
-                *counts.entry(name).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Union-find over the names, keyed by both spellings of each.
-    let names: Vec<String> = counts.keys().cloned().collect();
-    let index: HashMap<&str, usize> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
-    let mut parent: Vec<usize> = (0..names.len()).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
-    }
-    let union = |parent: &mut [usize], a: usize, b: usize| {
-        let (ra, rb) = (find(parent, a), find(parent, b));
-        if ra != rb {
-            parent[ra] = rb;
-        }
-    };
-    let mut owner: HashMap<String, usize> = HashMap::new();
-    for (i, name) in names.iter().enumerate() {
-        for key in [fold_name(name), expand_name(name)] {
-            match owner.get(&key) {
-                Some(&j) => union(&mut parent, i, j),
-                None => {
-                    owner.insert(key, i);
-                }
-            }
-        }
-    }
-
-    // `A = B` joins them. Names the archive has never used are still recorded, so
-    // a watch written against one resolves to the class.
-    let aliases = crate::config::aliases();
-    let mut extra: Vec<String> = Vec::new();
-    let mut split: Vec<(String, String)> = Vec::new();
-    for (canonical, other, same) in &aliases {
-        if *same {
-            for n in [canonical, other] {
-                if !index.contains_key(n.as_str()) && !extra.contains(n) {
-                    extra.push(n.clone());
-                }
-            }
-        } else {
-            split.push((canonical.clone(), other.clone()));
-        }
-    }
-    let mut names = names;
-    for n in extra {
-        names.push(n);
-        parent.push(parent.len());
-    }
-    let index: HashMap<&str, usize> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
-    for (canonical, other, same) in &aliases {
-        if !*same {
-            continue;
-        }
-        if let (Some(&a), Some(&b)) = (index.get(canonical.as_str()), index.get(other.as_str())) {
-            union(&mut parent, a, b);
-        }
-    }
-
-    // Group, then pick the spelling the archive uses most as the one to show.
-    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..names.len() {
-        let root = find(&mut parent, i);
-        groups.entry(root).or_default().push(i);
-    }
-    let mut out: HashMap<String, String> = HashMap::new();
-    for members in groups.values() {
-        let canonical = members
-            .iter()
-            .max_by_key(|&&i| (counts.get(&names[i]).copied().unwrap_or(0), std::cmp::Reverse(i)))
-            .map(|&i| names[i].clone())
-            .unwrap_or_default();
-        for &i in members {
-            out.insert(names[i].clone(), canonical.clone());
-        }
-    }
-    // `A != B` is applied last: it wins over anything the rules or the merges did.
-    for (a, b) in split {
-        // The vetoed spelling becomes its own canonical; the other keeps whatever
-        // it had, which is either itself or a class the veto says nothing about.
-        if out.contains_key(&b) {
-            out.insert(b.clone(), b.clone());
-        }
-        let _ = &a;
-    }
-    Ok(out)
+    two_shot(q, |expr| collect(Some(expr.to_string())))
 }
 
 /// Every id in the index matching at least one saved watch.
@@ -1250,10 +675,14 @@ pub fn watch_counts(conn: &Connection, watches: &[Watch]) -> Result<HashMap<Stri
 fn sync_watch_cache(conn: &Connection, watches: &[Watch]) -> Result<()> {
     let harvest = meta_get(conn, crate::harvest::KEY_LAST_HARVEST)?.unwrap_or_default();
     let stale_index = meta_get(conn, KEY_CACHE_HARVEST)?.as_deref() != Some(harvest.as_str());
+    // The stored fingerprint carries the class fingerprint on its first lines; the
+    // watch labels follow. A change to either invalidates what is cached.
+    let prefix = watch_fingerprint(conn, &[]);
     let covered: Vec<String> = match (stale_index, meta_get(conn, KEY_CACHE_FOR)?) {
-        (false, Some(list)) if list.starts_with(CACHE_VERSION) => list
+        (false, Some(list)) if list.starts_with(&prefix) => list
+            .strip_prefix(&prefix)
+            .unwrap_or("")
             .split('\n')
-            .skip(1)
             .filter(|l| !l.is_empty())
             .map(|l| l.to_string())
             .collect(),
@@ -1299,7 +728,7 @@ fn sync_watch_cache(conn: &Connection, watches: &[Watch]) -> Result<()> {
                 stmt.execute([id, label])?;
             }
         }
-        meta_set(conn, KEY_CACHE_FOR, &watch_fingerprint(watches))?;
+        meta_set(conn, KEY_CACHE_FOR, &watch_fingerprint(conn, watches))?;
         meta_set(conn, KEY_CACHE_HARVEST, &harvest)?;
         Ok(())
     })();
@@ -1309,12 +738,16 @@ fn sync_watch_cache(conn: &Connection, watches: &[Watch]) -> Result<()> {
 
 /// The labels the cache covers, behind a version tag. Bumping the tag invalidates
 /// every cache, which is what a change to *how* matching works requires.
-fn watch_fingerprint(watches: &[Watch]) -> String {
+fn watch_fingerprint(conn: &Connection, watches: &[Watch]) -> String {
     // The author classes are part of what a watch *means*: if `Damgård` starts
-    // matching `Damgaard`, the cached rows for that watch are wrong. Folding the
-    // class fingerprint in here keeps badges and searches agreeing.
-    let classes = CLASSES.get().map(|c| c.len()).unwrap_or(0);
-    std::iter::once(format!("{CACHE_VERSION} names:{classes}"))
+    // matching `Damgaard`, the cached rows for that watch are wrong. This used to
+    // fold in the *number* of classes, so swapping one alias for another left the
+    // badges stale while searches moved — 278 against 191 for the same watch.
+    let classes = meta_get(conn, KEY_NAMES_FOR)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    std::iter::once(format!("{CACHE_VERSION}\n{classes}"))
         .chain(watches.iter().map(|w| w.label()))
         .collect::<Vec<_>>()
         .join("\n")
@@ -1438,6 +871,25 @@ fn add_prefix(terms: &str) -> String {
         .join(" ")
 }
 
+/// Run an FTS query the user's way, and if SQLite rejects it as a parse error,
+/// again with every token quoted.
+///
+/// One function because it used to be three — `search`, `count_matches` and
+/// `matching_ids` each had their own copy, and a header could disagree with the
+/// results it was counting if only one of them was changed.
+fn two_shot<T>(q: &Query, run: impl Fn(&str) -> Result<T>) -> Result<T> {
+    match run(&primary_expr(q)) {
+        Ok(found) => Ok(found),
+        Err(first) => {
+            let fallback = fallback_expr(q);
+            if fallback.trim().is_empty() {
+                return Err(first);
+            }
+            run(&fallback)
+        }
+    }
+}
+
 /// FTS5 rejects some punctuation in bare queries (e.g. `zero-knowledge`).
 /// Rather than guess, we try the user's query verbatim first — preserving
 /// operators like AND/OR/NOT, quoted phrases and `prefix*` — and only fall
@@ -1477,23 +929,16 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
     if q.terms.trim().is_empty() {
         return browse(conn, q);
     }
-    match run_search(conn, q, &primary_expr(q)) {
-        Ok(hits) => Ok(hits),
-        Err(_) => {
-            // Nothing survives quoting (e.g. a lone `"`), so there is no second
-            // shot to take. Say that plainly instead of forwarding SQLite's
-            // "unterminated string: Error code 1" at the user. Checking the
-            // quoted tokens rather than the whole expression matters: under
-            // `--scope title` the wrapper makes even an empty query non-empty.
-            if quote_terms(q.terms, q.prefix).trim().is_empty() {
-                bail!("could not parse query: {}", q.terms);
-            }
-            // The fallback keeps its source attached: if *that* fails it is more
-            // likely a real database problem than a syntax one.
-            run_search(conn, q, &fallback_expr(q))
-                .with_context(|| format!("could not parse query: {}", q.terms))
-        }
+    // Nothing survives quoting (e.g. a lone `"`), so there is no second shot to
+    // take. Say that plainly instead of forwarding SQLite's "unterminated string:
+    // Error code 1" at the user. Checking the quoted tokens rather than the whole
+    // expression matters: under `--scope title` the wrapper makes even an empty
+    // query non-empty.
+    if quote_terms(q.terms, q.prefix).trim().is_empty() && run_search(conn, q, &primary_expr(q)).is_err() {
+        bail!("could not parse query: {}", q.terms);
     }
+    two_shot(q, |expr| run_search(conn, q, expr))
+        .with_context(|| format!("could not parse query: {}", q.terms))
 }
 
 fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
@@ -1519,20 +964,11 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     if q.only_watched {
         sql.push_str(" AND p.id IN (SELECT id FROM watch_hits)");
     }
-    // Every word of the name has to appear, but the order does not: nobody should
-    // have to know whether the archive stored "Katharina Boudgoust" or "Boudgoust
-    // Katharina" to watch a person. One `LIKE` per word, ANDed. A single word
-    // behaves exactly as it did before, which is the common case.
-    //
-    // Punctuation is dropped from each word, which is what lets completion offer a
-    // name surname-first — "Shamir, Adi" has to be the same filter as "Adi Shamir",
-    // since the comma is there only so the candidate starts with what was typed.
+    // One predicate, defined in `names`: every word of the name must begin a word
+    // of a single author's name, in any order. See that module for why it is per
+    // author rather than per byline.
     if let Some(a) = &q.author {
-        let folded = fold_name(a);
-        // Single letters are dropped: an initial as its own `LIKE '%d%'` matches
-        // almost every byline in the archive, and dropping it is also what makes
-        // "Ron D. Rothblum" and "Ron Rothblum" — the same person, filed both ways —
-        // one filter rather than two.
+        let folded = crate::names::fold_name(a);
         args.push(Box::new(folded));
         sql.push_str(&format!(" AND author_match(p.authors, ?{})", args.len()));
     }
@@ -1582,36 +1018,25 @@ fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>
 /// Total number of matches, ignoring the display limit, so the header can
 /// say "20 of 147 results".
 pub fn count_matches(conn: &Connection, q: &Query) -> Result<usize> {
-    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-    let sql = if q.terms.trim().is_empty() {
-        args.clear();
+    if q.terms.trim().is_empty() {
+        let mut args: Vec<Box<dyn ToSql>> = Vec::new();
         let filters = filter_sql(q, &mut args);
-        format!("SELECT COUNT(*) FROM papers p WHERE 1=1{filters}")
-    } else {
-        args.push(Box::new(primary_expr(q)));
+        let sql = format!("SELECT COUNT(*) FROM papers p WHERE 1=1{filters}");
+        let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let n: i64 = conn.query_row(&sql, refs.as_slice(), |r| r.get(0))?;
+        return Ok(n as usize);
+    }
+    let count = |expr: &str| -> Result<i64> {
+        let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(expr.to_string())];
         let filters = filter_sql(q, &mut args);
-        format!(
+        let sql = format!(
             "SELECT COUNT(*) FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
              WHERE papers_fts MATCH ?1{filters}"
-        )
+        );
+        let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        Ok(conn.query_row(&sql, refs.as_slice(), |r| r.get(0))?)
     };
-    let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-    let n: i64 = match conn.query_row(&sql, refs.as_slice(), |r| r.get(0)) {
-        Ok(n) => n,
-        Err(_) if !q.terms.trim().is_empty() => {
-            // Same verbatim-then-quoted fallback as `search`.
-            let mut args2: Vec<Box<dyn ToSql>> = vec![Box::new(fallback_expr(q))];
-            let filters = filter_sql(q, &mut args2);
-            let sql2 = format!(
-                "SELECT COUNT(*) FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
-                 WHERE papers_fts MATCH ?1{filters}"
-            );
-            let refs2: Vec<&dyn ToSql> = args2.iter().map(|b| b.as_ref()).collect();
-            conn.query_row(&sql2, refs2.as_slice(), |r| r.get(0))?
-        }
-        Err(e) => return Err(e.into()),
-    };
-    Ok(n as usize)
+    Ok(two_shot(q, count)? as usize)
 }
 
 /// No query terms: plain filtered listing, newest first.
@@ -1647,78 +1072,6 @@ fn browse(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn folding_unifies_the_archives_spellings() {
-        // One person, four ways the archive writes them.
-        assert_eq!(fold_name("Ron D.  Rothblum"), fold_name("Ron D. Rothblum"));
-        assert_eq!(fold_name("Ivan Damgård"), fold_name("Ivan Damgard"));
-        assert_eq!(fold_name("ADI SHAMIR"), fold_name("Adi Shamir"));
-        assert_eq!(fold_name("Shamir, Adi"), "shamir adi");
-        // Decomposed and pre-composed accents fold alike.
-        assert_eq!(fold_name("Damga\u{030a}rd"), fold_name("Damgård"));
-        // Distinct people stay distinct: `aa` is a transliteration, not an accent,
-        // and folding it would merge unrelated names.
-        assert_ne!(fold_name("Ivan Damgaard"), fold_name("Ivan Damgård"));
-    }
-
-    #[test]
-    fn expansion_is_evidence_not_guesswork() {
-        // A name carrying the umlaut links both conventions: `Müller` shares a key
-        // with `Muller` through folding and with `Mueller` through expansion.
-        assert_eq!(fold_name("Müller"), fold_name("Muller"));
-        assert_eq!(expand_name("Müller"), fold_name("Mueller"));
-        assert_eq!(expand_name("Damgård"), fold_name("Damgaard"));
-        assert_eq!(expand_name("Rønne"), fold_name("Roenne"));
-        // The reverse rule — collapsing `ue` to `u` — would merge these, and they
-        // are different people. Expanding cannot, because there is no umlaut to
-        // expand: that is the whole reason for doing it this way round.
-        assert_ne!(expand_name("Yue Chen"), expand_name("Yu Chen"));
-        assert_ne!(fold_name("Yue Chen"), fold_name("Yu Chen"));
-        assert_ne!(expand_name("Xue Liu"), expand_name("Xu Liu"));
-        // Expansion leaves a name with no umlaut exactly as folding does.
-        assert_eq!(expand_name("Adi Shamir"), fold_name("Adi Shamir"));
-    }
-
-    #[test]
-    fn a_name_must_match_one_author_not_a_byline() {
-        // The words used to be matched against the whole line, so a paper by
-        // Kasper Green Larsen and Ivan Damgård answered to "Kasper Damgård".
-        let byline = "Ivan Damgård; Kasper Green Larsen; Sophia Yakoubov";
-        assert!(author_match(byline, &fold_name("Ivan Damgård")));
-        assert!(author_match(byline, &fold_name("Kasper Larsen")));
-        assert!(!author_match(byline, &fold_name("Kasper Damgård")));
-        assert!(!author_match(byline, &fold_name("Sophia Damgård")));
-        // Order within a name does not matter, and initials are ignored.
-        assert!(author_match(byline, &fold_name("Damgård, Ivan")));
-        assert!(author_match(byline, &fold_name("Kasper G. Larsen")));
-        // A name that is not there is not there.
-        assert!(!author_match(byline, &fold_name("Adi Shamir")));
-    }
-
-    #[test]
-    fn an_accent_does_not_hide_a_name() {
-        // zsh keeps only candidates starting with what was typed, and compares
-        // characters: "damga" cannot reach "Damgård". The accent-free rendering
-        // can be typed, keeps its capitals, and is the same filter.
-        assert_eq!(deaccent("Damgård, Ivan"), "Damgard, Ivan");
-        assert_eq!(deaccent("Nico Döttling"), "Nico Dottling");
-        assert_eq!(deaccent("Peter B. Rønne"), "Peter B. Ronne");
-        // Nothing to strip, nothing to change — including the punctuation and
-        // spacing that `fold_name` would have flattened.
-        assert_eq!(deaccent("Ron D.  Rothblum"), "Ron D.  Rothblum");
-        assert_eq!(deaccent("Adi Shamir"), "Adi Shamir");
-    }
-
-    #[test]
-    fn surnames_split_off_the_end() {
-        assert_eq!(split_surname("Adi Shamir").unwrap(), ("Shamir", "Adi".into()));
-        assert_eq!(
-            split_surname("Ivan Bjerre Damgård").unwrap(),
-            ("Damgård", "Ivan Bjerre".into())
-        );
-        assert!(split_surname("Cher").is_none());
-    }
 
     #[test]
     fn watches_read_one_way_and_store_another() {

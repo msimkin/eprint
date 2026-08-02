@@ -590,7 +590,7 @@ pub fn run(
                     } else {
                         // The same parser the flag uses, so the grammar cannot
                         // drift between `--date` and `d`.
-                        match crate::parse_range(&typed) {
+                        match crate::dates::parse_range(&typed) {
                             Ok((since, before)) => {
                                 app.filters.since = since;
                                 app.filters.before = before;

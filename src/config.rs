@@ -69,6 +69,19 @@ latest_limit = 10
 #
 # `eprint watch add` and `eprint watch rm` edit these lines for you, and the rest
 # of this file is left alone when they do.
+
+# Author aliases live in a file called `authors` beside this one, because there
+# can be hundreds of them. The archive spells one person several ways, and
+# accents, punctuation, spacing and the umlaut/digraph pair (ö/oe, å/aa) are
+# already handled without being told. The file is for what no rule can know:
+#
+#   Ivan Damgård = Ivan Bjerre Damgård, I. Damgard, Ivan Damgaard
+#   Yuval Ishai  = Yual Ishai
+#   Yu Chen     != Yue Chen        # not the same person, whatever the rules think
+#
+# The name on the left is the one shown; anything on the right is found by it.
+# `eprint config --aliases` writes that file for you, filled with the pairs that
+# look alike, commented out for you to pick from.
 "#;
 
 /// Split a watch line the way a shell would, keeping "quoted phrases" intact.
