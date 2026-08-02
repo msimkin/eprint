@@ -292,15 +292,15 @@ Names are offered in both orders, because completion matches on a prefix and you
 either end:
 
 ```
-$ eprint watch add --author Shamir<TAB>
-Shamir        -- 54 papers
-Shamir, Adi   -- 53 papers
-Shamir, Dana  -- 1 paper
+$ eprint watch add --author Boudg<TAB>
+Boudgoust, Katharina  -- 18 papers
+Boudguiga, Aymen      -- 13 papers
 ```
 
-`Shamir, Adi` and `Adi Shamir` are the same filter — the comma is there only so the candidate
-starts with what you typed. Spellings that differ by accents, punctuation or spacing are shown as
-one person, with their papers added together.
+`Boudgoust, Katharina` and `Katharina Boudgoust` are the same filter — the comma is there only so
+the candidate starts with what you typed. Candidates are always people, never bare surnames, and
+spellings that differ by accents, punctuation or spacing are shown as one person with their papers
+added together.
 
 **`eprint watch rm <TAB>`** offers your saved watches by number, with what each one is:
 

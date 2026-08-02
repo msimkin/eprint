@@ -344,7 +344,6 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
     // Rothblum" with one, or the same "Damgård" written pre-composed and
     // decomposed. The spelling shown is whichever the archive uses most.
     let mut groups: HashMap<String, (HashMap<String, i64>, i64)> = HashMap::new();
-    let mut surnames: HashMap<String, (String, i64)> = HashMap::new();
     for row in rows {
         // The column holds the whole byline, so split it and keep only the names
         // that actually matched — the others are co-authors, not candidates.
@@ -356,17 +355,6 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
             let g = groups.entry(fold_name(&name)).or_default();
             *g.0.entry(name.clone()).or_insert(0) += 1;
             g.1 += 1;
-            // The surname alone, when that is the part being typed: one candidate
-            // for everyone who shares it, which is the point — "Wang" is one thing
-            // to watch, not four hundred.
-            if let Some(surname) = name.split_whitespace().next_back() {
-                if fold_name(surname).contains(&needle) && surname != name {
-                    let e = surnames
-                        .entry(fold_name(surname))
-                        .or_insert_with(|| (surname.to_string(), 0));
-                    e.1 += 1;
-                }
-            }
         }
     }
 
@@ -386,9 +374,20 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
         }
         out.push((name, total));
     }
-    out.extend(surnames.into_values());
-    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Candidates the shell can actually offer come first. zsh keeps only what
+    // starts with the typed text, so a name matching in the middle — "Sullivan"
+    // for "ivan" — is dead weight, and sorting it below the prefix matches stops
+    // it from eating the budget before the truncation.
     out.retain(|(n, _)| fold_name(n).contains(&needle));
+    out.sort_by(|a, b| {
+        let (pa, pb) = (
+            !fold_name(&a.0).starts_with(&needle),
+            !fold_name(&b.0).starts_with(&needle),
+        );
+        pa.cmp(&pb)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     out.truncate(limit);
     Ok(out)
 }
