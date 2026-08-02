@@ -113,6 +113,9 @@ enum Cmd {
         /// Switch on Tab completion by adding one line to your shell's rc file
         #[arg(long)]
         completions: bool,
+        /// Write the author aliases file, with suggestions to uncomment
+        #[arg(long)]
+        aliases: bool,
     },
     /// Shell completion, hidden because it is plumbing: `completions zsh` prints
     /// the function to install, `completions ids` prints the candidates it offers.
@@ -1000,9 +1003,17 @@ fn do_completions(what: &str, needle: Option<&str>) -> Result<()> {
         // one, and a name that did would be broken metadata.
         "authors" => {
             let conn = db::open()?;
-            for (name, n) in db::authors_matching(&conn, needle.unwrap_or(""), AUTHOR_MATCHES)? {
-                if !name.contains(':') {
-                    println!("{name}:{n} paper{}", if n == 1 { "" } else { "s" });
+            for c in db::authors_matching(&conn, needle.unwrap_or(""), AUTHOR_MATCHES)? {
+                if c.value.contains(':') {
+                    continue;
+                }
+                // Naming the person keeps two candidates from sharing a
+                // description, which `_describe` would pack onto one row — two
+                // names on one line reads as one mangled entry.
+                let plural = if c.papers == 1 { "" } else { "s" };
+                match c.person.is_empty() {
+                    true => println!("{}:{} paper{plural}", c.value, c.papers),
+                    false => println!("{}:{} paper{plural} · {}", c.value, c.papers, c.person),
                 }
             }
         }
@@ -1694,7 +1705,68 @@ fn nudge_completions(conn: &rusqlite::Connection) {
     eprintln!("tip: `eprint config --completions` switches on Tab completion for paper ids");
 }
 
-fn do_config(init: bool, edit: bool, completions: bool) -> Result<()> {
+/// `config --aliases`: start the author aliases file off with everything the
+/// rules could not decide for themselves.
+///
+/// Suggestions are written commented out. Merging two names is a claim about
+/// people, and the tool has no business making it silently — but it does know
+/// which names look alike, and finding them by hand across 20,000 spellings is
+/// not a reasonable thing to ask.
+fn write_aliases() -> Result<()> {
+    let path = config::aliases_path().context("could not determine the config directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let conn = db::open()?;
+    let suggestions = db::alias_suggestions(&conn)?;
+    // Only what the file does not mention yet, so this can be run again after the
+    // archive grows without disturbing anything already decided.
+    let fresh: Vec<&String> = suggestions
+        .iter()
+        .filter(|s| {
+            let name = s.split(" = ").next().unwrap_or("");
+            !name.is_empty() && !existing.contains(name)
+        })
+        .collect();
+    let mut out = existing.clone();
+    if out.is_empty() {
+        out.push_str(
+            "# Author aliases: spellings of one person that the tool cannot prove
+             # are the same. Accents, punctuation, spacing and the umlaut/digraph
+             # pair are handled automatically and need no entry here.
+             #
+             #   Yuval Ishai  = Yual Ishai, Y. Ishai
+             #   Yu Chen     != Yue Chen        # never the same person
+             #
+             # Below: names that look alike. Uncomment the ones that are right.
+
+",
+        );
+    } else if !fresh.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n# Further suggestions:\n");
+    }
+    for s in &fresh {
+        out.push_str(&format!("# {s}\n"));
+    }
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    println!();
+    println!("  {} suggestion{} written to {}",
+        fresh.len(),
+        if fresh.len() == 1 { "" } else { "s" },
+        path.display());
+    println!("  uncomment the ones that are right — `eprint config --edit` opens the folder\n");
+    Ok(())
+}
+
+fn do_config(init: bool, edit: bool, completions: bool, aliases: bool) -> Result<()> {
+    if aliases {
+        return write_aliases();
+    }
     if completions {
         return install_completions();
     }
@@ -1834,7 +1906,12 @@ fn real_main() -> Result<()> {
             entry,
         }) => do_bib(id.as_deref(), update, force, entry),
         Some(Cmd::Status) => do_status(),
-        Some(Cmd::Config { init, edit, completions }) => do_config(init, edit, completions),
+        Some(Cmd::Config {
+            init,
+            edit,
+            completions,
+            aliases,
+        }) => do_config(init, edit, completions, aliases),
         Some(Cmd::Show { id }) => {
             let conn = db::open()?;
             let st = Style::detect(StyleOpts {

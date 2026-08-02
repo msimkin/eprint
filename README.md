@@ -421,20 +421,50 @@ hands `Boudgoust` to the query instead of to `--author` — which is what Tab co
 finds all of them, and completion offers them as a single candidate with the papers added together.
 
 The rule fires only on evidence — a spelling that actually carries the umlaut is what links the
-other two — so `Yu` and `Yue`, or `Xu` and `Xue`, stay the different people they are.
+other two — so `Yu` and `Yue`, or `Xu` and `Xue`, stay the different people they are. A name is also
+matched **against one author at a time**: `--author "Kasper Damgård"` does not find papers where
+Kasper Larsen and Ivan Damgård happen to be co-authors.
 
-What no rule can know goes in `~/.config/eprint/authors`:
+What no rule can know — a typo, a middle name, a bare initial — goes in
+`~/.config/eprint/authors`:
 
 ```ini
-# the same person, however the archive got it wrong
+Ivan Damgård = Ivan Bjerre Damgård, I. Damgard, Ivan Damgaard
 Yuval Ishai  = Yual Ishai
-Ivan Damgård = I. Damgard, Ivan B. Damgaard
 
 # and, if the automatic merging ever overreaches, the opposite
 Yu Chen != Yue Chen
 ```
 
-The file is optional, hand-edited, and a line it cannot read is skipped rather than fatal.
+You do not have to find those yourself:
+
+```sh
+eprint config --aliases
+```
+
+writes the file with every pair of names that *looks* like one person — a shared surname with an
+abbreviated first name, or one name's words contained in another's — commented out, for you to
+uncomment the ones that are right. Merging two people is a claim the tool will not make on its own,
+but finding the candidates across 21,466 names is not a reasonable thing to do by hand.
+
+The effect of one line is worth seeing. Before:
+
+```
+Damgard, I.           -- 141 papers
+Damgard, Ivan         -- 139 papers
+Damgaard, Ivan B.     -- 135 papers
+Damgard, Ivan Bjerre  --   5 papers
+Damgard, Kasper       --   1 paper
+```
+
+after uncommenting `Ivan Damgård = Ivan Bjerre Damgård, I. Damgard, Ivan Damgaard`:
+
+```
+Damgard, Ivan    -- 142 papers
+Damgard, Kasper  --   1 paper
+```
+
+A line the file cannot read is skipped rather than fatal.
 
 Adding a watch you already have is not an error; it says so and changes nothing.
 
