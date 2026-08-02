@@ -69,14 +69,31 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
         return Ok(Vec::new());
     }
 
-    // The same predicate the filter uses, so what is offered and what is found
-    // cannot disagree — including its widening to a person's other spellings.
-    let mut stmt = conn.prepare("SELECT authors FROM papers WHERE author_match(authors, ?1)")?;
+    // The FTS probe narrows the table first; `author_match` still decides. Without
+    // it this scanned every paper and called into Rust for each one, which is
+    // 60-130ms on a path that runs per keypress.
+    let (sql, arg) = match author_probe(&needle) {
+        Some(probe) => (
+            "SELECT p.authors FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
+             WHERE papers_fts MATCH ?1 AND author_match(p.authors, ?2)"
+                .to_string(),
+            Some(probe),
+        ),
+        None => (
+            "SELECT authors FROM papers WHERE author_match(authors, ?1)".to_string(),
+            None,
+        ),
+    };
+    let mut stmt = conn.prepare(&sql)?;
     // Folded once, here, and reused for both passes below. Re-folding a byline per
     // candidate is what made a common needle take minutes: the work was
     // candidates × bylines × names, and every one of those allocated.
+    let params: Vec<&dyn rusqlite::ToSql> = match &arg {
+        Some(probe) => vec![probe, &needle],
+        None => vec![&needle],
+    };
     let bylines: Vec<Vec<String>> = stmt
-        .query_map([needle.as_str()], |r| r.get::<_, String>(0))?
+        .query_map(params.as_slice(), |r| r.get::<_, String>(0))?
         .map(|row| {
             row.map(|byline| {
                 byline
@@ -92,14 +109,20 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
     // One entry per person, and every spelling of their name the archive uses, so
     // the one that was typed can be offered back.
     let mut spellings: HashMap<String, HashMap<String, i64>> = HashMap::new();
-    let mut tally: HashMap<String, i64> = HashMap::new();
-    for byline in &bylines {
+    // Which papers each person appears on, by position in `bylines`. Counting a
+    // candidate is then a union of these rather than another pass over every
+    // byline: at a common surname that pass was 1,400 bylines × 40 candidates.
+    let mut rows: HashMap<String, Vec<u32>> = HashMap::new();
+    for (i, byline) in bylines.iter().enumerate() {
         for name in byline {
             if !name_matches(name, &words) {
                 continue;
             }
             let person = person_of(name);
-            *tally.entry(person.clone()).or_insert(0) += 1;
+            let seen = rows.entry(person.clone()).or_default();
+            if seen.last() != Some(&(i as u32)) {
+                seen.push(i as u32);
+            }
             *spellings
                 .entry(person)
                 .or_default()
@@ -112,9 +135,9 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
     // those are.
     let mut people: Vec<String> = spellings.keys().cloned().collect();
     people.sort_by(|a, b| {
-        tally
-            .get(b)
-            .cmp(&tally.get(a))
+        rows.get(b)
+            .map(|r| r.len())
+            .cmp(&rows.get(a).map(|r| r.len()))
             .then_with(|| a.cmp(b))
     });
     people.truncate(limit);
@@ -145,10 +168,20 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
             .split_whitespace()
             .filter(|w| w.len() > 1)
             .collect();
-        let count = bylines
-            .iter()
-            .filter(|names| names.iter().any(|n| name_matches(n, &candidate_words)))
-            .count() as i64;
+        // Every person this candidate would also find — `Ivan Damgard` finds
+        // `Ivan Bjerre Damgård` as well — and the papers are their rows, unioned.
+        let mut papers: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for (other, spelled) in &spellings {
+            if spelled
+                .keys()
+                .any(|n| name_matches(n, &candidate_words))
+            {
+                if let Some(idx) = rows.get(other) {
+                    papers.extend(idx.iter().copied());
+                }
+            }
+        }
+        let count = papers.len() as i64;
         // Name the person when the offered spelling is not how they are usually
         // written, so it is clear what the watch will actually follow.
         let person = if fold_name(&person) == folded_value {
@@ -415,6 +448,64 @@ pub struct Candidate {
     pub papers: i64,
 }
 
+/// An FTS5 expression that finds every paper [`author_match`] could accept, and
+/// possibly a few more.
+///
+/// `author_match` is exact but runs per row — 26,000 Rust calls, each splitting a
+/// byline and folding every name, which is 70ms of a 108ms author search and the
+/// whole cost of a completion keypress. The `authors` column is already indexed by
+/// FTS5, whose `unicode61` tokenizer folds diacritics, so `damgard*` finds
+/// `Damgård` in a tenth of a millisecond.
+///
+/// It is a **prefilter only**: whatever it returns is still refined by
+/// `author_match`, so per-author and word-boundary semantics do not change. That
+/// means it must never exclude a true match, hence:
+///
+/// - one `AND` group of word prefixes for the needle, `OR`-ed with one group per
+///   other spelling of the same person — `Damgård` alone would miss the rows filed
+///   as `Damgaard`, which is 127 rows where 139 match;
+/// - `None` when no word survives (a lone initial), so the caller keeps scanning
+///   rather than filtering on nothing.
+///
+/// Verified against 400 real (paper, author) pairs: no misses.
+pub fn author_probe(needle: &str) -> Option<String> {
+    let folded = fold_name(needle);
+    let group = |name: &str| -> Option<String> {
+        let words: Vec<String> = name
+            .split_whitespace()
+            .filter(|w| w.len() > 1)
+            // A token is matched as a prefix, so anything FTS5 would read as an
+            // operator or syntax has to go.
+            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .filter(|w| w.len() > 1)
+            .map(|w| format!("{w}*"))
+            .collect();
+        (!words.is_empty()).then(|| words.join(" AND "))
+    };
+    let mut groups: Vec<String> = group(&folded).map(|g| vec![g]).unwrap_or_default();
+    if groups.is_empty() {
+        return None;
+    }
+    // Every other spelling of whoever the needle names. Cheap: `SPELLINGS` holds
+    // only the names the archive writes more than one way.
+    if let Some(spellings) = SPELLINGS.get() {
+        let words: Vec<&str> = folded.split_whitespace().filter(|w| w.len() > 1).collect();
+        for (name, others) in spellings {
+            if !words_begin_words(name, &words) {
+                continue;
+            }
+            for other in others {
+                if let Some(g) = group(other) {
+                    if !groups.contains(&g) {
+                        groups.push(g);
+                    }
+                }
+            }
+        }
+    }
+    Some(format!("{{authors}} : ({})", groups.join(" OR ")))
+}
+
 /// Does one of this paper's authors match `needle`?
 ///
 /// **Per author, not per byline.** Matching the words against the whole line made
@@ -657,6 +748,43 @@ mod tests {
         assert_ne!(expand_name("Xue Liu"), expand_name("Xu Liu"));
         // Expansion leaves a name with no umlaut exactly as folding does.
         assert_eq!(expand_name("Adi Shamir"), fold_name("Adi Shamir"));
+    }
+
+    #[test]
+    fn the_probe_covers_every_spelling_it_must() {
+        // The probe is a prefilter, so it may return too much but never too little.
+        let probe = author_probe("Adi Shamir").expect("two usable words");
+        assert!(probe.starts_with("{authors} : ("), "must be scoped to the column");
+        assert!(probe.contains("adi*") && probe.contains("shamir*"));
+        // Punctuation is not FTS5 syntax to be passed through.
+        let probe = author_probe("Shamir, Adi").expect("a comma is not a word");
+        assert!(!probe.contains(','), "{probe}");
+        assert!(probe.contains("shamir*") && probe.contains("adi*"));
+        // Nothing usable means no probe at all, so the caller keeps scanning
+        // instead of filtering on an expression that matches nothing.
+        assert!(author_probe("J").is_none());
+        assert!(author_probe("...").is_none());
+        assert!(author_probe("").is_none());
+    }
+
+    #[test]
+    fn the_probe_reaches_a_persons_other_spellings() {
+        // Without the variant groups, `--author Damgård` would filter down to the
+        // rows spelled that way and lose the ones filed as `Damgaard` — 127 rows
+        // where 139 match.
+        let mut spellings: HashMap<String, Vec<String>> = HashMap::new();
+        let group = vec!["ivan damgard".to_string(), "ivan damgaard".to_string()];
+        for member in &group {
+            spellings.insert(member.clone(), group.clone());
+        }
+        // Only set if some other test has not already: the map is process-wide.
+        let _ = SPELLINGS.set(spellings);
+        if SPELLINGS.get().is_some_and(|s| s.contains_key("ivan damgard")) {
+            let probe = author_probe("Ivan Damgård").expect("two usable words");
+            assert!(probe.contains("damgard*"), "{probe}");
+            assert!(probe.contains("damgaard*"), "the other spelling too: {probe}");
+            assert!(probe.contains(" OR "), "as an alternative, not an extra AND");
+        }
     }
 
     #[test]

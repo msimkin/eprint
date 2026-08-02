@@ -143,6 +143,11 @@ CREATE TABLE IF NOT EXISTS papers (
 );
 CREATE INDEX IF NOT EXISTS papers_year_idx ON papers(year);
 CREATE INDEX IF NOT EXISTS papers_date_idx ON papers(date);
+-- `added` is what the feed orders and filters by, twice per run; `category` is
+-- what the completion list groups by. Without these both were a full scan of
+-- every paper plus a temp B-tree, which was 44ms of a 50ms `eprint`.
+-- `added` is created in `migrate`, after the column exists.
+CREATE INDEX IF NOT EXISTS papers_category_idx ON papers(category);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
   title, authors, abstract, category,
@@ -242,6 +247,9 @@ fn migrate(conn: &Connection) -> Result<()> {
              );",
         )?;
     }
+    // Now that `added` is certain to exist. An index is derived, not data, so it
+    // needs no version bump — an older database simply gains it here.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS papers_added_idx ON papers(added);")?;
     // Deleting or counting one watch's rows has to be cheap: that is what makes
     // adding and removing a watch incremental rather than a rebuild.
     conn.execute_batch(
@@ -636,6 +644,12 @@ fn matching_ids(conn: &Connection, q: &Query) -> Result<Vec<String>> {
         return collect(None);
     }
     // Same verbatim-then-quoted fallback as `search`.
+    if !uses_fts(q) {
+        return collect(None);
+    }
+    if q.terms.trim().is_empty() {
+        return collect(Some(primary_expr(q)));
+    }
     two_shot(q, |expr| collect(Some(expr.to_string())))
 }
 
@@ -871,6 +885,29 @@ fn add_prefix(terms: &str) -> String {
         .join(" ")
 }
 
+/// Add the author prefilter to an FTS expression, so the index narrows the table
+/// before `filter_sql`'s exact predicate looks at what is left. An author filter
+/// with no query terms becomes an FTS query in its own right — see `uses_fts`.
+fn with_author(q: &Query, terms: String) -> String {
+    let Some(probe) = q.author.as_deref().and_then(crate::names::author_probe) else {
+        return terms;
+    };
+    match terms.trim().is_empty() {
+        true => probe,
+        false => format!("({terms}) AND ({probe})"),
+    }
+}
+
+/// Whether a query can go through the FTS index at all: it needs terms, or an
+/// author whose name yields a probe. Everything else is a plain filtered listing.
+fn uses_fts(q: &Query) -> bool {
+    !q.terms.trim().is_empty()
+        || q.author
+            .as_deref()
+            .and_then(crate::names::author_probe)
+            .is_some()
+}
+
 /// Run an FTS query the user's way, and if SQLite rejects it as a parse error,
 /// again with every token quoted.
 ///
@@ -918,16 +955,21 @@ fn primary_expr(q: &Query) -> String {
     } else {
         q.terms.to_string()
     };
-    scoped(&base, q.scope)
+    with_author(q, scoped(&base, q.scope))
 }
 
 fn fallback_expr(q: &Query) -> String {
-    scoped(&quote_terms(q.terms, q.prefix), q.scope)
+    with_author(q, scoped(&quote_terms(q.terms, q.prefix), q.scope))
 }
 
 pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
-    if q.terms.trim().is_empty() {
+    if !uses_fts(q) {
         return browse(conn, q);
+    }
+    if q.terms.trim().is_empty() {
+        // An author filter alone: the probe is the whole expression, and there is
+        // no user text that could fail to parse.
+        return run_search(conn, q, &primary_expr(q));
     }
     // Nothing survives quoting (e.g. a lone `"`), so there is no second shot to
     // take. Say that plainly instead of forwarding SQLite's "unterminated string:
@@ -1018,10 +1060,21 @@ fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>
 /// Total number of matches, ignoring the display limit, so the header can
 /// say "20 of 147 results".
 pub fn count_matches(conn: &Connection, q: &Query) -> Result<usize> {
-    if q.terms.trim().is_empty() {
+    if !uses_fts(q) {
         let mut args: Vec<Box<dyn ToSql>> = Vec::new();
         let filters = filter_sql(q, &mut args);
         let sql = format!("SELECT COUNT(*) FROM papers p WHERE 1=1{filters}");
+        let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let n: i64 = conn.query_row(&sql, refs.as_slice(), |r| r.get(0))?;
+        return Ok(n as usize);
+    }
+    if q.terms.trim().is_empty() {
+        let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(primary_expr(q))];
+        let filters = filter_sql(q, &mut args);
+        let sql = format!(
+            "SELECT COUNT(*) FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
+             WHERE papers_fts MATCH ?1{filters}"
+        );
         let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let n: i64 = conn.query_row(&sql, refs.as_slice(), |r| r.get(0))?;
         return Ok(n as usize);
