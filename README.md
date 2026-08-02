@@ -389,6 +389,17 @@ eprint watch rm 2                            # remove one
 eprint watch rm --all
 ```
 
+`eprint watch` lists them the way you would say them, with how many papers each one currently
+marks — the quick check that a new watch matches anything at all:
+
+```
+$ eprint watch
+  1   lattice OR LWE                               2671 in the index
+  2   by Katharina Boudgoust                       18 in the index
+  3   zk · in Public-key cryptography              36 in the index
+  4   proof of work · titles only                  56 in the index
+```
+
 An author filter matches **every word of the name, in any order**, so
 `--author "Katharina Boudgoust"` and `--author "Boudgoust Katharina"` find the same 18 papers and
 you need not know which way round the archive stored it. A full name has to be quoted, or the shell
@@ -421,6 +432,11 @@ can promise, since a theme's yellow could be anything.
 In `browse`, **`w`** filters the listing down to watched papers, and any query you then type
 searches within that subset. The header shows `· watched only` while it is on; `w` again
 restores everything.
+
+Which papers match is worked out once and kept in the index, not recomputed per listing, so
+toggling `w` and typing in the query box stay instant however many watches you keep. It is
+refreshed when you change a watch and when new papers arrive — on the command that caused it, or
+in the background refresh, never on the search you are waiting for.
 
 Watches live in the **config file**, one `watch` line each, written exactly as you would type
 them:
