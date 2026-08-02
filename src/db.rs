@@ -86,6 +86,12 @@ pub fn open() -> Result<Connection> {
     let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // A stale index spawns a detached `update --quiet` child, so a foreground
+    // command can meet that writer mid-transaction. WAL keeps readers going, but
+    // anything that writes — `meta_set` on the search path, `stage_watched` in
+    // browse — would otherwise fail instantly rather than wait the few
+    // milliseconds the writer actually needs.
+    conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
     init(&conn)?;
     Ok(conn)
 }
@@ -281,6 +287,62 @@ pub fn titles(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Strin
     Ok(out)
 }
 
+/// The most recently dated paper: its id and its ePrint timestamp. This is "when
+/// the archive last posted", which is a different question from `added`, the
+/// wall-clock time this index caught up — and the one worth showing, since a feed
+/// that dates itself by when you last ran it tells you nothing you did not know.
+pub fn newest(conn: &Connection) -> Result<Option<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, date FROM papers ORDER BY date DESC LIMIT 1")?;
+    let mut rows = stmt.query([])?;
+    match rows.next()? {
+        Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
+        None => Ok(None),
+    }
+}
+
+/// Candidates for completing `--author`: names containing `needle`, each offered
+/// both in full and as a bare surname, commonest first.
+///
+/// Two forms because zsh completes on a prefix and people start a name from either
+/// end. "boudg" then finds the surname `Boudgoust`, "kath" finds `Katharina
+/// Boudgoust`, and the shell filters to whichever fits what was typed. Both are
+/// valid filters, since `--author` matches every word of the name in any order.
+///
+/// The needle is not optional: the whole author list is 21,000 names and over a
+/// megabyte, and narrowing first is what makes this cheap enough for a keypress.
+pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result<Vec<(String, i64)>> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT authors FROM papers WHERE lower(authors) LIKE ?1")?;
+    let rows = stmt.query_map([format!("%{needle}%")], |r| r.get::<_, String>(0))?;
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    for row in rows {
+        // The column holds the whole byline, so split it and keep only the names
+        // that actually matched — the others are co-authors, not candidates.
+        for name in row?.split(';') {
+            let name = name.trim();
+            if name.is_empty() || !name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            *counts.entry(name.to_string()).or_insert(0) += 1;
+            // The surname on its own, when that is the part being typed. Shared
+            // surnames collapse into one candidate, which is the point: "Wang"
+            // is one thing to watch, not four hundred.
+            if let Some(surname) = name.split_whitespace().next_back() {
+                if surname.to_lowercase().contains(&needle) && surname != name {
+                    *counts.entry(surname.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut out: Vec<(String, i64)> = counts.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.truncate(limit);
+    Ok(out)
+}
+
 /// The categories actually present in the index, with how many papers carry each,
 /// commonest first. Read from the data rather than hard-coded: the archive owns
 /// this list, so a category it adds should appear here without a release. Papers
@@ -445,9 +507,29 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// How the watch reads back to the user, in the same shape they typed it —
-    /// and also how it is written to the config file, so this has to round-trip
-    /// through `config`'s parser exactly.
+    /// How the watch reads on screen. Separate from `label()` on purpose: a list
+    /// of `--author` this and `--category` that is command-line syntax being shown
+    /// where a sentence belongs, and the flags are storage's business, not the
+    /// reader's. Never write this to the config — it does not parse back.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.terms.trim().is_empty() {
+            parts.push(self.terms.clone());
+        }
+        if let Some(a) = &self.author {
+            parts.push(format!("by {a}"));
+        }
+        if let Some(c) = &self.category {
+            parts.push(format!("in {c}"));
+        }
+        if self.scope == Scope::Title {
+            parts.push("titles only".to_string());
+        }
+        parts.join(" · ")
+    }
+
+    /// How the watch is written to the config file, in the same shape the user
+    /// typed it, so this has to round-trip through `config`'s parser exactly.
     pub fn label(&self) -> String {
         // A flag value containing a space must come back quoted, or reading the
         // line again splits `--author Dan Boneh` into author `Dan` plus a stray
@@ -787,9 +869,23 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     if q.only_watched {
         sql.push_str(" AND p.id IN (SELECT id FROM watched_stage)");
     }
+    // Every word of the name has to appear, but the order does not: nobody should
+    // have to know whether the archive stored "Katharina Boudgoust" or "Boudgoust
+    // Katharina" to watch a person. One `LIKE` per word, ANDed. A single word
+    // behaves exactly as it did before, which is the common case.
     if let Some(a) = &q.author {
-        args.push(Box::new(format!("%{}%", a.to_lowercase())));
-        sql.push_str(&format!(" AND lower(p.authors) LIKE ?{}", args.len()));
+        let mut words = a.split_whitespace().peekable();
+        if words.peek().is_some() {
+            for word in words {
+                args.push(Box::new(format!("%{}%", word.to_lowercase())));
+                sql.push_str(&format!(" AND lower(p.authors) LIKE ?{}", args.len()));
+            }
+        } else {
+            // All whitespace: keep the literal rather than silently matching every
+            // paper in the archive.
+            args.push(Box::new(format!("%{}%", a.to_lowercase())));
+            sql.push_str(&format!(" AND lower(p.authors) LIKE ?{}", args.len()));
+        }
     }
     if let Some(c) = &q.category {
         args.push(Box::new(format!("%{}%", c.to_lowercase())));

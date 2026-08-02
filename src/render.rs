@@ -298,7 +298,16 @@ pub fn short_authors(authors: &str, fav: Option<&str>) -> String {
         return "—".to_string();
     }
     let show = |n: &str| -> String {
-        let surname = n.split_whitespace().last().unwrap_or(n).to_string();
+        // The last word with letters in it, not simply the last word. The archive
+        // carries bylines like "Sohaib ..", whose trailing token would render the
+        // author as ".." — which reads as an elision, i.e. as though the tool had
+        // dropped names. Falling back to the first real word shows "Sohaib".
+        let surname = n
+            .split_whitespace()
+            .filter(|w| w.chars().any(char::is_alphanumeric))
+            .next_back()
+            .unwrap_or(n)
+            .to_string();
         if is_favourite(n, fav) {
             adore(&surname)
         } else {

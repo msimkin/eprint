@@ -25,6 +25,9 @@ const OVERLAP_SECS: u64 = 2 * 24 * 3600;
 /// Sanity bound on one arrival batch, for someone coming back after a long
 /// absence. Not a display limit: `latest_limit` is a floor, not a cap.
 const BATCH_MAX: usize = 500;
+/// How many author names one `--author` completion offers. A menu is for choosing
+/// from, not for reading: past this the answer is "type another letter".
+const AUTHOR_MATCHES: usize = 40;
 /// Set on a detached child to make it file a downloaded PDF instead of running a
 /// command. An env marker rather than a subcommand, hidden or otherwise, so the
 /// CLI surface stays exactly as it was.
@@ -115,8 +118,10 @@ enum Cmd {
     /// the function to install, `completions ids` prints the candidates it offers.
     #[command(hide = true)]
     Completions {
-        /// `zsh` or `ids`
+        /// `zsh`, `ids`, `categories`, `watches` or `authors`
         what: String,
+        /// Narrows `authors`, whose full list is far too big to offer whole
+        needle: Option<String>,
     },
     /// Kept working, kept out of `--help`. Removing it entirely turned
     /// `eprint search NAPs` into a search for the words "search" and "NAPs",
@@ -143,7 +148,7 @@ enum WatchCmd {
     Add {
         /// Query terms. Supports "quoted phrases", AND/OR/NOT and prefix*
         query: Vec<String>,
-        /// Watch an author instead of, or as well as, query terms
+        /// Watch an author — quote a full name: --author "Katharina Boudgoust"
         #[arg(long)]
         author: Option<String>,
         /// Watch an IACR category
@@ -842,6 +847,24 @@ _eprint() {
       (( ${#values} )) && _describe -t categories 'IACR category' values
       return
       ;;
+    --author)
+      # Filtered by what has been typed, because the whole list is 21,000 names.
+      # The tool offers each match twice, as the full name and as the surname, so
+      # plain prefix completion works whichever end you start from — and zsh
+      # escapes the space in a full name for you, which is the trap this removes.
+      # (`compadd -U` was tried, to insert a substring match: it appends to the
+      # typed text instead of replacing it, and a matcher spec mangles candidates
+      # containing spaces. Two candidates and no magic beats both.)
+      local -a names
+      names=(${(f)"$(eprint completions authors ${(Q)cur} 2>/dev/null)"})
+      if (( ${#names} )); then
+        _describe -t authors 'author' names
+      else
+        # `-r` because a bare `_message` is swallowed here and never shown.
+        _message -r 'a few more letters of the name'
+      fi
+      return
+      ;;
     --scope)
       _values 'scope' 'all[title, authors and abstract]' 'title[titles and authors only]'
       return
@@ -916,7 +939,7 @@ _eprint() {
 compdef _eprint eprint
 "#;
 
-fn do_completions(what: &str) -> Result<()> {
+fn do_completions(what: &str, needle: Option<&str>) -> Result<()> {
     match what {
         "zsh" => print!("{ZSH_COMPLETION}"),
         "ids" => {
@@ -936,13 +959,26 @@ fn do_completions(what: &str) -> Result<()> {
         "watches" => {
             let conn = db::open()?;
             // The number is the position `eprint watch` prints, which is what
-            // `watch rm` takes; the description is how the watch was saved.
+            // `watch rm` takes; the description reads the way the list does.
             for (i, w) in watches(&conn).iter().enumerate() {
-                println!("{}:{}", i + 1, w.label());
+                println!("{}:{}", i + 1, w.describe());
+            }
+        }
+        // Unlike the others this one is filtered, because the unfiltered answer is
+        // 21,000 names. A name containing a colon would split wrong in `_describe`,
+        // so it is dropped rather than shown mangled — no author in the archive has
+        // one, and a name that did would be broken metadata.
+        "authors" => {
+            let conn = db::open()?;
+            for (name, n) in db::authors_matching(&conn, needle.unwrap_or(""), AUTHOR_MATCHES)? {
+                if !name.contains(':') {
+                    println!("{name}:{n} paper{}", if n == 1 { "" } else { "s" });
+                }
             }
         }
         other => bail!(
-            "unknown completion target {other:?} — try `zsh`, `ids`, `categories` or `watches`"
+            "unknown completion target {other:?} — \
+             try `zsh`, `ids`, `categories`, `watches` or `authors`"
         ),
     }
     Ok(())
@@ -1210,32 +1246,50 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
         return Ok(());
     }
 
+    // The two dates in this header deliberately mean different things. A count of
+    // new papers is *about* your last look, so it is dated by it. "Nothing new",
+    // dated by your last look, only ever says "you ran this recently" — the useful
+    // answer there is when the archive itself last posted.
+    let posted = db::newest(&conn)?.map(|(_, date)| day(&date));
+
     // Order matters: a topped-up listing is no longer "the last batch", even if a
     // replay is what it was topped up from, so that case is reported first.
     let label = if topped_up {
-        match fresh_count {
-            0 => format!("nothing new since {}", day(&watermark)),
-            n => format!("{n} new since {}", day(&watermark)),
+        match (fresh_count, &posted) {
+            (0, Some(p)) => format!("nothing new since {p}"),
+            // Only with no papers at all, which the caller has already handled.
+            (0, None) => "nothing new".to_string(),
+            (n, _) => format!("{n} new since {}", day(&watermark)),
         }
     } else if replayed {
-        // Name what is on screen, and when it stopped being news. Same-day
-        // repeats read as a typo, so collapse them.
-        let (batch, seen) = (day(&window), day(&watermark));
-        if batch == seen {
-            format!("last batch, from {batch} · nothing new yet")
-        } else {
-            format!("last batch, from {batch} · nothing new since {seen}")
-        }
+        // The batch's own newest paper, not the window that produced it: the window
+        // start is another "when you last ran it" date, and a late-published paper
+        // (recent arrival, older date) would make the index-wide answer name a date
+        // no paper on screen carries.
+        let batch = hits
+            .iter()
+            .map(|h| h.paper.date.as_str())
+            .max()
+            .map(day)
+            .unwrap_or_else(|| day(&window));
+        format!("last batch, from {batch} · nothing new yet")
     } else {
         format!("since {}", day(&window))
     };
+
+    // A stale index looks exactly like a quiet archive once the header is dated by
+    // the archive, so say which it is. Only when stale: the feed is the most-typed
+    // command and this is the one listing that has always kept its header short.
+    let age = index_age(&conn)?
+        .filter(|s| *s as u64 > STALE_SECS)
+        .map(human_age);
 
     if a.json {
         println!("{}", render::json_of(&hits));
         return Ok(());
     }
     let mut out = String::new();
-    render::render_header(&mut out, hits.len(), hits.len(), None, &label, &st);
+    render::render_header(&mut out, hits.len(), hits.len(), age, &label, &st);
     let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
     let watched = db::watched_ids(&conn, &ids, &watches(&conn)).unwrap_or_default();
@@ -1317,7 +1371,12 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
             .label();
             let mut labels: Vec<String> = watches(&conn).iter().map(|w| w.label()).collect();
             if labels.contains(&new) {
-                bail!("you are already watching that");
+                // Not a failure: the state the user asked for is the state they
+                // have. Say so and show the list, rather than exiting non-zero
+                // over a no-op.
+                println!("\n  already watching that — nothing to add");
+                println!();
+                return list_watches(&conn);
             }
             labels.push(new);
             config::set_watches(&labels)?;
@@ -1362,7 +1421,8 @@ fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
     if watches.is_empty() {
         println!("  No watches yet. Save one with:\n");
         println!("    eprint watch add \"lattice OR LWE\"");
-        println!("    eprint watch add --author Boneh\n");
+        println!("    eprint watch add --author Boneh");
+        println!("    eprint watch add --author \"Katharina Boudgoust\"   # quote a full name\n");
         println!("  Matching papers are then marked ✱ wherever they appear.\n");
         return Ok(());
     }
@@ -1371,7 +1431,7 @@ fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
         // says "this expression does match things" before you wait a day for
         // `new` to prove it the hard way.
         let total = db::count_matches(conn, &w.query(None, 1)).unwrap_or(0);
-        println!("  {:<3} {:<44} {total} in the index", w.id, w.label());
+        println!("  {:<3} {:<44} {total} in the index", w.id, w.describe());
     }
     println!("\n  matches are marked ✱ in search, `new` and `browse` · `w` in browse filters to them");
     if let Some(p) = config::path() {
@@ -1649,14 +1709,11 @@ fn do_status() -> Result<()> {
     let last = db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?
         .map(|v| render::fmt_date(&v))
         .unwrap_or_else(|| "—".into());
-    let newest: (String, String) = conn
-        .query_row(
-            "SELECT id, substr(date,1,10) FROM papers ORDER BY date DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap_or_else(|_| ("—".into(), String::new()));
-    let newest = format!("{}  {}", newest.0, render::fmt_date(&newest.1));
+    // Same "newest paper" the feed dates itself by, so the two cannot disagree.
+    let newest = match db::newest(&conn)? {
+        Some((id, date)) => format!("{id}  {}", render::fmt_date(&date)),
+        None => "—".to_string(),
+    };
     let _ = &st;
     println!();
     println!("  papers indexed  {total}");
@@ -1730,6 +1787,6 @@ fn real_main() -> Result<()> {
             // everywhere, including shells with no completion installed.
             None => do_library(),
         },
-        Some(Cmd::Completions { what }) => do_completions(&what),
+        Some(Cmd::Completions { what, needle }) => do_completions(&what, needle.as_deref()),
     }
 }

@@ -277,13 +277,28 @@ shows up without a new release, and the counts tell you whether a filter is wort
 substring works too — `--category proto` is the same filter — and a name with a space is quoted for
 you as you complete it. This works wherever `--category` does: searches, `browse` and `watch add`.
 
+**`--author <TAB>`** completes names out of the index once you have typed a few letters — the full
+list is 21,466 names, so it narrows rather than dumps:
+
+```
+$ eprint watch add --author Boudg<TAB>
+Boudgoust  -- 18 papers
+Boudguiga  -- 13 papers
+
+$ eprint watch add --author Katharina\ B<TAB>      → Katharina\ Boudgoust
+```
+
+Every match is offered twice, as the surname alone and as the full name, so it works whichever end
+of the name you start from. Both are valid filters, and completing a full name escapes the space,
+which removes the one real trap in `--author`.
+
 **`eprint watch rm <TAB>`** offers your saved watches by number, with what each one is:
 
 ```
 $ eprint watch rm <TAB>
-1  -- --author Boudgoust
+1  -- by Boudgoust
 2  -- lattice OR LWE
-3  -- --category Foundations
+3  -- in Foundations
 ```
 
 Those numbers are positions that renumber after every removal, so having them listed beats counting
@@ -325,11 +340,18 @@ something:
 - **More arrived than `latest_limit`?** You get the whole batch. Seventeen papers means seventeen
   lines, not a number chosen in advance.
 - **Fewer, or nothing new?** The list is topped up with the most recent arrivals to `latest_limit`
-  (10 by default), and the header says how many are actually new — `2 new since 01/08/2026`, or
-  `nothing new since 01/08/2026`.
+  (10 by default), and the header says how many are actually new — `2 new since 31/07/2026`, or
+  `nothing new since 27/07/2026`.
 - **`-n N`** overrides both as an exact count.
 
 So `latest_limit` is a floor, not a ceiling.
+
+**The two dates mean different things, on purpose.** `2 new since 31/07/2026` counts what
+arrived since *you* last looked, because that window is what the number refers to. `nothing new
+since 27/07/2026` instead reports when the *archive* last posted — dating that line by your last
+run would only ever tell you that you ran the command recently. When the index itself is more
+than a day old, the header says so (`· index 3d old`), because a stale index otherwise looks
+exactly like a quiet archive.
 
 Papers carry an `added` timestamp recording when they first entered *your* index, which is
 what this filters on. A paper's own date can predate its arrival here, so filtering by that
@@ -359,12 +381,21 @@ feature**: it never changes which papers are shown, how many, or in what order.
 ```sh
 eprint watch add "lattice OR LWE"            # papers mentioning either term
 eprint watch add --author Boudgoust          # everything by one author
+eprint watch add --author "Katharina Boudgoust"   # a full name needs quoting
 eprint watch add zk --category "Public-key"  # "zk" AND in that IACR category
 eprint watch add "proof of work" -t          # those words in the title or authors
 eprint watch                                 # list them, numbered
 eprint watch rm 2                            # remove one
 eprint watch rm --all
 ```
+
+An author filter matches **every word of the name, in any order**, so
+`--author "Katharina Boudgoust"` and `--author "Boudgoust Katharina"` find the same 18 papers and
+you need not know which way round the archive stored it. A full name has to be quoted, or the shell
+hands `Boudgoust` to the query instead of to `--author` — which is what Tab completion is for
+(below): it fills in the whole name and escapes the space for you.
+
+Adding a watch you already have is not an error; it says so and changes nothing.
 
 Matching papers get a gold `✱` after the title and their id in the same gold, everywhere a list
 of papers appears — searches, the feed and `browse`:
