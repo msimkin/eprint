@@ -278,29 +278,21 @@ substring works too — `--category proto` is the same filter — and a name wit
 you as you complete it. This works wherever `--category` does: searches, `browse` and `watch add`.
 
 **`--author <TAB>`** completes names out of the index once you have typed a few letters — the full
-list is 21,466 names, so it narrows rather than dumps:
+list is 21,466 names, so it narrows rather than dumps. Names are offered in both orders, since
+completion matches on a prefix and you may start from either end:
 
 ```
-$ eprint watch add --author Boudg<TAB>
-Boudgoust  -- 18 papers
-Boudguiga  -- 13 papers
+$ eprint watch add --author boudg<TAB>
+Boudgoust, Katharina  -- 18 papers
+Boudguiga, Aymen      -- 13 papers
 
 $ eprint watch add --author Katharina\ B<TAB>      → Katharina\ Boudgoust
 ```
 
-Names are offered in both orders, because completion matches on a prefix and you may start from
-either end:
-
-```
-$ eprint watch add --author Boudg<TAB>
-Boudgoust, Katharina  -- 18 papers
-Boudguiga, Aymen      -- 13 papers
-```
-
 `Boudgoust, Katharina` and `Katharina Boudgoust` are the same filter — the comma is there only so
-the candidate starts with what you typed. Candidates are always people, never bare surnames, and
-spellings that differ by accents, punctuation or spacing are shown as one person with their papers
-added together.
+the candidate starts with what you typed, and the space is escaped for you. Candidates are always
+people, never bare surnames, and spellings that differ by accents, punctuation or spacing are shown
+as one person with their papers added together.
 
 **`eprint watch rm <TAB>`** offers your saved watches by number, with what each one is:
 
