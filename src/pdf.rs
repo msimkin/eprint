@@ -141,7 +141,11 @@ pub fn cached(id: &str) -> Option<PathBuf> {
         if split_id(stem) == Some(want) {
             return Some(path);
         }
-        if split_id(stem).is_none() && names_paper(stem, want.1) && is_pdf(&path) {
+        if split_id(stem).is_none()
+            && names_paper(stem, want.1)
+            && !claims_other_year(stem, want.0, want.1)
+            && is_pdf(&path)
+        {
             loose = Some(path);
         }
     }
@@ -224,6 +228,22 @@ pub fn slug_words(path: &Path) -> String {
         .replace('-', " ")
 }
 
+/// True when the filename names a *different* year than the one being asked for,
+/// wherever in the name that year sits.
+///
+/// `split_id` only recognises a year at the very start, so `paper-2025-1523.pdf`
+/// slipped past the "never serve 2025/1523 for 2026/1523" rule and was not only
+/// opened but renamed to claim it was the 2026 paper. A group equal to the paper
+/// number is skipped first: papers numbered 1990-2100 exist, and `1999.pdf` is a
+/// paper number, not a year.
+fn claims_other_year(stem: &str, want_year: i64, want_num: i64) -> bool {
+    stem.split(|c: char| !c.is_ascii_digit())
+        .filter(|g| g.len() == 4)
+        .filter_map(|g| g.parse::<i64>().ok())
+        .filter(|y| *y != want_num)
+        .any(|y| (1990..=2100).contains(&y) && y != want_year)
+}
+
 /// True when this download plausibly *is* the paper: ePrint serves
 /// `/YYYY/NNNN.pdf`, so browsers save `NNNN.pdf`. Requiring the number rules out
 /// filing an unrelated download that happened to finish inside the window.
@@ -260,7 +280,9 @@ struct Seen {
 /// Deliberately silent: this runs detached, behind an `open` the user has already
 /// moved on from, so it must never print or fail loudly.
 pub fn adopt(id: &str, title: &str) {
-    let Some((_, num)) = split_id(id) else { return };
+    let Some((year, num)) = split_id(id) else {
+        return;
+    };
     let watching = watch_dirs();
     if watching.is_empty() {
         return;
@@ -304,7 +326,7 @@ pub fn adopt(id: &str, title: &str) {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if !names_paper(stem, num) {
+            if !names_paper(stem, num) || claims_other_year(stem, year, num) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
@@ -353,5 +375,44 @@ pub fn adopt(id: &str, title: &str) {
             mtime,
             quiet,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_filename_naming_another_year_is_another_paper() {
+        // `paper-2025-1523.pdf` was served for 2026/1523 and renamed to claim it
+        // was that paper: `split_id` only sees a year at the start of the name.
+        assert!(claims_other_year("paper-2025-1523", 2026, 1523));
+        assert!(claims_other_year("downloads/2019-77-copy", 2026, 77));
+        // The same year, however it is written, is not a claim about another.
+        assert!(!claims_other_year("paper-2026-1523", 2026, 1523));
+        assert!(!claims_other_year("1523", 2026, 1523));
+        // Papers numbered in the 1990s exist; the number is not a year.
+        assert!(!claims_other_year("1999", 2026, 1999));
+        assert!(!claims_other_year("2026-1999-title", 2026, 1999));
+    }
+
+    #[test]
+    fn ids_and_filenames_agree() {
+        assert_eq!(split_id("2026/1523"), Some((2026, 1523)));
+        assert_eq!(split_id("2026-1523-some-title"), Some((2026, 1523)));
+        assert_eq!(split_id("nonsense"), None);
+        assert_eq!(file_name("2026/1523", "A Title"), "2026-1523-a-title.pdf");
+        // No usable title: still a canonical, sortable name.
+        assert_eq!(file_name("2026/674", ""), "2026-0674.pdf");
+        assert_eq!(file_name("2026/674", "!!! ???"), "2026-0674.pdf");
+    }
+
+    #[test]
+    fn a_download_has_to_name_the_paper() {
+        assert!(names_paper("1523", 1523));
+        assert!(names_paper("1523 (1)", 1523));
+        assert!(names_paper("0001523", 1523));
+        assert!(!names_paper("15230", 1523));
+        assert!(!names_paper("thesis", 1523));
     }
 }

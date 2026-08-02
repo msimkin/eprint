@@ -1414,6 +1414,15 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
                 scope,
             }
             .label();
+            // The file is line-based and the label has to parse back to this same
+            // watch. Anything that would not is refused here rather than written
+            // and silently misread later.
+            if !config::round_trips(&new) {
+                if new.contains(['\n', '\r']) {
+                    bail!("a watch cannot contain a line break");
+                }
+                bail!("{new:?} would not read back the same way — try quoting it");
+            }
             let mut labels: Vec<String> = watches(&conn).iter().map(|w| w.label()).collect();
             if labels.contains(&new) {
                 // Not a failure: the state the user asked for is the state they

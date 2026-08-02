@@ -105,6 +105,20 @@ fn unquote(s: &str) -> String {
 /// Parse one `watch = …` value. Accepts exactly what `eprint watch add` accepts,
 /// which is also what `Watch::label()` writes, so a round trip is lossless.
 /// Returns `None` for a line that would watch nothing.
+/// Does this label survive being written and read back?
+///
+/// `Watch::label()` and `parse_watch()` are meant to be exact inverses, and a
+/// value that breaks that is written to the file and then read back as something
+/// else — or as nothing at all. Two ways it happened: a query term containing a
+/// line break left a stray line in the file and truncated the watch, and a term
+/// of literally `--title` was stored as a flag and vanished on the next read.
+pub fn round_trips(label: &str) -> bool {
+    if label.contains(['\n', '\r']) {
+        return false;
+    }
+    parse_watch(0, label).map(|w| w.label()).as_deref() == Some(label)
+}
+
 fn parse_watch(id: i64, value: &str) -> Option<Watch> {
     // The file is named `.toml`, which invites wrapping the whole value in quotes
     // — `watch = "--author Boudgoust"`. Left alone that parses as a phrase query
