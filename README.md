@@ -444,7 +444,9 @@ eprint config --aliases
 
 writes the file with every pair of names that *looks* like one person — a shared surname with an
 abbreviated first name, or one name's words contained in another's — commented out, for you to
-uncomment the ones that are right. Merging two people is a claim the tool will not make on its own,
+uncomment the ones that are right. Add `--edit` to open it in `$EDITOR` afterwards; plain
+`eprint config --edit` opens the settings file, which is a different one. `eprint config` shows where
+both live. Merging two people is a claim the tool will not make on its own,
 but finding the candidates across 21,466 names is not a reasonable thing to do by hand.
 
 The effect of one line is worth seeing. Before:

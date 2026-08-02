@@ -115,7 +115,8 @@ enum Cmd {
         /// Switch on Tab completion by adding one line to your shell's rc file
         #[arg(long)]
         completions: bool,
-        /// Write the author aliases file, with suggestions to uncomment
+        /// Write the author aliases file, with suggestions to uncomment. Add
+        /// `--edit` to open it afterwards
         #[arg(long)]
         aliases: bool,
     },
@@ -1196,6 +1197,12 @@ fn edit_config() -> Result<()> {
     if created {
         println!("wrote {}", path.display());
     }
+    edit_file(&path)
+}
+
+/// Hand a file to the user's editor. Shared by `--edit` and `--aliases --edit`,
+/// which open different files.
+fn edit_file(path: &std::path::Path) -> Result<()> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());
@@ -1203,7 +1210,7 @@ fn edit_config() -> Result<()> {
     let prog = words.next().unwrap_or("vi");
     let status = std::process::Command::new(prog)
         .args(words)
-        .arg(&path)
+        .arg(path)
         .status()
         .with_context(|| format!("launching {prog} (set $EDITOR to choose another editor)"))?;
     if !status.success() {
@@ -1224,7 +1231,7 @@ fn edit_config() -> Result<()> {
 /// people, and the tool has no business making it silently — but it does know
 /// which names look alike, and finding them by hand across 20,000 spellings is
 /// not a reasonable thing to ask.
-fn write_aliases() -> Result<()> {
+fn write_aliases(open_after: bool) -> Result<()> {
     let path = config::aliases_path().context("could not determine the config directory")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1271,13 +1278,19 @@ fn write_aliases() -> Result<()> {
         fresh.len(),
         if fresh.len() == 1 { "" } else { "s" },
         path.display());
-    println!("  uncomment the ones that are right — `eprint config --edit` opens the folder\n");
+    // Naming the command that opens *this* file: `--edit` alone opens the config
+    // file, which is a different file and used to be promised here by mistake.
+    if open_after {
+        println!("  uncomment the ones that are right\n");
+        return edit_file(&path);
+    }
+    println!("  uncomment the ones that are right — `eprint config --aliases --edit` opens it\n");
     Ok(())
 }
 
 fn do_config(init: bool, edit: bool, completions: bool, aliases: bool) -> Result<()> {
     if aliases {
-        return write_aliases();
+        return write_aliases(edit);
     }
     if completions {
         return completions::install_completions();
@@ -1326,6 +1339,18 @@ fn do_config(init: bool, edit: bool, completions: bool, aliases: bool) -> Result
             "off  (eprint config --completions)".to_string()
         }
     );
+    match config::aliases_path() {
+        Some(p) if p.exists() => println!(
+            "  author aliases {}  ({} in use)",
+            p.display(),
+            config::aliases().len()
+        ),
+        Some(p) => println!(
+            "  author aliases {}  (not created yet — eprint config --aliases)",
+            p.display()
+        ),
+        None => {}
+    }
     if path.is_some() {
         println!("\n  edit with `eprint config --edit`");
     }
