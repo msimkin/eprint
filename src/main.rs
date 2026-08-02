@@ -682,7 +682,12 @@ pub fn open_url(url: &str) -> Result<()> {
 ///
 /// The archive serves PDFs behind a Cloudflare challenge and denies `*pdf` in
 /// `robots.txt`, so the browser does the fetching and we only file the result.
-fn open_paper(conn: &rusqlite::Connection, id: &str) -> Result<()> {
+/// `announce` is false when the caller owns the screen. `browse` draws every cell
+/// itself, so anything printed here lands on top of the listing — the save hint
+/// used to appear as broken text across the selected paper's title. The TUI shows
+/// the same words in its status line instead; the filing behaviour is identical,
+/// which is the point of both front-ends coming through here.
+fn open_paper(conn: &rusqlite::Connection, id: &str, announce: bool) -> Result<()> {
     if let Some(path) = pdf::cached(id) {
         return open_url(&path.to_string_lossy());
     }
@@ -691,9 +696,11 @@ fn open_paper(conn: &rusqlite::Connection, id: &str) -> Result<()> {
     open_url(&format!("https://eprint.iacr.org/{id}.pdf"))?;
     let title = db::get(conn, id)?.map(|p| p.title).unwrap_or_default();
     spawn_adopter(id, &title);
-    nudge_completions(conn);
-    // stderr, so piping stays clean.
-    eprintln!("{}", save_hint());
+    if announce {
+        nudge_completions(conn);
+        // stderr, so piping stays clean.
+        eprintln!("{}", save_hint());
+    }
     Ok(())
 }
 
@@ -1848,7 +1855,7 @@ fn real_main() -> Result<()> {
                     bail!("{id:?} is not a paper id — they look like 2026/1539, or just 1539");
                 }
                 let conn = db::open()?;
-                open_paper(&conn, &id)
+                open_paper(&conn, &id, true)
             }
             // No id: answer "what do I have?" rather than erroring. Works
             // everywhere, including shells with no completion installed.

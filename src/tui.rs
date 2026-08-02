@@ -725,7 +725,7 @@ pub fn run(
                     // status line carries the save hint, since the TUI owns the
                     // screen and cannot print to it.
                     let local = crate::pdf::cached(&id);
-                    let _ = crate::open_paper(&conn, &id);
+                    let _ = crate::open_paper(&conn, &id, false);
                     app.status = Some(match local {
                         Some(p) => format!(
                             "opened {}",
