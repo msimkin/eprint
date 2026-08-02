@@ -70,6 +70,9 @@ const WATCH_MATCH_CAP: usize = 50_000;
 /// it saw. Stored verbatim rather than hashed — a few hundred bytes, and a stale
 /// cache should be diagnosable by reading `meta`.
 const KEY_CACHE_FOR: &str = "watch_cache_for";
+/// Bumped when matching changes, so every cache rebuilds once. v4 records which
+/// watch matched each paper; v3 and earlier stored ids alone.
+const CACHE_VERSION: &str = "v4";
 const KEY_CACHE_HARVEST: &str = "watch_cache_harvest";
 
 pub const MARK_START: char = '\x01';
@@ -168,12 +171,21 @@ CREATE TABLE IF NOT EXISTS bib (
 -- carries a whole setup to another machine. `legacy_watches` reads the table an
 -- older build created, once, and then drops it.
 
--- Which papers match a saved watch. Not TEMP and not scratch: the whole point is
--- that it outlives the command, so badging a listing and filtering to watched
--- papers are both indexed lookups rather than a scan of the archive per watch.
--- Pure cache — `watched()` rebuilds it whenever the watch list or the index has
+-- Which papers match a saved watch, and which watch matched. Not TEMP and not
+-- scratch: the whole point is that it outlives the command, so badging a listing
+-- and filtering to watched papers are both indexed lookups rather than a scan of
+-- the archive per watch. Recording the label as well as the id is what lets a
+-- watch be added or removed without rebuilding the rest, and makes the per-watch
+-- counts `eprint watch` prints a GROUP BY instead of a scan each.
+-- Pure cache — `watched()` repairs it whenever the watch list or the index has
 -- moved, so dropping it costs nothing but the next rebuild.
-CREATE TABLE IF NOT EXISTS watch_hits (id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS watch_hits (
+  id    TEXT NOT NULL,
+  label TEXT NOT NULL,
+  PRIMARY KEY (id, label)
+);
+-- Its index is created in `migrate`, which runs after the old one-column shape
+-- has been dropped — there is no `label` to index until then.
 "#,
     )?;
     migrate(conn)?;
@@ -195,6 +207,28 @@ fn migrate(conn: &Connection) -> Result<()> {
              UPDATE papers SET added = date WHERE added = '';",
         )?;
     }
+    // `watch_hits` gained a `label` column. It is pure cache, so the old shape is
+    // dropped and rebuilt rather than migrated.
+    let has_id: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('watch_hits') WHERE name = 'label'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_id == 0 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS watch_hits;
+             CREATE TABLE watch_hits (
+               id    TEXT NOT NULL,
+               label TEXT NOT NULL,
+               PRIMARY KEY (id, label)
+             );",
+        )?;
+    }
+    // Deleting or counting one watch's rows has to be cheap: that is what makes
+    // adding and removing a watch incremental rather than a rebuild.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS watch_hits_label_idx ON watch_hits(label);",
+    )?;
     let has_entry: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('bib') WHERE name = 'entry'",
         [],
@@ -744,107 +778,104 @@ fn matching_ids(conn: &Connection, q: &Query) -> Result<Vec<String>> {
 
 /// Every id in the index matching at least one saved watch.
 ///
-/// The set is cached in `watch_hits` and rebuilt only when the watch list or the
-/// index has changed, so the common call is three `meta` reads and one indexed
-/// `SELECT`. It used to be recomputed on every listing — one whole-index scan per
-/// watch — which at 23 watches cost 630ms on *every* command, including a five-row
-/// feed and every keystroke in `browse`'s query box. Nothing about "which papers
-/// match my watches" depends on what is on screen, so nothing about it belongs on
-/// the interactive path.
+/// Backed by the `watch_hits` table, which is brought up to date first — and only
+/// for what actually changed. Adding a watch matches that one watch and inserts
+/// its rows; removing one deletes its rows. Only a harvest forces every watch to
+/// be matched again, and that happens in the background child that harvested.
+/// Nothing here depends on what is on screen, so nothing here belongs on the
+/// interactive path: it used to be one whole-index scan per watch on *every*
+/// command, 630ms at twenty-three watches.
 pub fn watched(conn: &Connection, watches: &[Watch]) -> Result<HashSet<String>> {
-    let fingerprint = watch_fingerprint(watches);
-    let harvest = meta_get(conn, crate::harvest::KEY_LAST_HARVEST)?.unwrap_or_default();
-    let fresh = meta_get(conn, KEY_CACHE_FOR)?.as_deref() == Some(fingerprint.as_str())
-        && meta_get(conn, KEY_CACHE_HARVEST)?.as_deref() == Some(harvest.as_str());
-    if !fresh {
-        rebuild_watch_cache(conn, watches, &fingerprint, &harvest)?;
-    }
-    let mut stmt = conn.prepare("SELECT id FROM watch_hits")?;
+    sync_watch_cache(conn, watches)?;
+    let mut stmt = conn.prepare("SELECT DISTINCT id FROM watch_hits")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     Ok(rows.collect::<std::result::Result<HashSet<String>, _>>()?)
 }
 
-/// Identifies the watch list the cache was built from. Labels are what the config
-/// stores, so two lists differ here exactly when they differ on disk.
-fn watch_fingerprint(watches: &[Watch]) -> String {
-    // Versioned: a change to how matching works invalidates every cached set just
-    // as surely as an edited watch does, and a stale cache would be invisible.
-    // v3: v0.7.0–v0.7.4 could leave an empty cache behind a fingerprint that still
-    // looked current, if a rebuild was interrupted. Bumping heals those once.
-    std::iter::once("v3".to_string())
-        .chain(watches.iter().map(|w| w.label()))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// How many papers each watch currently marks, straight from the cache.
+///
+/// `eprint watch` used to run one whole-index count per watch — 1.0s at
+/// twenty-three of them, growing by ~44ms each. The rows are already there.
+pub fn watch_counts(conn: &Connection, watches: &[Watch]) -> Result<HashMap<String, i64>> {
+    sync_watch_cache(conn, watches)?;
+    let mut stmt = conn.prepare("SELECT label, COUNT(*) FROM watch_hits GROUP BY label")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
 }
 
-/// Rebuild `watch_hits` from scratch.
+/// Bring `watch_hits` in line with the watch list, doing as little as possible.
 ///
-/// Wholesale rather than incrementally, even after a harvest that added only a
-/// handful of papers: a *revised* paper can start or stop matching a watch without
-/// being new, and one rebuild a day — in the background child that did the
-/// harvesting — is not worth being clever about.
-fn rebuild_watch_cache(
-    conn: &Connection,
-    watches: &[Watch],
-    fingerprint: &str,
-    harvest: &str,
-) -> Result<()> {
-    let mut ids: HashSet<String> = HashSet::new();
+/// The labels the cache was built from are recorded in `meta`, so the work is the
+/// difference between that list and this one: labels that went are deleted, labels
+/// that arrived are matched. A changed harvest invalidates everything, since a
+/// revised paper can start or stop matching a watch without being new.
+fn sync_watch_cache(conn: &Connection, watches: &[Watch]) -> Result<()> {
+    let harvest = meta_get(conn, crate::harvest::KEY_LAST_HARVEST)?.unwrap_or_default();
+    let stale_index = meta_get(conn, KEY_CACHE_HARVEST)?.as_deref() != Some(harvest.as_str());
+    let covered: Vec<String> = match (stale_index, meta_get(conn, KEY_CACHE_FOR)?) {
+        (false, Some(list)) if list.starts_with(CACHE_VERSION) => list
+            .split('\n')
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        // No usable cache: every watch is "new" and the table starts empty.
+        _ => {
+            conn.execute("DELETE FROM watch_hits", [])?;
+            Vec::new()
+        }
+    };
 
-    // Watches that are pure filters (author, category) need no FTS, so all of them
-    // go into one scan with their predicate groups OR'd together: 161ms against
-    // 638ms for 23 separate scans, returning the identical set.
-    let plain: Vec<&Watch> = watches
+    let wanted: Vec<String> = watches.iter().map(|w| w.label()).collect();
+    let gone: Vec<&String> = covered.iter().filter(|l| !wanted.contains(l)).collect();
+    let added: Vec<&Watch> = watches
         .iter()
-        .filter(|w| w.terms.trim().is_empty())
+        .filter(|w| !covered.contains(&w.label()))
         .collect();
-    if !plain.is_empty() {
-        let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-        let mut groups: Vec<String> = Vec::new();
-        for w in &plain {
-            let q = w.query(None, WATCH_MATCH_CAP);
-            // `filter_sql` emits " AND <clause>" chains, so one watch's chain
-            // becomes one OR group here and the predicates are reused, not restated.
-            let clauses = filter_sql(&q, &mut args);
-            let group = clauses.trim_start().trim_start_matches("AND ").trim();
-            if !group.is_empty() {
-                groups.push(format!("({group})"));
-            }
-        }
-        if !groups.is_empty() {
-            let sql = format!("SELECT p.id FROM papers p WHERE {}", groups.join(" OR "));
-            let mut stmt = conn.prepare(&sql)?;
-            let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
-            let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(0))?;
-            for row in rows {
-                ids.insert(row?);
-            }
-        }
+    if gone.is_empty() && added.is_empty() && !covered.is_empty() {
+        // Already current, and the common case: three meta reads and nothing else.
+        return Ok(());
     }
 
-    // Anything carrying query terms still needs its own `papers_fts MATCH`.
-    for w in watches.iter().filter(|w| !w.terms.trim().is_empty()) {
+    // Matching happens outside the write transaction: it is the slow part, and
+    // holding a write lock across it would block the background refresh.
+    let mut fresh: Vec<(String, String)> = Vec::new();
+    for w in &added {
+        let label = w.label();
         // A watch that no longer parses contributes nothing rather than breaking
         // the listing it is meant to annotate.
-        if let Ok(matched) = matching_ids(conn, &w.query(None, WATCH_MATCH_CAP)) {
-            ids.extend(matched);
+        if let Ok(ids) = matching_ids(conn, &w.query(None, WATCH_MATCH_CAP)) {
+            fresh.extend(ids.into_iter().map(|id| (id, label.clone())));
         }
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let rebuilt = (|| -> Result<()> {
-        conn.execute("DELETE FROM watch_hits", [])?;
-        let mut stmt = conn.prepare("INSERT OR IGNORE INTO watch_hits (id) VALUES (?1)")?;
-        for id in &ids {
-            stmt.execute([id])?;
+    let written = (|| -> Result<()> {
+        for label in &gone {
+            conn.execute("DELETE FROM watch_hits WHERE label = ?1", [label])?;
         }
-        drop(stmt);
-        meta_set(conn, KEY_CACHE_FOR, fingerprint)?;
-        meta_set(conn, KEY_CACHE_HARVEST, harvest)?;
+        {
+            let mut stmt =
+                conn.prepare("INSERT OR IGNORE INTO watch_hits (id, label) VALUES (?1, ?2)")?;
+            for (id, label) in &fresh {
+                stmt.execute([id, label])?;
+            }
+        }
+        meta_set(conn, KEY_CACHE_FOR, &watch_fingerprint(watches))?;
+        meta_set(conn, KEY_CACHE_HARVEST, &harvest)?;
         Ok(())
     })();
-    conn.execute_batch(if rebuilt.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-    rebuilt
+    conn.execute_batch(if written.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    written
+}
+
+/// The labels the cache covers, behind a version tag. Bumping the tag invalidates
+/// every cache, which is what a change to *how* matching works requires.
+fn watch_fingerprint(watches: &[Watch]) -> String {
+    std::iter::once(CACHE_VERSION.to_string())
+        .chain(watches.iter().map(|w| w.label()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Watches used to live in this file, one row per saved search. They are settings,

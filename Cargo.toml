@@ -1,6 +1,6 @@
 [package]
 name = "eprint"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 description = "Search the IACR Cryptology ePrint Archive from the command line"
 license = "MIT"

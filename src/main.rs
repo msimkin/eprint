@@ -1472,10 +1472,10 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
 
 fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
     let watches = watches(conn);
-    // Every write to the watch list lands here on its way to being printed, which
-    // makes it the one place that can absorb the rebuild. Doing it now means the
-    // next `eprint` does a lookup instead of paying for the change.
-    let _ = db::watched(conn, &watches);
+    // Every write to the watch list passes through here on its way to being
+    // printed, so this is where the cache is brought up to date — which for an
+    // added or removed watch is that one watch's rows, not a rebuild.
+    let counts = db::watch_counts(conn, &watches).unwrap_or_default();
     if watches.is_empty() {
         println!("  No watches yet. Save one with:\n");
         println!("    eprint watch add \"lattice OR LWE\"");
@@ -1487,8 +1487,10 @@ fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
     for w in &watches {
         // The index-wide count is the useful sanity check on a new watch: it
         // says "this expression does match things" before you wait a day for
-        // `new` to prove it the hard way.
-        let total = db::count_matches(conn, &w.query(None, 1)).unwrap_or(0);
+        // `new` to prove it the hard way. Read from the cache, which already
+        // knows which papers this watch marks — counting them here meant one
+        // whole-index scan per watch, and a second per `eprint watch`.
+        let total = counts.get(&w.label()).copied().unwrap_or(0);
         println!("  {:<3} {:<44} {total} in the index", w.id, w.describe());
     }
     println!("\n  matches are marked ✱ in search, `new` and `browse` · `w` in browse filters to them");

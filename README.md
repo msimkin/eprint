@@ -441,10 +441,11 @@ In `browse`, **`w`** filters the listing down to watched papers, and any query y
 searches within that subset. The header shows `· watched only` while it is on; `w` again
 restores everything.
 
-Which papers match is worked out once and kept in the index, not recomputed per listing, so
-toggling `w` and typing in the query box stay instant however many watches you keep. It is
-refreshed when you change a watch and when new papers arrive — on the command that caused it, or
-in the background refresh, never on the search you are waiting for.
+Which papers match is worked out once and kept in the index, along with which watch matched them,
+so toggling `w`, typing in the query box, and the counts above all read from a table rather than
+searching the archive again. Adding a watch matches only that watch; removing one is a delete. Only
+new papers arriving cause everything to be re-matched, and that happens in the background refresh —
+never on the command you are waiting for.
 
 Watches live in the **config file**, one `watch` line each, written exactly as you would type
 them:
