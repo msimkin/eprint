@@ -815,7 +815,13 @@ if ! whence compdef > /dev/null 2>&1; then
 fi
 
 _eprint() {
+  # zsh matches candidates against the typed text case-sensitively unless told
+  # otherwise, which would make completion the only case-sensitive thing in the
+  # tool: `--author shamir` and `--category crypto` are perfectly good filters, so
+  # they should also be perfectly good things to type at a Tab.
   local -a cmds papers values
+  local -a nocase
+  nocase=(-M 'm:{a-zA-Z}={A-Za-z}')
   cmds=(
     'browse:Interactive full-screen browser'
     'open:Open a paper PDF'
@@ -827,7 +833,7 @@ _eprint() {
     'config:Show or create the configuration file'
   )
   if (( CURRENT == 2 )); then
-    _describe -t commands 'eprint command' cmds
+    _describe -t commands 'eprint command' cmds $nocase
     return
   fi
   local cur=${words[CURRENT]} flag=${words[CURRENT-1]}
@@ -848,7 +854,7 @@ _eprint() {
   case $flag in
     --category)
       values=(${(f)"$(eprint completions categories 2>/dev/null)"})
-      (( ${#values} )) && _describe -t categories 'IACR category' values
+      (( ${#values} )) && _describe -t categories 'IACR category' values $nocase
       return
       ;;
     --author)
@@ -862,7 +868,7 @@ _eprint() {
       local -a names
       names=(${(f)"$(eprint completions authors ${(Q)cur} 2>/dev/null)"})
       if (( ${#names} )); then
-        _describe -t authors 'author' names
+        _describe -t authors 'author' names $nocase
       else
         # `-r` because a bare `_message` is swallowed here and never shown.
         _message -r 'a few more letters of the name'
@@ -870,11 +876,11 @@ _eprint() {
       return
       ;;
     --scope)
-      _values 'scope' 'all[title, authors and abstract]' 'title[titles and authors only]'
+      _values $nocase 'scope' 'all[title, authors and abstract]' 'title[titles and authors only]'
       return
       ;;
     --theme)
-      _values 'theme' 'auto[follow the terminal]' 'dark' 'light' 'mono[attributes only]'
+      _values $nocase 'theme' 'auto[follow the terminal]' 'dark' 'light' 'mono[attributes only]'
       return
       ;;
   esac
@@ -919,23 +925,23 @@ _eprint() {
       # A bare `eprint`, a query, or the hidden `search`: the feed's own flags.
       *) flags=($search_flags '-a[include full abstracts]' '--abstracts[include full abstracts]') ;;
     esac
-    (( ${#flags} )) && _values 'option' $flags
+    (( ${#flags} )) && _values $nocase 'option' $flags
     return
   fi
   case ${words[2]} in
     open|show|bib)
       papers=(${(f)"$(eprint completions ids 2>/dev/null)"})
-      (( ${#papers} )) && _describe -t papers 'downloaded papers' papers
+      (( ${#papers} )) && _describe -t papers 'downloaded papers' papers $nocase
       ;;
     watch)
       if (( CURRENT == 3 )); then
-        _values 'watch command' 'add[save a search]' 'rm[remove one]' 'list[show them]'
+        _values $nocase 'watch command' 'add[save a search]' 'rm[remove one]' 'list[show them]'
       elif [[ ${words[3]} == rm ]]; then
         # `watch rm` takes the position `eprint watch` prints, and those numbers
         # renumber after a removal — so they are worth showing with their labels
         # rather than counted by hand.
         values=(${(f)"$(eprint completions watches 2>/dev/null)"})
-        (( ${#values} )) && _describe -t watches 'saved watch' values
+        (( ${#values} )) && _describe -t watches 'saved watch' values $nocase
       fi
       ;;
   esac

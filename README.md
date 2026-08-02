@@ -316,6 +316,10 @@ by hand. `--scope` and `--theme` complete their values too, and **flag names com
 `eprint lattice -<TAB>` lists what a search takes, `eprint bib -<TAB>` what `bib` takes. Both
 `--category <value>` and `--category=<value>` are understood.
 
+Completion ignores case everywhere, like the filters themselves: `--author shamir<TAB>` and
+`--category crypto<TAB>` work as well as the capitalised forms, and the name is inserted with the
+archive's own capitalisation.
+
 Changing completion means starting a new shell, or `exec zsh` — the function is loaded once when the
 shell starts, so an already-open terminal keeps the version it read at login.
 
