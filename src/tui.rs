@@ -40,10 +40,6 @@ pub struct Filters {
 }
 
 const ID_W: usize = 11;
-/// Per-watch ceiling when staging the watched-only filter. Generous enough that
-/// no realistic watch is truncated, bounded so a pathological one cannot stage
-/// the whole archive.
-const WATCH_STAGE_CAP: usize = 20_000;
 /// Width of the "❯ " selection marker and the "▸ " expand arrow.
 const MARKER_W: usize = 2;
 const ARROW_W: usize = 2;
@@ -68,8 +64,14 @@ struct App {
     scope: Scope,
     /// eprint id -> (citation key, is_published)
     bib: HashMap<String, (String, bool)>,
-    /// Ids on screen that match a saved watch.
+    /// Every id in the index matching a saved watch, read once at startup from the
+    /// `watch_hits` cache. Badging is then a hash lookup per visible row rather
+    /// than a query per search.
     watched: HashSet<String>,
+    /// The unfiltered listing, kept while `w` is on so switching it off restores
+    /// instantly instead of re-running a 26,000-row query. Dropped as soon as the
+    /// query or a filter changes, since it would no longer be what to return to.
+    unfiltered: Option<(Vec<Hit>, usize)>,
     /// `w`: restrict the whole listing, and any query typed into it, to papers
     /// matching a watch.
     watched_only: bool,
@@ -84,6 +86,10 @@ struct App {
 
 impl App {
     fn search(&mut self, conn: &Connection) {
+        // Whatever `w` off would have restored is stale the moment the query or a
+        // filter moves, so the stash is dropped on every search and re-taken by the
+        // `w` handler alone.
+        self.unfiltered = None;
         let q = Query {
             terms: &self.query,
             year: self.filters.year,
@@ -91,7 +97,6 @@ impl App {
             before: self.filters.before.clone(),
             added_since: None,
             only_watched: self.watched_only,
-            only_listed: false,
             author: self.filters.author.clone(),
             category: self.filters.category.clone(),
             limit: self.filters.limit,
@@ -103,7 +108,6 @@ impl App {
                 self.total = db::count_matches(conn, &q).unwrap_or(hits.len());
                 let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
                 self.bib = db::bib_map(conn, &ids).unwrap_or_default();
-                self.watched = db::watched_ids(conn, &ids, &self.watch_list).unwrap_or_default();
                 self.hits = hits;
                 self.status = None;
             }
@@ -394,7 +398,8 @@ pub fn run(
         editing: Editing::None,
         date_input: String::new(),
         expanded: HashSet::new(),
-        watched: HashSet::new(),
+        watched: db::watched(&conn, &watch_list).unwrap_or_default(),
+        unfiltered: None,
         watched_only: false,
         watch_list,
         favourite: crate::config::load().favourite_author,
@@ -678,21 +683,31 @@ pub fn run(
             KeyCode::Char('w') => {
                 if app.watched_only {
                     app.watched_only = false;
-                    app.search(&conn);
+                    // Switching off returns to a listing we already had, so restore
+                    // it rather than asking the database for it again.
+                    match app.unfiltered.take() {
+                        Some((hits, total)) => {
+                            app.hits = hits;
+                            app.total = total;
+                            app.selected = 0;
+                            app.scroll = 0;
+                        }
+                        None => app.search(&conn),
+                    }
                 } else {
-                    // Re-stage on every switch-on, so watches added in another
-                    // shell since this session started are picked up.
+                    // Re-read on every switch-on, so a watch added in another shell
+                    // since this session started is picked up. The cache rebuilds
+                    // itself if that list has changed; otherwise this is a lookup.
                     app.watch_list = crate::config::load().watches;
-                    match db::stage_watched(&conn, &app.watch_list, WATCH_STAGE_CAP) {
-                        Ok(0) => {
-                            app.status =
-                                Some("no watches yet — `eprint watch add \"topic\"`".to_string())
-                        }
-                        Ok(_) => {
-                            app.watched_only = true;
-                            app.search(&conn);
-                        }
-                        Err(_) => app.status = Some("could not read your watches".to_string()),
+                    app.watched = db::watched(&conn, &app.watch_list).unwrap_or_default();
+                    if app.watched.is_empty() {
+                        app.status =
+                            Some("no watches yet — `eprint watch add \"topic\"`".to_string());
+                    } else {
+                        let prev = (std::mem::take(&mut app.hits), app.total);
+                        app.watched_only = true;
+                        app.search(&conn);
+                        app.unfiltered = Some(prev);
                     }
                 }
             }

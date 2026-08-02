@@ -557,6 +557,10 @@ fn do_update(full: bool, quiet: bool) -> Result<()> {
         }
     }
     let n = harvest::run(&mut conn, from.as_deref(), quiet, &format_iso(now()))?;
+    // New papers invalidate the watch cache. Rebuilding here keeps the cost inside
+    // the update — usually the detached background child — rather than surprising
+    // whichever command runs next.
+    let _ = db::watched(&conn, &watches(&conn));
     if !quiet {
         let total = db::count(&conn)?;
         if n == 0 {
@@ -1065,7 +1069,6 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         before,
         added_since: None,
         only_watched: false,
-        only_listed: false,
         author: a.author.clone(),
         category: a.category.clone(),
         limit: a.limit.unwrap_or(if a.is_latest() {
@@ -1095,7 +1098,7 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
     render::render_header(&mut out, hits.len(), total, age, scope.label(), st);
     let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
-    let watched = db::watched_ids(&conn, &ids, &watches(&conn)).unwrap_or_default();
+    let watched = db::watched(&conn, &watches(&conn)).unwrap_or_default();
     for hit in &hits {
         let w = watched.contains(&hit.paper.id);
         render::render_hit(&mut out, hit, st, a.abstracts, bibs.get(&hit.paper.id), w);
@@ -1293,7 +1296,7 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
     render::render_header(&mut out, hits.len(), hits.len(), age, &label, &st);
     let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
-    let watched = db::watched_ids(&conn, &ids, &watches(&conn)).unwrap_or_default();
+    let watched = db::watched(&conn, &watches(&conn)).unwrap_or_default();
     for hit in &hits {
         let w = watched.contains(&hit.paper.id);
         render::render_hit(&mut out, hit, &st, a.abstracts, bibs.get(&hit.paper.id), w);
@@ -1419,6 +1422,10 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
 
 fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
     let watches = watches(conn);
+    // Every write to the watch list lands here on its way to being printed, which
+    // makes it the one place that can absorb the rebuild. Doing it now means the
+    // next `eprint` does a lookup instead of paying for the change.
+    let _ = db::watched(conn, &watches);
     if watches.is_empty() {
         println!("  No watches yet. Save one with:\n");
         println!("    eprint watch add \"lattice OR LWE\"");

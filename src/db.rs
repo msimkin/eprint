@@ -62,9 +62,15 @@ fn scoped(expr: &str, scope: Scope) -> String {
     }
 }
 
-/// Ceiling on how many ids one watch contributes when deciding which rows to badge.
-/// Far above any realistic watch, and only a guard against a pathological one.
+/// Ceiling on how many ids one watch contributes to the cache. Far above any
+/// realistic watch, and only a guard against a pathological one.
 const WATCH_MATCH_CAP: usize = 50_000;
+
+/// What the cached `watch_hits` was built from: the watch labels, and the harvest
+/// it saw. Stored verbatim rather than hashed — a few hundred bytes, and a stale
+/// cache should be diagnosable by reading `meta`.
+const KEY_CACHE_FOR: &str = "watch_cache_for";
+const KEY_CACHE_HARVEST: &str = "watch_cache_harvest";
 
 pub const MARK_START: char = '\x01';
 pub const MARK_END: char = '\x02';
@@ -88,8 +94,8 @@ pub fn open() -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     // A stale index spawns a detached `update --quiet` child, so a foreground
     // command can meet that writer mid-transaction. WAL keeps readers going, but
-    // anything that writes — `meta_set` on the search path, `stage_watched` in
-    // browse — would otherwise fail instantly rather than wait the few
+    // anything that writes — `meta_set` on the search path, a `watch_hits`
+    // rebuild — would otherwise fail instantly rather than wait the few
     // milliseconds the writer actually needs.
     conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
     init(&conn)?;
@@ -150,16 +156,12 @@ CREATE TABLE IF NOT EXISTS bib (
 -- carries a whole setup to another machine. `legacy_watches` reads the table an
 -- older build created, once, and then drops it.
 
--- Scratch space for `browse`'s watched-only filter: the union of every watch's
--- matches, so the filter is one `IN (SELECT …)` instead of thousands of bound
--- parameters. TEMP, so it lives and dies with the connection and never touches
--- the stored schema.
-CREATE TEMP TABLE IF NOT EXISTS watched_stage (id TEXT PRIMARY KEY);
-
--- Scratch space for the other direction: the ids currently on screen, so asking
--- "which of these match a watch?" costs one indexed lookup per watch instead of
--- one scan of the whole archive per watch.
-CREATE TEMP TABLE IF NOT EXISTS listing_stage (id TEXT PRIMARY KEY);
+-- Which papers match a saved watch. Not TEMP and not scratch: the whole point is
+-- that it outlives the command, so badging a listing and filtering to watched
+-- papers are both indexed lookups rather than a scan of the archive per watch.
+-- Pure cache — `watched()` rebuilds it whenever the watch list or the index has
+-- moved, so dropping it costs nothing but the next rebuild.
+CREATE TABLE IF NOT EXISTS watch_hits (id TEXT PRIMARY KEY);
 "#,
     )?;
     migrate(conn)?;
@@ -573,7 +575,6 @@ impl Watch {
             before: None,
             added_since: watermark.map(|w| w.to_string()),
             only_watched: false,
-            only_listed: false,
             author: self.author.clone(),
             category: self.category.clone(),
             limit,
@@ -626,94 +627,106 @@ fn matching_ids(conn: &Connection, q: &Query) -> Result<Vec<String>> {
     }
 }
 
-/// Fill `listing_stage` with the ids about to be annotated.
-fn stage_listing(conn: &Connection, ids: &[String]) -> Result<()> {
-    conn.execute("DELETE FROM listing_stage", [])?;
-    // One transaction rather than one per row: a full `browse` listing stages
-    // 26,000 ids, and autocommitting each of them is the whole saving thrown away.
+/// Every id in the index matching at least one saved watch.
+///
+/// The set is cached in `watch_hits` and rebuilt only when the watch list or the
+/// index has changed, so the common call is three `meta` reads and one indexed
+/// `SELECT`. It used to be recomputed on every listing — one whole-index scan per
+/// watch — which at 23 watches cost 630ms on *every* command, including a five-row
+/// feed and every keystroke in `browse`'s query box. Nothing about "which papers
+/// match my watches" depends on what is on screen, so nothing about it belongs on
+/// the interactive path.
+pub fn watched(conn: &Connection, watches: &[Watch]) -> Result<HashSet<String>> {
+    let fingerprint = watch_fingerprint(watches);
+    let harvest = meta_get(conn, crate::harvest::KEY_LAST_HARVEST)?.unwrap_or_default();
+    let fresh = meta_get(conn, KEY_CACHE_FOR)?.as_deref() == Some(fingerprint.as_str())
+        && meta_get(conn, KEY_CACHE_HARVEST)?.as_deref() == Some(harvest.as_str());
+    if !fresh {
+        rebuild_watch_cache(conn, watches, &fingerprint, &harvest)?;
+    }
+    let mut stmt = conn.prepare("SELECT id FROM watch_hits")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<HashSet<String>, _>>()?)
+}
+
+/// Identifies the watch list the cache was built from. Labels are what the config
+/// stores, so two lists differ here exactly when they differ on disk.
+fn watch_fingerprint(watches: &[Watch]) -> String {
+    watches
+        .iter()
+        .map(|w| w.label())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rebuild `watch_hits` from scratch.
+///
+/// Wholesale rather than incrementally, even after a harvest that added only a
+/// handful of papers: a *revised* paper can start or stop matching a watch without
+/// being new, and one rebuild a day — in the background child that did the
+/// harvesting — is not worth being clever about.
+fn rebuild_watch_cache(
+    conn: &Connection,
+    watches: &[Watch],
+    fingerprint: &str,
+    harvest: &str,
+) -> Result<()> {
+    let mut ids: HashSet<String> = HashSet::new();
+
+    // Watches that are pure filters (author, category) need no FTS, so all of them
+    // go into one scan with their predicate groups OR'd together: 161ms against
+    // 638ms for 23 separate scans, returning the identical set.
+    let plain: Vec<&Watch> = watches
+        .iter()
+        .filter(|w| w.terms.trim().is_empty())
+        .collect();
+    if !plain.is_empty() {
+        let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+        let mut groups: Vec<String> = Vec::new();
+        for w in &plain {
+            let q = w.query(None, WATCH_MATCH_CAP);
+            // `filter_sql` emits " AND <clause>" chains, so one watch's chain
+            // becomes one OR group here and the predicates are reused, not restated.
+            let clauses = filter_sql(&q, &mut args);
+            let group = clauses.trim_start().trim_start_matches("AND ").trim();
+            if !group.is_empty() {
+                groups.push(format!("({group})"));
+            }
+        }
+        if !groups.is_empty() {
+            let sql = format!("SELECT p.id FROM papers p WHERE {}", groups.join(" OR "));
+            let mut stmt = conn.prepare(&sql)?;
+            let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                ids.insert(row?);
+            }
+        }
+    }
+
+    // Anything carrying query terms still needs its own `papers_fts MATCH`.
+    for w in watches.iter().filter(|w| !w.terms.trim().is_empty()) {
+        // A watch that no longer parses contributes nothing rather than breaking
+        // the listing it is meant to annotate.
+        if let Ok(matched) = matching_ids(conn, &w.query(None, WATCH_MATCH_CAP)) {
+            ids.extend(matched);
+        }
+    }
+
+    conn.execute("DELETE FROM watch_hits", [])?;
     conn.execute_batch("BEGIN")?;
-    let staged = (|| -> Result<()> {
-        let mut stmt = conn.prepare("INSERT OR IGNORE INTO listing_stage (id) VALUES (?1)")?;
-        for id in ids {
+    let filled = (|| -> Result<()> {
+        let mut stmt = conn.prepare("INSERT OR IGNORE INTO watch_hits (id) VALUES (?1)")?;
+        for id in &ids {
             stmt.execute([id])?;
         }
         Ok(())
     })();
-    conn.execute_batch(if staged.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-    staged
-}
-
-/// Fill `watched_stage` with every id matching some watch, and report how many.
-/// Cheap to repeat, so callers can re-stage whenever the watch list may have
-/// changed rather than tracking that themselves.
-pub fn stage_watched(conn: &Connection, watches: &[Watch], cap_per_watch: usize) -> Result<usize> {
-    conn.execute("DELETE FROM watched_stage", [])?;
-    for w in watches {
-        // A watch that no longer parses contributes nothing rather than
-        // emptying the filter.
-        if let Ok(ids) = matching_ids(conn, &w.query(None, cap_per_watch)) {
-            let mut stmt =
-                conn.prepare("INSERT OR IGNORE INTO watched_stage (id) VALUES (?1)")?;
-            for id in ids {
-                stmt.execute([id])?;
-            }
-        }
-    }
-    Ok(conn.query_row("SELECT COUNT(*) FROM watched_stage", [], |r| r.get::<_, i64>(0))? as usize)
-}
-
-/// Above this many rows on screen, ask each watch about the whole index instead of
-/// about the listing. Measured at 26,419 papers and 23 watches: staging wins hugely
-/// on small listings (a 5-row feed 690ms → 89ms, 1,000 rows 706ms → 146ms) and keeps
-/// winning to about 12,000 rows, past which the per-id lookups outgrow the scan they
-/// replace (20,000 rows: 950ms staged against 859ms whole-index). Only `browse`
-/// loading everything reaches that.
-const STAGE_MAX: usize = 10_000;
-
-/// Which of `ids` match at least one saved watch.
-///
-/// Two strategies, because neither wins everywhere. Normally the ids on screen are
-/// staged once and each watch is asked only about them, which is what makes the
-/// cost track the listing rather than the archive. Matching every watch against the
-/// whole index — the previous behaviour — is a 26,000-row scan per watch, invisible
-/// with two watches but 600ms on *every* command at twenty-three, including a
-/// five-row feed. Past `STAGE_MAX` that scan is the cheaper of the two and comes
-/// back. (A third shape, chunking the ids into bound parameters, was measured and
-/// rejected earlier: 66 queries per watch on a full listing.)
-pub fn watched_ids(
-    conn: &Connection,
-    ids: &[String],
-    watches: &[Watch],
-) -> Result<HashSet<String>> {
-    let mut out = HashSet::new();
-    if ids.is_empty() || watches.is_empty() {
-        return Ok(out);
-    }
-    let staged = ids.len() <= STAGE_MAX;
-    if staged {
-        stage_listing(conn, ids)?;
-    }
-    let want: HashSet<&String> = if staged {
-        HashSet::new()
-    } else {
-        ids.iter().collect()
-    };
-    for w in watches {
-        let mut q = w.query(None, if staged { ids.len() } else { WATCH_MATCH_CAP });
-        q.only_listed = staged;
-        // A watch with a broken expression must not break the listing it is
-        // annotating, so a failed match just contributes nothing.
-        let Ok(matched) = matching_ids(conn, &q) else {
-            continue;
-        };
-        if staged {
-            // Already restricted to the listing by the query itself.
-            out.extend(matched);
-        } else {
-            out.extend(matched.into_iter().filter(|id| want.contains(id)));
-        }
-    }
-    Ok(out)
+    conn.execute_batch(if filled.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    filled?;
+    meta_set(conn, KEY_CACHE_FOR, fingerprint)?;
+    meta_set(conn, KEY_CACHE_HARVEST, harvest)?;
+    Ok(())
 }
 
 /// Watches used to live in this file, one row per saved search. They are settings,
@@ -767,12 +780,9 @@ pub struct Query<'a> {
     /// Filters on when the paper entered *this* index, not its own date, so
     /// `new` can ask a watch "anything since I last looked?".
     pub added_since: Option<String>,
-    /// Restricts the query to papers matching some watch. Requires a preceding
-    /// `stage_watched()` on the same connection to fill `watched_stage`.
+    /// Restricts the query to papers matching some watch, via the `watch_hits`
+    /// cache. Call `watched()` first on the same connection so the cache is fresh.
     pub only_watched: bool,
-    /// Restricts the query to the ids on screen. Requires a preceding
-    /// `stage_listing()` on the same connection to fill `listing_stage`.
-    pub only_listed: bool,
     pub author: Option<String>,
     pub category: Option<String>,
     pub limit: usize,
@@ -916,10 +926,7 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
         sql.push_str(&format!(" AND p.added > ?{}", args.len()));
     }
     if q.only_watched {
-        sql.push_str(" AND p.id IN (SELECT id FROM watched_stage)");
-    }
-    if q.only_listed {
-        sql.push_str(" AND p.id IN (SELECT id FROM listing_stage)");
+        sql.push_str(" AND p.id IN (SELECT id FROM watch_hits)");
     }
     // Every word of the name has to appear, but the order does not: nobody should
     // have to know whether the archive stored "Katharina Boudgoust" or "Boudgoust
