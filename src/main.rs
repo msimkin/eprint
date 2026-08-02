@@ -1065,6 +1065,7 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         before,
         added_since: None,
         only_watched: false,
+        only_listed: false,
         author: a.author.clone(),
         category: a.category.clone(),
         limit: a.limit.unwrap_or(if a.is_latest() {

@@ -155,6 +155,11 @@ CREATE TABLE IF NOT EXISTS bib (
 -- parameters. TEMP, so it lives and dies with the connection and never touches
 -- the stored schema.
 CREATE TEMP TABLE IF NOT EXISTS watched_stage (id TEXT PRIMARY KEY);
+
+-- Scratch space for the other direction: the ids currently on screen, so asking
+-- "which of these match a watch?" costs one indexed lookup per watch instead of
+-- one scan of the whole archive per watch.
+CREATE TEMP TABLE IF NOT EXISTS listing_stage (id TEXT PRIMARY KEY);
 "#,
     )?;
     migrate(conn)?;
@@ -568,6 +573,7 @@ impl Watch {
             before: None,
             added_since: watermark.map(|w| w.to_string()),
             only_watched: false,
+            only_listed: false,
             author: self.author.clone(),
             category: self.category.clone(),
             limit,
@@ -620,6 +626,23 @@ fn matching_ids(conn: &Connection, q: &Query) -> Result<Vec<String>> {
     }
 }
 
+/// Fill `listing_stage` with the ids about to be annotated.
+fn stage_listing(conn: &Connection, ids: &[String]) -> Result<()> {
+    conn.execute("DELETE FROM listing_stage", [])?;
+    // One transaction rather than one per row: a full `browse` listing stages
+    // 26,000 ids, and autocommitting each of them is the whole saving thrown away.
+    conn.execute_batch("BEGIN")?;
+    let staged = (|| -> Result<()> {
+        let mut stmt = conn.prepare("INSERT OR IGNORE INTO listing_stage (id) VALUES (?1)")?;
+        for id in ids {
+            stmt.execute([id])?;
+        }
+        Ok(())
+    })();
+    conn.execute_batch(if staged.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    staged
+}
+
 /// Fill `watched_stage` with every id matching some watch, and report how many.
 /// Cheap to repeat, so callers can re-stage whenever the watch list may have
 /// changed rather than tracking that themselves.
@@ -639,13 +662,24 @@ pub fn stage_watched(conn: &Connection, watches: &[Watch], cap_per_watch: usize)
     Ok(conn.query_row("SELECT COUNT(*) FROM watched_stage", [], |r| r.get::<_, i64>(0))? as usize)
 }
 
+/// Above this many rows on screen, ask each watch about the whole index instead of
+/// about the listing. Measured at 26,419 papers and 23 watches: staging wins hugely
+/// on small listings (a 5-row feed 690ms → 89ms, 1,000 rows 706ms → 146ms) and keeps
+/// winning to about 12,000 rows, past which the per-id lookups outgrow the scan they
+/// replace (20,000 rows: 950ms staged against 859ms whole-index). Only `browse`
+/// loading everything reaches that.
+const STAGE_MAX: usize = 10_000;
+
 /// Which of `ids` match at least one saved watch.
 ///
-/// One query per watch over the whole index, intersected in memory — *not* one
-/// query per watch per chunk of on-screen ids. The chunked version cost 66 queries
-/// per watch on a full 26,000-paper listing and dominated the search; this is ten
-/// queries whatever the listing size, because a watch's match set is small (an
-/// author is tens of papers, a broad term a few thousand ids).
+/// Two strategies, because neither wins everywhere. Normally the ids on screen are
+/// staged once and each watch is asked only about them, which is what makes the
+/// cost track the listing rather than the archive. Matching every watch against the
+/// whole index — the previous behaviour — is a 26,000-row scan per watch, invisible
+/// with two watches but 600ms on *every* command at twenty-three, including a
+/// five-row feed. Past `STAGE_MAX` that scan is the cheaper of the two and comes
+/// back. (A third shape, chunking the ids into bound parameters, was measured and
+/// rejected earlier: 66 queries per watch on a full listing.)
 pub fn watched_ids(
     conn: &Connection,
     ids: &[String],
@@ -655,16 +689,28 @@ pub fn watched_ids(
     if ids.is_empty() || watches.is_empty() {
         return Ok(out);
     }
-    let want: HashSet<&String> = ids.iter().collect();
+    let staged = ids.len() <= STAGE_MAX;
+    if staged {
+        stage_listing(conn, ids)?;
+    }
+    let want: HashSet<&String> = if staged {
+        HashSet::new()
+    } else {
+        ids.iter().collect()
+    };
     for w in watches {
+        let mut q = w.query(None, if staged { ids.len() } else { WATCH_MATCH_CAP });
+        q.only_listed = staged;
         // A watch with a broken expression must not break the listing it is
         // annotating, so a failed match just contributes nothing.
-        if let Ok(matched) = matching_ids(conn, &w.query(None, WATCH_MATCH_CAP)) {
-            for id in matched {
-                if want.contains(&id) {
-                    out.insert(id);
-                }
-            }
+        let Ok(matched) = matching_ids(conn, &q) else {
+            continue;
+        };
+        if staged {
+            // Already restricted to the listing by the query itself.
+            out.extend(matched);
+        } else {
+            out.extend(matched.into_iter().filter(|id| want.contains(id)));
         }
     }
     Ok(out)
@@ -724,6 +770,9 @@ pub struct Query<'a> {
     /// Restricts the query to papers matching some watch. Requires a preceding
     /// `stage_watched()` on the same connection to fill `watched_stage`.
     pub only_watched: bool,
+    /// Restricts the query to the ids on screen. Requires a preceding
+    /// `stage_listing()` on the same connection to fill `listing_stage`.
+    pub only_listed: bool,
     pub author: Option<String>,
     pub category: Option<String>,
     pub limit: usize,
@@ -868,6 +917,9 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     }
     if q.only_watched {
         sql.push_str(" AND p.id IN (SELECT id FROM watched_stage)");
+    }
+    if q.only_listed {
+        sql.push_str(" AND p.id IN (SELECT id FROM listing_stage)");
     }
     // Every word of the name has to appear, but the order does not: nobody should
     // have to know whether the archive stored "Katharina Boudgoust" or "Boudgoust
