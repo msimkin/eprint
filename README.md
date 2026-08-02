@@ -414,6 +414,28 @@ dropped, which is what makes `Ron D. Rothblum` and `Ron Rothblum` one filter rat
 hands `Boudgoust` to the query instead of to `--author` — which is what Tab completion is for
 (below): it fills in the whole name and escapes the space for you.
 
+**One author, however the archive spells them.** The same person is often filed several ways —
+`Ivan Damgård`, `Ivan Damgard` and `Ivan Damgaard` are one researcher, as are `Nico Döttling` and
+`Nico Doettling`. Spellings that differ only by an accent, its written-out form (`ö`/`oe`, `å`/`aa`,
+`ü`/`ue`), punctuation, case or a stray space are treated as one author: a watch on any of them
+finds all of them, and completion offers them as a single candidate with the papers added together.
+
+The rule fires only on evidence — a spelling that actually carries the umlaut is what links the
+other two — so `Yu` and `Yue`, or `Xu` and `Xue`, stay the different people they are.
+
+What no rule can know goes in `~/.config/eprint/authors`:
+
+```ini
+# the same person, however the archive got it wrong
+Yuval Ishai  = Yual Ishai
+Ivan Damgård = I. Damgard, Ivan B. Damgaard
+
+# and, if the automatic merging ever overreaches, the opposite
+Yu Chen != Yue Chen
+```
+
+The file is optional, hand-edited, and a line it cannot read is skipped rather than fatal.
+
 Adding a watch you already have is not an error; it says so and changes nothing.
 
 Matching papers get a gold `✱` after the title and their id in the same gold, everywhere a list

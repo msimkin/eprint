@@ -215,6 +215,64 @@ pub fn path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".config").join("eprint").join("config.toml"))
 }
 
+/// Where the author aliases live: beside the config, since they are settings too
+/// and copying the directory should carry them along.
+pub fn aliases_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("EPRINT_ALIASES") {
+        return Some(PathBuf::from(p));
+    }
+    path().map(|p| p.with_file_name("authors"))
+}
+
+/// What the author aliases file says, as `(canonical, other, same_person)` triples.
+///
+/// The rules in `db` merge spellings they can *prove* related — an umlaut and its
+/// digraph. This file is for what no rule can derive: a typo, a name with only an
+/// initial, or a merge the rules got wrong and must be told to undo.
+///
+/// ```text
+/// Ivan Damgård = I. Damgard, Ivan B. Damgaard
+/// Yu Chen != Yue Chen
+/// ```
+///
+/// A line that makes no sense is skipped, not fatal: these annotate a listing and
+/// must never be able to break one.
+pub fn aliases() -> Vec<(String, String, bool)> {
+    let Some(p) = aliases_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        // `!=` first: it contains `=`, so testing for `=` first would split it
+        // in the middle and produce a canonical ending in `!`.
+        let (canonical, rest, same) = match line.split_once("!=") {
+            Some((a, b)) => (a, b, false),
+            None => match line.split_once('=') {
+                Some((a, b)) => (a, b, true),
+                None => continue,
+            },
+        };
+        let canonical = canonical.trim();
+        if canonical.is_empty() {
+            continue;
+        }
+        for other in rest.split(',') {
+            let other = other.trim();
+            if !other.is_empty() && other != canonical {
+                out.push((canonical.to_string(), other.to_string(), same));
+            }
+        }
+    }
+    out
+}
+
 /// Deliberately tiny `key = value` reader rather than a TOML dependency —
 /// the whole config is a handful of scalars plus the watch lines.
 pub fn load() -> Config {
@@ -279,4 +337,40 @@ pub fn init() -> Result<(PathBuf, bool)> {
     }
     std::fs::write(&p, TEMPLATE).with_context(|| format!("writing {}", p.display()))?;
     Ok((p, true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aliases_read_both_directions() {
+        std::env::set_var("EPRINT_ALIASES", "/nonexistent/eprint-test-aliases");
+        assert!(aliases().is_empty(), "a missing file means no aliases");
+
+        let path = std::env::temp_dir().join("eprint-alias-test");
+        std::fs::write(
+            &path,
+            "# a comment\n\
+             Ivan Damgård = I. Damgard, Ivan B. Damgaard\n\
+             Yu Chen != Yue Chen\n\
+             \n\
+             nonsense line with no separator\n\
+             = missing a canonical\n",
+        )
+        .unwrap();
+        std::env::set_var("EPRINT_ALIASES", &path);
+        let got = aliases();
+        assert_eq!(
+            got,
+            vec![
+                ("Ivan Damgård".to_string(), "I. Damgard".to_string(), true),
+                ("Ivan Damgård".to_string(), "Ivan B. Damgaard".to_string(), true),
+                ("Yu Chen".to_string(), "Yue Chen".to_string(), false),
+            ],
+            "unreadable lines are skipped, not fatal"
+        );
+        std::env::remove_var("EPRINT_ALIASES");
+        let _ = std::fs::remove_file(&path);
+    }
 }
