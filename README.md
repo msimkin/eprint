@@ -635,7 +635,9 @@ a range, at whatever granularity you feel like:
 Both ends of a range may be a year, a month or a day, and they need not match. An upper bound
 always includes the whole period it names, so `..2020` runs to 31 December.
 
-`04/28/2026` is rejected rather than guessed at — 28 is not a month, and the error says so.
+`04/28/2026` is rejected rather than guessed at — 28 is not a month, and the error says so. So is
+anything else it cannot read: `2024-o6-01` with a letter for a zero is an error, not a silent answer
+about January. A range that runs backwards (`2024..2020`) says so rather than returning nothing.
 
 In `browse`, **`d`** opens the same thing as a prompt: type `2023..2024`, enter to apply, an empty
 prompt to clear, `esc` to cancel. A misparse keeps the prompt open with the error in the footer, so
@@ -710,6 +712,7 @@ stored. Saved PDFs live separately, in `~/Documents/eprint/`. Override the locat
 cargo build --locked            # debug build
 cargo build --release --locked  # optimised build
 cargo clippy --all-targets      # lints
+cargo test --locked             # unit tests
 cargo fmt                       # formatting
 ```
 

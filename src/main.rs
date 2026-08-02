@@ -423,14 +423,22 @@ fn parse_bound(s: &str, upper: bool) -> Result<String> {
         Ok(format!("{y:04}-{m:02}-{d:02}"))
     };
 
-    // ISO, kept for compatibility.
+    // ISO, kept for compatibility. Every component must parse: defaulting them
+    // turned a typo like "2024-o6-01" into 2024-01-01 and answered a question
+    // nobody asked, which is worse than refusing.
     if t.len() >= 8 && t.contains('-') && !t.contains('/') {
         let p: Vec<&str> = t.splitn(3, '-').collect();
-        let (y, m, d) = (
-            p.first().and_then(|v| v.parse().ok()).unwrap_or(0),
-            p.get(1).and_then(|v| v.parse().ok()).unwrap_or(1),
-            p.get(2).and_then(|v| v.parse().ok()).unwrap_or(1),
-        );
+        let part = |v: Option<&&str>, what: &str| -> Result<i64> {
+            match v {
+                Some(v) => v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("could not read the {what} in {t:?} — try 28/04/2024 or 2024")
+                }),
+                None => Ok(1),
+            }
+        };
+        let y = part(p.first(), "year")?;
+        let m = part(p.get(1), "month")?;
+        let d = part(p.get(2), "day")?;
         return build(y, m, d);
     }
 
@@ -497,6 +505,11 @@ pub(crate) fn parse_range(s: &str) -> Result<(Option<String>, Option<String>)> {
         } else {
             Some(parse_bound(hi, true)?)
         };
+        if let (Some(f), Some(t2)) = (&from, &till) {
+            if f >= t2 {
+                bail!("{t:?} runs backwards — the earlier date goes first");
+            }
+        }
         return Ok((from, till));
     }
     // No `..`, so the value names a single period and both ends come from it: a
@@ -1022,6 +1035,21 @@ fn spawn_adopter(id: &str, title: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// ePrint ids are `YYYY/NNN` and nothing else. Checked before anything is opened:
+/// the alternative is handing a typo to the browser, which looks like the tool
+/// working right up until the page 404s.
+fn valid_id(id: &str) -> bool {
+    match id.split_once('/') {
+        Some((y, n)) => {
+            y.len() == 4
+                && y.bytes().all(|b| b.is_ascii_digit())
+                && !n.is_empty()
+                && n.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 fn normalise_id(raw: &str) -> String {
@@ -1739,10 +1767,31 @@ fn do_status() -> Result<()> {
 }
 
 fn main() {
+    quiet_broken_pipe();
     if let Err(e) = real_main() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// `eprint watch | head -3` used to end in a Rust panic and a backtrace notice:
+/// Rust ignores SIGPIPE, so the first `println!` after the reader leaves fails,
+/// and a failed print panics. Closing a pipe early is what `head` is *for*, so it
+/// leaves quietly instead. Resetting SIGPIPE itself would mean a `libc`
+/// dependency for three lines; every other panic still reports as before.
+fn quiet_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let broken = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(|s| s.contains("Broken pipe"))
+            .unwrap_or(false);
+        if broken {
+            std::process::exit(0);
+        }
+        previous(info);
+    }));
 }
 
 fn real_main() -> Result<()> {
@@ -1794,13 +1843,76 @@ fn real_main() -> Result<()> {
         }
         Some(Cmd::Open { id, .. }) => match id {
             Some(id) => {
+                let id = normalise_id(&id);
+                if !valid_id(&id) {
+                    bail!("{id:?} is not a paper id — they look like 2026/1539, or just 1539");
+                }
                 let conn = db::open()?;
-                open_paper(&conn, &normalise_id(&id))
+                open_paper(&conn, &id)
             }
             // No id: answer "what do I have?" rather than erroring. Works
             // everywhere, including shells with no completion installed.
             None => do_library(),
         },
         Some(Cmd::Completions { what, needle }) => do_completions(&what, needle.as_deref()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every case here is a bug that shipped, so the tests are the bug list.
+    #[test]
+    fn dates_reject_what_they_cannot_read() {
+        // A typo used to default each unreadable component and answer a question
+        // nobody asked: "2024-o6-01" quietly became 2024-01-01.
+        for bad in ["2024-o6-01", "not-a-date", "2024-xx-yy", "abc-def-ghi"] {
+            assert!(parse_bound(bad, false).is_err(), "{bad} should not parse");
+        }
+        // Out-of-range components were already caught; keep them caught.
+        assert!(parse_bound("2024-13-01", false).is_err());
+        assert!(parse_bound("2024-06-99", false).is_err());
+    }
+
+    #[test]
+    fn dates_still_accept_what_they_should() {
+        assert_eq!(parse_bound("2024-06-15", false).unwrap(), "2024-06-15");
+        assert_eq!(parse_bound("28/04/2024", false).unwrap(), "2024-04-28");
+        assert_eq!(parse_bound("2024", false).unwrap(), "2024-01-01");
+        // The upper bound is the day *after* the period: stored dates are
+        // timestamps, so an inclusive `<=` would drop the final day.
+        assert_eq!(parse_bound("2024", true).unwrap(), "2025-01-01");
+        assert_eq!(parse_bound("28/04/2024", true).unwrap(), "2024-04-29");
+        assert_eq!(parse_bound("02/2024", true).unwrap(), "2024-03-01");
+    }
+
+    #[test]
+    fn ranges_must_run_forwards() {
+        assert!(parse_range("2024..2020").is_err());
+        assert!(parse_range("2020..2024").is_ok());
+        // A single period is both ends of itself, and must stay valid.
+        assert!(parse_range("2024").is_ok());
+        let (from, till) = parse_range("2020..2024").unwrap();
+        assert_eq!(from.unwrap(), "2020-01-01");
+        assert_eq!(till.unwrap(), "2025-01-01");
+    }
+
+    #[test]
+    fn ids_are_year_slash_number() {
+        for good in ["2026/1539", "1996/1", "2026/0001"] {
+            assert!(valid_id(good), "{good} should be an id");
+        }
+        // "2026/1523extra" was handed to the browser as a URL.
+        for bad in ["2026/1523extra", "abc", "2026/", "/1523", "26/15", "2026-1539"] {
+            assert!(!valid_id(bad), "{bad} should not be an id");
+        }
+    }
+
+    #[test]
+    fn a_bare_number_means_this_year() {
+        let (y, _, _) = civil_from_days(now().div_euclid(86400));
+        assert_eq!(normalise_id("1539"), format!("{y}/1539"));
+        assert_eq!(normalise_id("2019/17"), "2019/17");
     }
 }

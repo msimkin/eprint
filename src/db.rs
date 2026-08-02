@@ -769,7 +769,9 @@ pub fn watched(conn: &Connection, watches: &[Watch]) -> Result<HashSet<String>> 
 fn watch_fingerprint(watches: &[Watch]) -> String {
     // Versioned: a change to how matching works invalidates every cached set just
     // as surely as an edited watch does, and a stale cache would be invisible.
-    std::iter::once("v2".to_string())
+    // v3: v0.7.0–v0.7.4 could leave an empty cache behind a fingerprint that still
+    // looked current, if a rebuild was interrupted. Bumping heals those once.
+    std::iter::once("v3".to_string())
         .chain(watches.iter().map(|w| w.label()))
         .collect::<Vec<_>>()
         .join("\n")
@@ -829,20 +831,20 @@ fn rebuild_watch_cache(
         }
     }
 
-    conn.execute("DELETE FROM watch_hits", [])?;
-    conn.execute_batch("BEGIN")?;
-    let filled = (|| -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let rebuilt = (|| -> Result<()> {
+        conn.execute("DELETE FROM watch_hits", [])?;
         let mut stmt = conn.prepare("INSERT OR IGNORE INTO watch_hits (id) VALUES (?1)")?;
         for id in &ids {
             stmt.execute([id])?;
         }
+        drop(stmt);
+        meta_set(conn, KEY_CACHE_FOR, fingerprint)?;
+        meta_set(conn, KEY_CACHE_HARVEST, harvest)?;
         Ok(())
     })();
-    conn.execute_batch(if filled.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-    filled?;
-    meta_set(conn, KEY_CACHE_FOR, fingerprint)?;
-    meta_set(conn, KEY_CACHE_HARVEST, harvest)?;
-    Ok(())
+    conn.execute_batch(if rebuilt.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    rebuilt
 }
 
 /// Watches used to live in this file, one row per saved search. They are settings,
@@ -1176,4 +1178,52 @@ fn browse(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folding_unifies_the_archives_spellings() {
+        // One person, four ways the archive writes them.
+        assert_eq!(fold_name("Ron D.  Rothblum"), fold_name("Ron D. Rothblum"));
+        assert_eq!(fold_name("Ivan Damgård"), fold_name("Ivan Damgard"));
+        assert_eq!(fold_name("ADI SHAMIR"), fold_name("Adi Shamir"));
+        assert_eq!(fold_name("Shamir, Adi"), "shamir adi");
+        // Decomposed and pre-composed accents fold alike.
+        assert_eq!(fold_name("Damga\u{030a}rd"), fold_name("Damgård"));
+        // Distinct people stay distinct: `aa` is a transliteration, not an accent,
+        // and folding it would merge unrelated names.
+        assert_ne!(fold_name("Ivan Damgaard"), fold_name("Ivan Damgård"));
+    }
+
+    #[test]
+    fn surnames_split_off_the_end() {
+        assert_eq!(split_surname("Adi Shamir").unwrap(), ("Shamir", "Adi".into()));
+        assert_eq!(
+            split_surname("Ivan Bjerre Damgård").unwrap(),
+            ("Damgård", "Ivan Bjerre".into())
+        );
+        assert!(split_surname("Cher").is_none());
+    }
+
+    #[test]
+    fn watches_read_one_way_and_store_another() {
+        let w = Watch {
+            id: 1,
+            terms: "zk".into(),
+            author: Some("Adi Shamir".into()),
+            category: Some("Foundations".into()),
+            scope: Scope::Title,
+        };
+        // Storage has to round-trip through the config parser, so flag values
+        // containing a space stay quoted.
+        assert_eq!(
+            w.label(),
+            "zk --author \"Adi Shamir\" --category Foundations --title"
+        );
+        // Display is a sentence and deliberately does not round-trip.
+        assert_eq!(w.describe(), "zk · by Adi Shamir · in Foundations · titles only");
+    }
 }
