@@ -158,6 +158,16 @@ _eprint() {
       ;;
   esac
 }
+
+# One candidate per row. zsh compacts a listing by putting every match that shares
+# a description on one line and printing the description once — `_describe` checks
+# `list-grouped`, which is true unless it is told otherwise. That is the wrong
+# trade here: every candidate carries a count worth reading, so eleven authors with
+# one paper each came out as three crowded rows with a single "1 paper" at the far
+# right, while the authors whose counts happened to be unique lined up neatly.
+# Scoped to this command, so every other completion keeps zsh's default.
+zstyle ':completion:*:*:eprint:*' list-grouped false
+
 compdef _eprint eprint
 "#;
 
