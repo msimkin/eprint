@@ -139,9 +139,11 @@ fn parse_watch(id: i64, value: &str) -> Option<Watch> {
     while i < toks.len() {
         match toks[i].as_str() {
             "--author" | "-a" => {
+                // Written as a name reads, so a watch saved from the shell's
+                // `Shamir, Adi` candidate does not sit among two dozen `First Last`.
                 author = toks
                     .get(i + 1)
-                    .map(|v| unquote(v))
+                    .map(|v| crate::names::person_form(&unquote(v)))
                     .filter(|v| !v.is_empty());
                 i += 2;
             }

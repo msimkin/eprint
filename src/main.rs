@@ -1041,7 +1041,9 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
             let new = db::Watch {
                 id: 0,
                 terms,
-                author,
+                // The same normalisation the config reader applies, or `label()`
+                // and `parse_watch` would stop being exact inverses.
+                author: author.map(|a| names::person_form(&a)),
                 category,
                 scope,
             }

@@ -321,6 +321,29 @@ pub fn canonical_byline(byline: &str) -> String {
     out
 }
 
+/// A typed `--author` value written the way a name reads: `"Shamir, Adi"` becomes
+/// `"Adi Shamir"`, and the table's spelling wherever it knows one.
+///
+/// Completion offers both orders because zsh filters candidates by prefix and a
+/// surname is what people start typing — the comma form is there for the shell, not
+/// as a way to write a name, and picking it left one saved watch reading `by
+/// Shamir, Adi` among two dozen `by First Last`. Both are the same filter, since
+/// `author_match` ignores punctuation and word order, so this decides only what a
+/// watch *stores and shows*.
+pub fn person_form(value: &str) -> String {
+    let swapped = match value.split_once(',') {
+        // A reversed name has exactly one comma with something either side. More
+        // than one is not a name being reversed, and this must not touch it.
+        Some((surname, rest))
+            if !rest.contains(',') && !surname.trim().is_empty() && !rest.trim().is_empty() =>
+        {
+            format!("{} {}", rest.trim(), surname.trim())
+        }
+        _ => value.trim().to_string(),
+    };
+    canonical(&swapped).unwrap_or(&swapped).to_string()
+}
+
 /// What a typed `--author` value should be compared as: canonicalised through the
 /// same table, then folded.
 ///
@@ -904,6 +927,20 @@ mod tests {
         let words: Vec<&str> = needle.split_whitespace().collect();
         assert!(name_matches("Ivana Klasovitá", &words));
         assert!(name_matches("Ivana Klasovita", &words));
+    }
+
+    #[test]
+    fn a_saved_author_reads_like_a_name() {
+        // The shell's surname-first candidate is a prefix-matching device, not a
+        // spelling: one watch read `by Shamir, Adi` among two dozen `by First Last`.
+        assert_eq!(person_form("Shamir, Adi"), "Adi Shamir");
+        assert_eq!(person_form("Rothblum, Ron D."), "Ron Rothblum");
+        // Already a name, or known to the table, or neither: all left sensible.
+        assert_eq!(person_form("Adi Shamir"), "Adi Shamir");
+        assert_eq!(person_form("Damgard, Ivan"), "Ivan Damgaard");
+        assert_eq!(person_form("  Boudgoust  "), "Boudgoust");
+        // Two commas is not a name reversed, and must not be rearranged.
+        assert_eq!(person_form("Smith, John, Jr"), "Smith, John, Jr");
     }
 
     #[test]
