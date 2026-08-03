@@ -1224,6 +1224,20 @@ fn edit_file(path: &std::path::Path) -> Result<()> {
 
 
 
+/// The explanation at the top of a fresh aliases file. A raw string starting at
+/// column zero, because a continued literal indented itself into the output.
+const ALIAS_HEADER: &str = r#"# Author aliases: spellings of one person the tool cannot prove are the same.
+# Accents, punctuation, spacing and the umlaut/digraph pair (ö/oe, å/aa) are
+# handled without being told, so they need no entry here.
+#
+#   Yuval Ishai  = Yual Ishai, Y. Ishai
+#   Yu Chen     != Yue Chen        # never the same person, whatever the rules think
+#
+# The name on the left is the one shown; anything on the right is found by it.
+# Below are the names that look alike. Uncomment the ones that are right.
+
+"#;
+
 /// `config --aliases`: start the author aliases file off with everything the
 /// rules could not decide for themselves.
 ///
@@ -1251,18 +1265,7 @@ fn write_aliases(open_after: bool) -> Result<()> {
         .collect();
     let mut out = existing.clone();
     if out.is_empty() {
-        out.push_str(
-            "# Author aliases: spellings of one person that the tool cannot prove
-             # are the same. Accents, punctuation, spacing and the umlaut/digraph
-             # pair are handled automatically and need no entry here.
-             #
-             #   Yuval Ishai  = Yual Ishai, Y. Ishai
-             #   Yu Chen     != Yue Chen        # never the same person
-             #
-             # Below: names that look alike. Uncomment the ones that are right.
-
-",
-        );
+        out.push_str(ALIAS_HEADER);
     } else if !fresh.is_empty() {
         if !out.ends_with('\n') {
             out.push('\n');
@@ -1273,11 +1276,24 @@ fn write_aliases(open_after: bool) -> Result<()> {
         out.push_str(&format!("# {s}\n"));
     }
     std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    // Suggestions are only added if the file does not mention that name yet, so a
+    // second run has nothing to add. Saying "0 suggestions written" reads as a
+    // failure; say what is actually there.
+    let active = config::aliases().len();
     println!();
-    println!("  {} suggestion{} written to {}",
-        fresh.len(),
-        if fresh.len() == 1 { "" } else { "s" },
-        path.display());
+    match (fresh.len(), existing.is_empty()) {
+        (0, false) => println!(
+            "  {} already lists every name that looks alike, {} in use — {}",
+            path.display(),
+            active,
+            if active == 0 { "none uncommented yet" } else { "nothing to add" }
+        ),
+        (n, _) => println!(
+            "  {n} suggestion{} written to {}",
+            if n == 1 { "" } else { "s" },
+            path.display()
+        ),
+    }
     // Naming the command that opens *this* file: `--edit` alone opens the config
     // file, which is a different file and used to be promised here by mistake.
     if open_after {
