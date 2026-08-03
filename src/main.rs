@@ -289,6 +289,32 @@ impl SearchArgs {
 
 // ---------- index freshness ----------
 
+/// Where an incremental harvest should start: the **earlier** of the last harvest
+/// and the newest record actually indexed, less the re-request window.
+///
+/// Taking the harvest clock alone opens a hole that never heals. The watermark is
+/// the server's `responseDate`, so a harvest that comes back empty still advances
+/// it; once it has run ahead of the data, every later run asks about a window that
+/// starts after the records it is missing, and `OVERLAP_SECS` is far too short to
+/// reach back. That is not hypothetical — it cost this index 2026/1540 to 1575, a
+/// week of papers, while `status` reported a harvest minutes old.
+///
+/// Bounding it by `MAX(papers.date)` makes the request describe the data rather
+/// than the clock, so a gap of any size closes itself on the next update. The
+/// harvest clock still bounds the other side: a paper dated in the future must not
+/// be able to push the window forward.
+fn incremental_from(last_harvest: Option<&str>, newest: Option<&str>) -> Option<String> {
+    let at = |s: Option<&str>| s.and_then(dates::parse_iso);
+    let (harvested, newest) = (at(last_harvest), at(newest));
+    let start = match (harvested, newest) {
+        (Some(h), Some(n)) => h.min(n),
+        (Some(h), None) => h,
+        // Nothing harvested yet: the caller asks for everything.
+        (None, _) => return None,
+    };
+    Some(dates::format_iso(start - OVERLAP_SECS as i64))
+}
+
 fn index_age(conn: &rusqlite::Connection) -> Result<Option<i64>> {
     Ok(db::meta_get(conn, harvest::KEY_LAST_HARVEST)?
         .and_then(|v| dates::parse_iso(&v))
@@ -325,8 +351,10 @@ fn do_update(full: bool, quiet: bool) -> Result<()> {
     let from = if full {
         None
     } else {
-        db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?
-            .and_then(|v| dates::parse_iso(&v).map(|t| dates::format_iso(t - OVERLAP_SECS as i64)))
+        incremental_from(
+            db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?.as_deref(),
+            db::newest(&conn)?.map(|(_, date)| date).as_deref(),
+        )
     };
     db::meta_set(
         &conn,
@@ -1483,6 +1511,35 @@ mod tests {
         let (from, till) = dates::parse_range("2020..2024").unwrap();
         assert_eq!(from.unwrap(), "2020-01-01");
         assert_eq!(till.unwrap(), "2025-01-01");
+    }
+
+    #[test]
+    fn an_incremental_window_never_outruns_the_data() {
+        // The bug this exists for: a harvest that comes back empty still advances
+        // the watermark, so the window marched past 2026/1540-1575 and no later run
+        // could reach back. The window has to describe the data, not the clock.
+        let day = 24 * 3600;
+        let harvested = dates::format_iso(30 * day);
+        let newest = dates::format_iso(10 * day);
+        assert_eq!(
+            incremental_from(Some(&harvested), Some(&newest)),
+            Some(dates::format_iso(10 * day - OVERLAP_SECS as i64)),
+            "the newest record bounds it, not the harvest clock"
+        );
+        // Up to date: the harvest clock is the earlier of the two and still wins,
+        // so the usual case asks about two days rather than everything since.
+        let newest = dates::format_iso(40 * day);
+        assert_eq!(
+            incremental_from(Some(&harvested), Some(&newest)),
+            Some(dates::format_iso(30 * day - OVERLAP_SECS as i64)),
+            "a paper dated in the future must not push the window forward"
+        );
+        // An empty index has nothing to bound, and no harvest means a full one.
+        assert_eq!(
+            incremental_from(Some(&harvested), None),
+            Some(dates::format_iso(30 * day - OVERLAP_SECS as i64))
+        );
+        assert_eq!(incremental_from(None, Some(&newest)), None);
     }
 
     #[test]
