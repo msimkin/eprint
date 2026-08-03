@@ -32,11 +32,31 @@ use std::collections::HashMap;
 /// other Chens. The skeleton rule above is the one comparison that survived every
 /// such test, and it cannot bridge an initial, so initials are listed here.
 ///
-/// Selected as: every author with 25 or more papers whom the archive spells more
-/// than one way. The representative is the commonest spelling with its middle
-/// initials dropped, preferring a well-used variant that carries the author's real
-/// accents. `Ivan Damgaard` is deliberately the ASCII spelling; every other entry
-/// keeps its accents.
+/// Selected as: every author with 10 or more papers whom the archive spells more
+/// than one way — 428 of them. The cut started at 25 and came down twice, because a
+/// paper count is a poor proxy for whether a reader knows the name: 25 left Guy
+/// Rothblum as both `Guy N. Rothblum` and `Guy Rothblum` on 19 papers along with 36
+/// others at that level, and 15 still left Yvo Desmedt, Claude Crépeau, Éric Brier,
+/// Begül Bilgin and Stefan Kölbl split on 13 or 14. At 10 nothing above the line is
+/// split. Below it are ~600 groups that are almost all a one-off ALL-CAPS or
+/// unaccented spelling of a name whose other form is already right — invisible
+/// unless you complete that exact name, and never a matching failure, since
+/// `fold_name` equates them either way.
+///
+/// The representative is the commonest spelling with its middle initials dropped,
+/// except that a variant carrying the author's real accents wins if it holds at
+/// least a tenth of the papers (`Küsters` over `Kuesters`, `Padró` over `Padro`)
+/// and an ALL-CAPS spelling loses to a mixed-case one. Both of those rules are safe
+/// in a way the identity rules are not: every candidate here folds alike, so they
+/// are the same person and the same filter, and a poor choice is cosmetic. Two
+/// guards keep them honest — a spelling whose non-ASCII characters are not letters
+/// is mojibake (`Juliane KrÃ¤mer`) and never wins, and the tenth-of-the-papers floor
+/// rejects a one-off misspelling that happens to carry more accents
+/// (`Francisco Rodrıíguez-Henrıíquez`).
+///
+/// `Ivan Damgaard` is deliberately the ASCII spelling, `Yael Kalai` deliberately
+/// drops a maiden name, and `Sri Aravinda Krishnan Thyagarajan` deliberately fixes
+/// the archive's missing space. Those three are the only hand-written choices.
 static PEOPLE: &[(&str, &[&str])] = &[
     ("Brent Waters", &[]),
     ("Ivan Damgaard", &["i damgard", "ivan bjerre damgard"]),
@@ -57,7 +77,7 @@ static PEOPLE: &[(&str, &[&str])] = &[
     ("Yehuda Lindell", &["y lindell"]),
     ("Kenneth Paterson", &["k g paterson"]),
     ("Jesper Buus Nielsen", &["jesper b nielsen"]),
-    ("Nigel Smart", &["n p smart", "n smart"]),
+    ("Nigel Smart", &["n p smart", "n smart", "nigel paul smart"]),
     ("David Pointcheval", &["d pointcheval"]),
     ("Qiang Tang", &[]),
     ("Shivam Bhasin", &[]),
@@ -82,7 +102,7 @@ static PEOPLE: &[(&str, &[&str])] = &[
     ("Jean-Sébastien Coron", &[]),
     ("Damien Stehlé", &[]),
     ("Juan Garay", &[]),
-    ("Man Ho Au", &[]),
+    ("Man Ho Au", &["man ho allen au"]),
     ("Nir Bitansky", &[]),
     ("Joseph Liu", &[]),
     ("Elisabeth Oswald", &["e oswald"]),
@@ -109,13 +129,13 @@ static PEOPLE: &[(&str, &[&str])] = &[
     ("Svetla Nikova", &["s nikova"]),
     ("Tal Malkin", &[]),
     ("Benny Pinkas", &["b pinkas"]),
-    ("Markku-Juhani Saarinen", &[]),
+    ("Markku-Juhani Saarinen", &["markku juhani olavi sarinen"]),
     ("Russell Lai", &[]),
     ("Gaëtan Leurent", &[]),
     ("Cas Cremers", &[]),
     ("Ron Rothblum", &[]),
     ("Yunlei Zhao", &[]),
-    ("Charanjit Jutla", &[]),
+    ("Charanjit Jutla", &["charanjit singh jutla"]),
     ("Juliane Krämer", &[]),
     ("Paulo Barreto", &["p s l m barreto"]),
     ("Fabrice Benhamouda", &[]),
@@ -220,6 +240,251 @@ static PEOPLE: &[(&str, &[&str])] = &[
     ("Matthias Kannwischer", &[]),
     ("Jörg Schwenk", &[]),
     ("Lilya Budaghyan", &["l budaghyan"]),
+    ("Gaëtan Cassiers", &[]),
+    ("Shi-Feng Sun", &[]),
+    ("Siamak Shahandashti", &["s f shahandashti"]),
+    ("Igor Semaev", &["i semaev"]),
+    ("Hervé Chabanne", &[]),
+    ("Amr Youssef", &["a m youssef"]),
+    ("Michael Tunstall", &["m tunstall"]),
+    ("Dong Hoon Lee", &[]),
+    ("Guru-Vamsi Policharla", &[]),
+    ("Zhengzhong Jin", &[]),
+    ("Melek Önen", &[]),
+    ("Carla Ràfols", &[]),
+    ("Pierrick Gaudry", &["p gaudry"]),
+    ("Enes Pasalic", &["e pasalic"]),
+    ("Stefan Katzenbeisser", &["s katzenbeisser"]),
+    ("Carles Padró", &["c padro"]),
+    ("Kefei Chen", &[]),
+    ("François Dupressoir", &[]),
+    ("Joon-Woo Lee", &[]),
+    ("Véronique Cortier", &[]),
+    ("Maciej Skórski", &[]),
+    ("Annelie Heuser", &[]),
+    ("Hideki Imai", &["h imai"]),
+    ("Benoît Cogliati", &[]),
+    ("Siwoo Eum", &[]),
+    ("João Ribeiro", &[]),
+    ("David Gérault", &[]),
+    ("Riad Wahby", &[]),
+    ("Peter Ryan", &[]),
+    ("Nadia El Mrabet", &[]),
+    ("Arjen Lenstra", &["a k lenstra"]),
+    ("Dan Page", &["d page"]),
+    ("Pavel Hubáček", &[]),
+    ("Maria Potop-Butucaru", &[]),
+    ("Alice Pellet-Mary", &[]),
+    ("Marcos Simplicio Jr.", &[]),
+    ("Emmanuel Thomé", &[]),
+    ("Mélissa Rossi", &[]),
+    ("Łukasz Chmielewski", &[]),
+    ("Wai-Kong Lee", &[]),
+    ("Aurore Guillevic", &["a guillevic"]),
+    ("Scott Fluhrer", &[]),
+    ("Jia Xu", &[]),
+    ("John Steinberger", &[]),
+    ("Ee-Chien Chang", &[]),
+    ("Johannes Blömer", &["j blomer"]),
+    ("Guy Rothblum", &[]),
+    ("Alexander Dent", &[]),
+    ("Billy Bob Brumley", &["b b brumley", "billy b brumley"]),
+    ("Diana Maimut", &["diana stefania maimut"]),
+    ("Sofía Celi", &[]),
+    ("Elizabeth Quaglia", &[]),
+    ("Adrià Gascón", &[]),
+    ("Kaoutar Elkhiyaoui", &[]),
+    ("Meltem Sönmez Turan", &[]),
+    ("Damian Vizár", &[]),
+    ("Karim Eldefrawy", &[]),
+    ("Farinaz Koushanfar", &[]),
+    ("Michał Zając", &[]),
+    ("María Isabel González Vasco", &["m i gonzalez vasco"]),
+    ("Jacob Schuldt", &[]),
+    ("Simon Blackburn", &[]),
+    ("Victor Wei", &[]),
+    ("Anca Nitulescu", &[]),
+    ("Phong Nguyen", &[]),
+    ("Michele Orrù", &[]),
+    ("Nele Mentens", &["n mentens"]),
+    ("Benoît Gérard", &[]),
+    ("Gareth Davies", &[]),
+    ("Julio López", &[]),
+    ("Alexei Zamyatin", &["a zamyatin"]),
+    ("Alex Grilo", &[]),
+    ("Howon Kim", &[]),
+    ("Rafael Schaefer", &[]),
+    ("Alex Malozemoff", &[]),
+    ("Vlastimil Klima", &[]),
+    ("Özgür Dagdelen", &[]),
+    ("Qun-Xiong Zheng", &[]),
+    ("Hyunjun Kim", &[]),
+    ("Xiangyong Zeng", &[]),
+    ("Mehmet Sabır Kiraz", &["mehmet s kiraz"]),
+    ("Wen-jie Lu", &["w j lu"]),
+    ("Roberto Avanzi", &["r m avanzi", "roberto maria avanzi"]),
+    ("Tore Kasper Frederiksen", &["tore k frederiksen"]),
+    ("John Schanck", &[]),
+    ("Baocang Wang", &[]),
+    ("Mehran Mozaffari Kermani", &[]),
+    ("Johannes Müller", &[]),
+    ("Keith Martin", &["k m martin"]),
+    ("Dipanwita Roy Chowdhury", &[]),
+    ("Yarkın Doröz", &[]),
+    ("Attila Yavuz", &["attila altay yavuz"]),
+    ("Douglas Wikström", &[]),
+    ("Essam Ghadafi", &["e ghadafi"]),
+    ("Kristina Hostáková", &[]),
+    ("Murat Cenk", &[]),
+    ("Rafaël del Pino", &[]),
+    ("Dima Grigoriev", &["d grigoriev"]),
+    ("Enrique Larraia", &["e larraia"]),
+    ("Thomas Roche", &[]),
+    ("José Bacelar Almeida", &[]),
+    ("Wessel van Woerden", &[]),
+    ("William Knottenbelt", &["w j knottenbelt"]),
+    ("Kyoohyung Han", &[]),
+    ("Anamaria Costache", &["a costache"]),
+    ("Xiutao Feng", &[]),
+    ("Sergiu Carpov", &["s carpov"]),
+    ("Evgeny Alekseev", &[]),
+    ("Rémi Géraud-Stewart", &[]),
+    ("Gilles Macario-Rat", &[]),
+    ("Elizabeth Crites", &[]),
+    ("Raymond Zhao", &[]),
+    ("Dung Hoang Duong", &["dung h duong"]),
+    ("Cécile Pierrot", &[]),
+    ("Olivier Rioul", &[]),
+    ("Byeonghak Lee", &[]),
+    ("Katherine Stange", &[]),
+    ("F. Betül Durak", &[]),
+    ("Peter Rønne", &["peter browne ronne"]),
+    ("Colin O'Flynn", &[]),
+    ("Huseyin Hisil", &[]),
+    ("Hyeokdong Kwon", &[]),
+    ("Stefan Kölbl", &[]),
+    ("Srinivas Vivek", &["s vivek"]),
+    ("Ghassan Karame", &[]),
+    ("Jefferson Ricardini", &[]),
+    ("Maura Paterson", &["m b paterson"]),
+    ("Claude Crépeau", &[]),
+    ("Begül Bilgin", &["b bilgin"]),
+    ("Eamonn Postlethwaite", &[]),
+    ("Wen-Feng Qi", &[]),
+    ("Nikolay Kaleyski", &[]),
+    ("Sylvain Duquesne", &["s duqusne"]),
+    ("Pantelimon Stanica", &[]),
+    ("Jason LeGrow", &[]),
+    ("Hilder Pereira", &[]),
+    ("Elisa Gorla", &["e gorla"]),
+    ("Rahul Sharma", &["r sharma"]),
+    ("Rajat Subhra Chakraborty", &[]),
+    ("Yvo Desmedt", &[]),
+    ("Michiel Van Beirendonck", &[]),
+    ("Yongzhuang Wei", &["y wei"]),
+    ("M. Mirzaee Shamsabad", &[]),
+    ("Jorge Guajardo", &["j guajardo"]),
+    ("István Vajda", &[]),
+    ("Boris Ryabko", &["b ryabko"]),
+    ("Qiaoyan Wen", &[]),
+    ("Myungsun Kim", &[]),
+    ("Éric Brier", &["e brier"]),
+    ("Hoon Wei Lim", &[]),
+    ("Zakaria Najm", &[]),
+    ("Ludo Tolhuizen", &["l tolhuizen"]),
+    ("David Bernhard", &["d bernhard"]),
+    ("Dieter Schmidt", &[]),
+    ("Gregory Bard", &[]),
+    ("Kwok-Yan Lam", &[]),
+    ("Zhaohui Cheng", &["z cheng"]),
+    ("Máire O'Neill", &[]),
+    ("Axel Poschmann", &[]),
+    ("William Buchanan", &[]),
+    ("M. Anwar Hasan", &[]),
+    ("Laurent Imbert", &["l imbert"]),
+    ("Karine Heydemann", &[]),
+    ("Guénaël Renault", &[]),
+    ("Bin Xiao", &[]),
+    ("Quoc-Huy Vu", &[]),
+    ("Jing Xu", &[]),
+    ("Alexander Block", &[]),
+    ("Jorge Chávez-Saab", &[]),
+    ("Marina Krček", &[]),
+    ("Somindu Ramanna", &[]),
+    ("John Mitchell", &["j c mitchell"]),
+    ("Carlos Aguilar-Melchor", &[]),
+    ("Hyang-Sook Lee", &[]),
+    ("Ferucio Laurentiu Tiplea", &[]),
+    ("Phuong Ha Nguyen", &[]),
+    ("Iddo Bentov", &[]),
+    ("Dustin Moody", &["d moody"]),
+    ("Houssem Maghrebi", &[]),
+    ("Rachid El Bansarkhani", &[]),
+    ("Christopher Fletcher", &[]),
+    ("Juan Manuel González Nieto", &["juan m gonzalez nieto"]),
+    ("Loïs Huguenin-Dumittan", &[]),
+    ("Alper Çakan", &[]),
+    ("Andreea Alexandru", &[]),
+    ("Mirosław Kutyłowski", &[]),
+    ("Constantin Cătălin Drăgan", &[]),
+    ("Akın Ünal", &[]),
+    ("Alan Sherman", &[]),
+    ("Ivy Woo", &[]),
+    ("Fang-Wei Fu", &[]),
+    ("Duc Le", &["duc viet le"]),
+    ("Romain Poussier", &[]),
+    ("Benjamin Diamond", &[]),
+    ("Patrick Felke", &["p felke"]),
+    ("Emmanuel Fouotsa", &[]),
+    ("Xuan Wang", &[]),
+    ("Liliya Akhmetzyanova", &[]),
+    ("Stanislav Smyshlyaev", &["s v smyshlyaev"]),
+    ("Estuardo Alpírez Bock", &[]),
+    ("Michaël Peeters", &[]),
+    ("Malika Izabachène", &[]),
+    ("Xiaoyuan Yang", &[]),
+    ("Joseph Silverman", &[]),
+    ("Berry Schoenmakers", &["b schonmakers"]),
+    ("Hannes Groß", &[]),
+    ("Valérie Nachef", &[]),
+    ("Igor Shparlinski", &[]),
+    ("Zhuojun Liu", &[]),
+    ("Jianhua Li", &[]),
+    ("Shin'ichiro Matsuo", &[]),
+    ("Shoichi Hirose", &[]),
+    ("Cristina Pérez-Solà", &[]),
+    ("Sebastian Faller", &[]),
+    ("Tianyu Zheng", &[]),
+    ("Ali Aydın Selçuk", &[]),
+    ("Jean-Christophe Deneuville", &[]),
+    ("Marjan Škrobot", &[]),
+    ("Alexandre Adomnicăi", &[]),
+    ("Shaoquan Jiang", &["s jiang"]),
+    ("Seong Oun Hwang", &[]),
+    ("Jean-François Biasse", &[]),
+    ("Armando Faz-Hernández", &[]),
+    ("Guillermo Pascual-Perez", &[]),
+    ("Karl Wüst", &[]),
+    ("Çetin Kaya Koç", &[]),
+    ("Philippe Maurine", &["p maurine"]),
+    ("Cuauhtemoc Mancillas-López", &[]),
+    ("Anders Dalskov", &[]),
+    ("Bruce Kapron", &[]),
+    ("Urbi Chatterjee", &[]),
+    ("Tao Wang", &[]),
+    ("Poorvi Vora", &[]),
+    ("Adrián Ranea", &[]),
+    ("Alice Silverberg", &["a silverberg"]),
+    ("Cédric Fournet", &[]),
+    ("Jean-Claude Bajard", &["j c bajard"]),
+    ("M. Sadegh Riazi", &[]),
+    ("Peter Montgomery", &["p l montgomery"]),
+    ("Florian Göpfert", &[]),
+    ("Mike Burmester", &["m burmester"]),
+    ("Chanathip Namprempre", &["c namprempre"]),
+    ("Germán Sáez", &[]),
+    ("John Black", &["j black"]),
+    ("Philip MacKenzie", &[]),
     ("Yuval Ishai", &["yual ishai"]),
 ];
 
@@ -773,17 +1038,29 @@ mod tests {
         }
         assert_eq!(canonical("Yael Tauman Kalai"), Some("Yael Kalai"));
         assert_eq!(canonical("Yael Tauman-Kalai"), Some("Yael Kalai"));
-        assert_eq!(canonical("Ron D. Rothblum"), Some("Ron Rothblum"));
         assert_eq!(canonical("N. P.  Smart"), Some("Nigel Smart"));
         // A hyphen splitting a word is why the key ignores word boundaries.
         assert_eq!(canonical("Hwa-Jeong Seo"), Some("Hwajeong Seo"));
         // One typo, on one paper, for a very well-published author.
         assert_eq!(canonical("Yual Ishai"), Some("Yuval Ishai"));
+        // A full middle name has to be listed: the skeleton cannot bridge it, and
+        // no rule may, since `Yu Chen` and `Yu Long Chen` have exactly this shape.
+        assert_eq!(canonical("Peter Browne Rønne"), Some("Peter Rønne"));
+        assert_eq!(canonical("Nigel Paul Smart"), Some("Nigel Smart"));
+        assert_eq!(canonical("Duc Viet Le"), Some("Duc Le"));
+        // Which is why this one is absent: a different person from `Duc V. Le`.
+        assert_eq!(canonical("Duc-Phong Le"), None);
+        // Two Rothblums, one entry each: the pair that showed the 25-paper cut was
+        // too high, and the pair most at risk from a rule that merged by surname.
+        assert_eq!(canonical("Ron D. Rothblum"), Some("Ron Rothblum"));
+        assert_eq!(canonical("Guy N. Rothblum"), Some("Guy Rothblum"));
+        assert_eq!(canonical("Guy Rothblum"), Some("Guy Rothblum"));
         // Different people the table must not swallow.
         assert_eq!(canonical("Kasper Damgård"), None);
-        assert_eq!(canonical("Guy Rothblum"), None);
         assert_eq!(canonical("Yu Long Chen"), None);
         assert_eq!(canonical("Xiao Wang"), None);
+        assert_eq!(canonical("Feng Liu"), None);
+        assert_eq!(canonical("Bo Yang"), None);
     }
 
     #[test]
@@ -892,6 +1169,7 @@ mod tests {
         // taken from the entry itself, so this is really a shape check — no empty
         // entries, no stray that is not a folded name, no duplicate keys.
         let mut seen: HashMap<String, &str> = HashMap::new();
+        let mut claimed: HashMap<&str, &str> = HashMap::new();
         for (rep, strays) in PEOPLE {
             assert!(!rep.trim().is_empty(), "empty representative");
             assert!(
@@ -909,6 +1187,11 @@ mod tests {
                     key,
                     "{stray} needs no entry: the skeleton already reaches {rep}"
                 );
+                // Two entries claiming one stray is a silent overwrite in the map,
+                // so the loser would quietly stop being reachable.
+                if let Some(other) = claimed.insert(*stray, rep) {
+                    panic!("{rep} and {other} both claim the stray {stray}");
+                }
                 assert_eq!(canonical(stray), Some(*rep), "{stray}");
             }
         }
