@@ -8,7 +8,7 @@ local SQLite FTS5 index, so searching is instant and works offline.
 ```
 $ eprint "threshold ecdsa" -n 3
 
-3 of 61 results  in: title, authors, abstract · index 8m old
+3 of 62 results  in: title, authors, abstract · index 8m old
 
   2026/1455    Trout++: Robust Asynchronous Two-Round ECDSA for Arbitrary Thresholds
                Nof, Parker
@@ -22,7 +22,8 @@ $ eprint "threshold ecdsa" -n 3
 
 Results are titles and authors, newest first — the second hit above matches in its abstract
 rather than its title. Add `-a` for full abstracts, `-t` to match titles and authors only, or
-`eprint show <id>` for one paper in full.
+`eprint show <id>` for one paper in full. For reading rather than looking something up, there is a
+full-screen [interactive browser](#interactive-browser).
 
 ### Opening papers
 
@@ -88,6 +89,48 @@ well if you would rather not go through the tool.
 challenge, and its `robots.txt` says *"Full text PDFs are only available under a license specific
 to each paper"* while denying `*pdf` to every agent. Metadata is offered to machines over OAI-PMH;
 full text is not. So your browser does the fetching, and this only files what your browser saved.
+
+## Interactive browser
+
+A full-screen reader for exploring the archive rather than looking one thing up.
+
+<p align="center"><img src="docs/browse.svg" alt="eprint browse: a search for &quot;secret sharing&quot;, with query matches highlighted and a watched paper marked with a gold star" width="100%"></p>
+
+```sh
+eprint browse                      # everything, newest first
+eprint browse "lattice signature"  # start from a query
+eprint browse --author Boudgoust --date 2023..2024
+```
+
+Abstracts expand and collapse in place, matches stay highlighted inside the expanded text, and the
+query can be edited live with `/`. There is no cap on how much it loads — a bare `eprint browse`
+holds all ~26,000 papers and `G` really does reach the oldest one from 1996 — because only the rows
+on screen are ever laid out. `-n` still exists if you want a smaller set.
+
+| Key | Action |
+|---|---|
+| `j` / `k`, arrows | move |
+| `g` / `G`, home / end | first / last |
+| `ctrl-d` / `ctrl-u`, page keys | jump |
+| `space` / `tab` | expand or collapse the abstract |
+| `a` | expand or collapse everything |
+| `t` | toggle where the query is matched: `in: title, authors, abstract` ⇄ `in: title, authors` |
+| `d` | filter by date — same grammar as `--date`; empty clears it |
+| `w` | show only papers matching a watch — searches apply within that subset |
+| `/` | edit the query — results filter live as you type |
+| `ctrl-u` | clear the query (while editing) |
+| `enter` / `o` | open the PDF — your local copy once you have one |
+| `y` | copy the URL to the clipboard |
+| `b` | copy the CryptoBib citation key (published version when known) |
+| `B` | copy the full BibTeX record |
+| `q` / `esc` / `ctrl-c` | quit |
+
+`/` refines the current query rather than replacing it, so you can narrow a search by
+typing more terms; `ctrl-u` clears it to start fresh. Expansion is tracked per paper id, so
+it survives re-searching.
+
+Because nothing needs to be clicked, `browse` works identically on terminals without OSC 8
+support — press `enter` instead.
 
 ## Install
 
@@ -189,46 +232,7 @@ A query is just the first argument, so `eprint search <query>` and `eprint <quer
 thing; `search` is kept for the fingers that expect it. `new` and `Bib` are not — those words are
 now ordinary query terms.
 
-## Interactive browser
-
-```sh
-eprint browse                      # everything, newest first
-eprint browse "lattice signature"  # start from a query
-eprint browse --author Boudgoust --date 2023..2024
-```
-
-A full-screen browser for exploring rather than looking something up. Abstracts expand and
-collapse in place, and matches stay highlighted inside the expanded text. There is no cap on how
-much it loads — a bare `eprint browse` holds all ~26,000 papers and `G` really does reach the
-oldest one from 1996 — because only the rows on screen are ever laid out. `-n` still exists if you
-want a smaller set.
-
-| Key | Action |
-|---|---|
-| `j` / `k`, arrows | move |
-| `g` / `G`, home / end | first / last |
-| `ctrl-d` / `ctrl-u`, page keys | jump |
-| `space` / `tab` | expand or collapse the abstract |
-| `a` | expand or collapse everything |
-| `t` | toggle where the query is matched: `in: title, authors, abstract` ⇄ `in: title, authors` |
-| `d` | filter by date — same grammar as `--date`; empty clears it |
-| `w` | show only papers matching a watch — searches apply within that subset |
-| `/` | edit the query — results filter live as you type |
-| `ctrl-u` | clear the query (while editing) |
-| `enter` / `o` | open the PDF — your local copy once you have one |
-| `y` | copy the URL to the clipboard |
-| `b` | copy the CryptoBib citation key (published version when known) |
-| `B` | copy the full BibTeX record |
-| `q` / `esc` / `ctrl-c` | quit |
-
-`/` refines the current query rather than replacing it, so you can narrow a search by
-typing more terms; `ctrl-u` clears it to start fresh. Expansion is tracked per paper id, so
-it survives re-searching.
-
-Because nothing needs to be clicked, `browse` works identically on terminals without OSC 8
-support — press `enter` instead.
-
-### Tab completion (zsh)
+## Tab completion (zsh)
 
 ```sh
 eprint config --completions      # adds one line to ~/.zshrc, then open a new shell
@@ -263,13 +267,13 @@ exact wording, and they are the one filter you cannot guess:
 
 ```
 $ eprint watch add --category <TAB>
-Applications               -- 2024 papers
-Attacks and cryptanalysis  -- 1272 papers
-Cryptographic protocols    -- 6210 papers
-Foundations                -- 3088 papers
-Implementation             -- 2360 papers
-Public-key cryptography    -- 4783 papers
-Secret-key cryptography    -- 2882 papers
+Applications               -- 2030 papers
+Attacks and cryptanalysis  -- 1281 papers
+Cryptographic protocols    -- 6224 papers
+Foundations                -- 3090 papers
+Implementation             -- 2364 papers
+Public-key cryptography    -- 4792 papers
+Secret-key cryptography    -- 2885 papers
 ```
 
 The list is read from your index rather than baked into the binary, so a category the archive adds
@@ -278,7 +282,7 @@ substring works too — `--category proto` is the same filter — and a name wit
 you as you complete it. This works wherever `--category` does: searches, `browse` and `watch add`.
 
 **`--author <TAB>`** completes names out of the index once you have typed a few letters — the full
-list is 21,466 names, so it narrows rather than dumps. Names are offered in both orders, since
+list is 19,540 names, so it narrows rather than dumps. Names are offered in both orders, since
 completion matches on a prefix and you may start from either end:
 
 ```
@@ -309,16 +313,18 @@ by hand. `--scope` and `--theme` complete their values too, and **flag names com
 `--category <value>` and `--category=<value>` are understood.
 
 Completion ignores case everywhere, like the filters themselves: `--author shamir<TAB>` and
-`--category crypto<TAB>` work as well as the capitalised forms, and the name is inserted with the
-archive's own capitalisation.
+`--category crypto<TAB>` work as well as the capitalised forms. Names insert with the archive's own
+capitalisation but without accents, since a shell cannot reach `Damgård` from a typed `damga`; the
+description beside the candidate shows the real spelling when the two differ.
 
 Changing completion means starting a new shell, or `exec zsh` — the function is loaded once when the
 shell starts, so an already-open terminal keeps the version it read at login.
 
-Completion covers your **library**, not the whole archive: a short changing list is what completion
-is good at, and 26,000 candidates would mean megabytes of output on every keypress. `--author` is
-left out for the same reason — 21,466 distinct names is 1.1 MB per keypress. Nothing completes for
-`--date` or watch query terms either, where the candidate set is "anything you might type".
+Paper ids complete from your **library**, not the whole archive: a short changing list is what
+completion is good at, and 26,000 candidates would mean megabytes of output per keypress. `--author`
+is the one target that is *filtered* rather than listed, for the same reason — the full set is 19,540
+names — so it answers once you have typed two letters. Nothing completes for `--date` or for watch
+query terms, where the candidate set is "anything you might type".
 
 Without any shell setup, **`eprint open` with no id lists the same thing**:
 
@@ -400,7 +406,7 @@ marks — the quick check that a new watch matches anything at all:
 
 ```
 $ eprint watch
-  1   lattice OR LWE                               2671 in the index
+  1   lattice OR LWE                               2681 in the index
   2   by Katharina Boudgoust                       18 in the index
   3   zk · in Public-key cryptography              36 in the index
   4   proof of work · titles only                  56 in the index
@@ -425,7 +431,8 @@ where it does that — `ue` only inside a word — because `Yu` and `Yue`, or `X
 different people, and every case that needs the rule (`Gueneysu`, `Kuesters`, `Buenz`, `Mueller`) has
 the digraph mid-word.
 
-Second, a table of about 180 well-published authors, built into the binary, for the rest: a bare
+Second, a table of 428 well-published authors — everyone with ten or more papers whom the archive
+spells more than one way — built into the binary, for the rest: a bare
 initial (`N. P. Smart`, `F. Vercauteren`), a hyphen splitting a given name (`Hwa-Jeong Seo`), a
 middle name that comes and goes (`Yael Tauman Kalai`, `Ron D. Rothblum`), one typo, and one paper
 where the archive put two people in a single author field. Names are written through it as they are
@@ -490,6 +497,10 @@ Values are written the way the tool writes them, and quoting means the same thin
 the command line: bare words are separate terms, `"a b"` is an exact phrase. So
 `watch = lattice OR LWE` is an OR, while `watch = "lattice OR LWE"` would look for that literal
 phrase and match nothing.
+
+An author is saved as a name reads, whichever candidate you picked: completing `Shamir, Adi` stores
+`--author "Adi Shamir"`, and a name the table knows is saved as its usual spelling, so a list of
+two dozen watches does not have one odd entry in it.
 
 So copying `~/.config/eprint/config.toml` to another machine copies your whole setup — theme,
 limits and watches together — and you can add or remove them by hand with `eprint config --edit`
@@ -681,7 +692,7 @@ title and authors only — useful when searching for a person, where abstract ma
 mostly papers *citing* them rather than papers *by* them.
 
 ```sh
-eprint Boudgoust          # 21 hits, three of them papers *citing* her
+eprint Boudgoust          # 22 hits, four of them papers *citing* her
 eprint Boudgoust -t       # 18 — title and authors only
 ```
 
@@ -701,12 +712,16 @@ eprint zk --color | less -R        # force colour through a pager
 
 Searching checks the index age. If it is more than 24 hours old, a background refresh is
 spawned and your search returns immediately against existing data — it never blocks. An
-incremental update takes about 0.1s. Use `--no-update` to suppress it, or `eprint update`
+incremental update takes a second or two. Use `--no-update` to suppress it, or `eprint update`
 to refresh on demand.
 
-Incremental harvests use the server's own `responseDate` as the watermark and re-request a
-two-day overlap window, so records cannot be missed through clock skew. Withdrawn papers
-arrive as OAI-PMH tombstones and are deleted from the index.
+An incremental harvest asks for changes since the earlier of two things: the last harvest, and the
+newest paper actually in your index — less a two-day overlap. Both halves matter. The harvest clock
+alone cannot be trusted, because a refresh that finds nothing still advances it, and once it runs
+ahead of the data every later request starts *after* the papers you are missing; that cost this
+author's own index a week of papers while `status` cheerfully reported a fresh harvest. Bounding the
+window by the newest paper you hold makes the request describe your data instead, so a gap of any
+size closes itself on the next update. Withdrawn papers arrive as OAI-PMH tombstones and are deleted.
 
 ## Scope and licensing
 
@@ -761,6 +776,9 @@ Pass `EPRINT_DB=/tmp/scratch.db` to work against a throwaway index instead of yo
 | `src/tui.rs` | Interactive browser (ratatui) |
 | `src/theme.rs` | Colour palettes shared by both front-ends |
 | `src/config.rs` | Config file reading and writing (settings and watches) |
+| `src/names.rs` | Who an author is: folding, the name table, the one matching predicate |
+| `src/dates.rs` | Civil-date arithmetic, ISO storage, the day-first grammar |
+| `src/completions.rs` | The zsh function, and installing it |
 
 Two independent data sources feed one SQLite database: ePrint's OAI-PMH endpoint supplies
 paper metadata (`papers`, plus an FTS5 index), and CryptoBib supplies citation keys
