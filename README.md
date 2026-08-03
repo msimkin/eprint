@@ -414,59 +414,34 @@ dropped, which is what makes `Ron D. Rothblum` and `Ron Rothblum` one filter rat
 hands `Boudgoust` to the query instead of to `--author` — which is what Tab completion is for
 (below): it fills in the whole name and escapes the space for you.
 
-**One author, however the archive spells them.** The same person is often filed several ways —
-`Ivan Damgård`, `Ivan Damgard` and `Ivan Damgaard` are one researcher, as are `Nico Döttling` and
-`Nico Doettling`. Spellings that differ only by an accent, its written-out form (`ö`/`oe`, `å`/`aa`,
-`ü`/`ue`), punctuation, case or a stray space are treated as one author: a watch on any of them
-finds all of them, and completion offers them as a single candidate with the papers added together.
+**One author, however the archive spells them.** The same person is often filed several ways, and
+the tool settles on one spelling for them everywhere — in a listing, in `show`, as a completion
+candidate and in a watch count.
 
-The rule fires only on evidence — a spelling that actually carries the umlaut is what links the
-other two — so `Yu` and `Yue`, or `Xu` and `Xue`, stay the different people they are. A name is also
-matched **against one author at a time**: `--author "Kasper Damgård"` does not find papers where
-Kasper Larsen and Ivan Damgård happen to be co-authors.
+Two things do that. First, a fold: accents, punctuation, case, stray spaces and the written-out form
+of an accented letter (`ö`/`oe`, `å`/`aa`, `ü`/`ue`) all come to the same thing, so `Damgaard`,
+`Damgard` and `Damgård` are one filter, and so are `Doettling` and `Döttling`. It is careful about
+where it does that — `ue` only inside a word — because `Yu` and `Yue`, or `Xu` and `Xue`, are
+different people, and every case that needs the rule (`Gueneysu`, `Kuesters`, `Buenz`, `Mueller`) has
+the digraph mid-word.
 
-What no rule can know — a typo, a middle name, a bare initial — goes in
-`~/.config/eprint/authors`:
-
-```ini
-Ivan Damgård = Ivan Bjerre Damgård, I. Damgard, Ivan Damgaard
-Yuval Ishai  = Yual Ishai
-
-# and, if the automatic merging ever overreaches, the opposite
-Yu Chen != Yue Chen
-```
-
-You do not have to find those yourself:
-
-```sh
-eprint config --aliases
-```
-
-writes the file with every pair of names that *looks* like one person — a shared surname with an
-abbreviated first name, or one name's words contained in another's — commented out, for you to
-uncomment the ones that are right. Add `--edit` to open it in `$EDITOR` afterwards; plain
-`eprint config --edit` opens the settings file, which is a different one. `eprint config` shows where
-both live. Merging two people is a claim the tool will not make on its own,
-but finding the candidates across 21,466 names is not a reasonable thing to do by hand.
-
-The effect of one line is worth seeing. Before:
-
-```
-Damgard, I.           -- 141 papers
-Damgard, Ivan         -- 139 papers
-Damgaard, Ivan B.     -- 135 papers
-Damgard, Ivan Bjerre  --   5 papers
-Damgard, Kasper       --   1 paper
-```
-
-after uncommenting `Ivan Damgård = Ivan Bjerre Damgård, I. Damgard, Ivan Damgaard`:
+Second, a table of about 180 well-published authors, built into the binary, for the rest: a bare
+initial (`N. P. Smart`, `F. Vercauteren`), a hyphen splitting a given name (`Hwa-Jeong Seo`), a
+middle name that comes and goes (`Yael Tauman Kalai`, `Ron D. Rothblum`), one typo, and one paper
+where the archive put two people in a single author field. Names are written through it as they are
+harvested, so:
 
 ```
 Damgard, Ivan    -- 142 papers
 Damgard, Kasper  --   1 paper
 ```
 
-A line the file cannot read is skipped rather than fatal.
+rather than five entries for Ivan Damgård and one for Kasper. There is deliberately no rule that
+guesses this: expanding `S. Sree Vivek` or `T-H. Hubert Chan` to the archive's commonest name for
+that surname produces a *different person*, so the corrections are hand-checked data rather than a
+heuristic, and an author with one or two papers and an unusual spelling may simply be missed. A name
+is also matched **against one author at a time**: `--author "Kasper Damgård"` does not find papers
+where Kasper Larsen and Ivan Damgård happen to be co-authors.
 
 Adding a watch you already have is not an error; it says so and changes nothing.
 

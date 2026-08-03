@@ -115,10 +115,6 @@ enum Cmd {
         /// Switch on Tab completion by adding one line to your shell's rc file
         #[arg(long)]
         completions: bool,
-        /// Write the author aliases file, with suggestions to uncomment. Add
-        /// `--edit` to open it afterwards
-        #[arg(long)]
-        aliases: bool,
     },
     /// Shell completion, hidden because it is plumbing: `completions zsh` prints
     /// the function to install, `completions ids` prints the candidates it offers.
@@ -291,16 +287,6 @@ impl SearchArgs {
 
 // ---------- minimal civil-time helpers (no chrono dependency) ----------
 
-
-
-
-
-
-
-
-
-
-
 // ---------- index freshness ----------
 
 fn index_age(conn: &rusqlite::Connection) -> Result<Option<i64>> {
@@ -318,7 +304,11 @@ fn spawn_background_refresh(conn: &rusqlite::Connection) -> Result<()> {
     if dates::now() - last_attempt < ATTEMPT_COOLDOWN_SECS as i64 {
         return Ok(());
     }
-    db::meta_set(conn, harvest::KEY_LAST_ATTEMPT, &dates::format_iso(dates::now()))?;
+    db::meta_set(
+        conn,
+        harvest::KEY_LAST_ATTEMPT,
+        &dates::format_iso(dates::now()),
+    )?;
 
     let exe = std::env::current_exe().context("locating own executable")?;
     let _ = std::process::Command::new(exe)
@@ -335,18 +325,26 @@ fn do_update(full: bool, quiet: bool) -> Result<()> {
     let from = if full {
         None
     } else {
-        db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?.and_then(|v| {
-            dates::parse_iso(&v).map(|t| dates::format_iso(t - OVERLAP_SECS as i64))
-        })
+        db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?
+            .and_then(|v| dates::parse_iso(&v).map(|t| dates::format_iso(t - OVERLAP_SECS as i64)))
     };
-    db::meta_set(&conn, harvest::KEY_LAST_ATTEMPT, &dates::format_iso(dates::now()))?;
+    db::meta_set(
+        &conn,
+        harvest::KEY_LAST_ATTEMPT,
+        &dates::format_iso(dates::now()),
+    )?;
     if !quiet {
         match &from {
             Some(f) => eprintln!("Updating index (changes since {})…", &f[..10]),
             None => eprintln!("Harvesting the full archive — this takes a couple of minutes…"),
         }
     }
-    let n = harvest::run(&mut conn, from.as_deref(), quiet, &dates::format_iso(dates::now()))?;
+    let n = harvest::run(
+        &mut conn,
+        from.as_deref(),
+        quiet,
+        &dates::format_iso(dates::now()),
+    )?;
     // New papers invalidate the watch cache. Rebuilding here keeps the cost inside
     // the update — usually the detached background child — rather than surprising
     // whichever command runs next.
@@ -386,7 +384,6 @@ fn effective_scope(title_flag: bool, cli: Option<&str>, cfg: &config::Config) ->
     }
     Scope::from_str(cli.unwrap_or(&cfg.scope))
 }
-
 
 /// Print, or pipe through a pager when the output would not fit on screen.
 /// `less -RFX` keeps colour, exits immediately if the output fits, and leaves
@@ -596,8 +593,6 @@ fn do_forget(ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-
-
 /// Printed on the first open of a paper. Deliberately does *not* ask the user to
 /// navigate anywhere: the browser suggests whatever folder it last used, so the
 /// hint names the places already being watched instead.
@@ -743,7 +738,10 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
         return do_browse(a);
     }
     // Same non-blocking freshness check as `search`.
-    if index_age(&conn)?.map(|s| s as u64 > STALE_SECS).unwrap_or(true) {
+    if index_age(&conn)?
+        .map(|s| s as u64 > STALE_SECS)
+        .unwrap_or(true)
+    {
         let _ = spawn_background_refresh(&conn);
     }
     let (since, before) = dates::date_window(&a.date, &a.since)?;
@@ -752,7 +750,11 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
         year: a.year,
         since,
         before,
-        date_text: a.date.clone().or_else(|| a.since.clone()).unwrap_or_default(),
+        date_text: a
+            .date
+            .clone()
+            .or_else(|| a.since.clone())
+            .unwrap_or_default(),
         author: a.author.clone(),
         category: a.category.clone(),
         // No limit means no limit: laying out only the visible rows made loading
@@ -767,7 +769,15 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
     let scope = effective_scope(a.title, a.scope.as_deref(), &cfg);
     let stale = bib_stale_days(&conn)?;
     let watch_list = watches(&conn);
-    tui::run(conn, a.query.join(" "), filters, theme, scope, stale, watch_list)
+    tui::run(
+        conn,
+        a.query.join(" "),
+        filters,
+        theme,
+        scope,
+        stale,
+        watch_list,
+    )
 }
 
 /// Days since the CryptoBib data was refreshed, but only once that exceeds
@@ -815,7 +825,11 @@ fn do_feed(a: &SearchArgs) -> Result<()> {
         do_update(true, false)?;
         return do_feed(a);
     }
-    if !a.no_update && index_age(&conn)?.map(|s| s as u64 > STALE_SECS).unwrap_or(true) {
+    if !a.no_update
+        && index_age(&conn)?
+            .map(|s| s as u64 > STALE_SECS)
+            .unwrap_or(true)
+    {
         let _ = spawn_background_refresh(&conn);
     }
     drop(conn);
@@ -934,7 +948,11 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
     if fresh_count > 0 {
         db::meta_set(&conn, harvest::KEY_NEW_BATCH, &watermark)?;
     }
-    db::meta_set(&conn, harvest::KEY_LAST_SEEN, &dates::format_iso(dates::now()))?;
+    db::meta_set(
+        &conn,
+        harvest::KEY_LAST_SEEN,
+        &dates::format_iso(dates::now()),
+    )?;
     Ok(())
 }
 
@@ -981,7 +999,9 @@ fn do_watch(action: Option<WatchCmd>) -> Result<()> {
             // Blank means absent: `--author ''` is the user saying nothing, and
             // storing it as an empty filter would save a watch that matches every
             // paper in the archive.
-            let author = author.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let author = author
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             let category = category
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
@@ -1077,7 +1097,9 @@ fn list_watches(conn: &rusqlite::Connection) -> Result<()> {
         let total = counts.get(&w.label()).copied().unwrap_or(0);
         println!("  {:<3} {:<44} {total} in the index", w.id, w.describe());
     }
-    println!("\n  matches are marked ✱ in search, `new` and `browse` · `w` in browse filters to them");
+    println!(
+        "\n  matches are marked ✱ in search, `new` and `browse` · `w` in browse filters to them"
+    );
     if let Some(p) = config::path() {
         // Naming the file is the point of keeping them there: copy it and the
         // whole setup follows.
@@ -1146,7 +1168,9 @@ fn do_bib(id: Option<&str>, update: bool, force: bool, want_entry: bool) -> Resu
                 println!();
             }
             None => {
-                println!("\n  cryptoeprint:{pid}\n  not in CryptoBib; using the archive's own key\n");
+                println!(
+                    "\n  cryptoeprint:{pid}\n  not in CryptoBib; using the archive's own key\n"
+                );
             }
         }
         warn_if_stale(&conn)?;
@@ -1160,11 +1184,10 @@ fn do_bib(id: Option<&str>, update: bool, force: bool, want_entry: bool) -> Resu
         [],
         |r| r.get(0),
     )?;
-    let eprints: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM bib WHERE kind = 'eprint'",
-        [],
-        |r| r.get(0),
-    )?;
+    let eprints: i64 =
+        conn.query_row("SELECT COUNT(*) FROM bib WHERE kind = 'eprint'", [], |r| {
+            r.get(0)
+        })?;
     println!();
     if total == 0 {
         println!("  no CryptoBib data — run `eprint bib --update`");
@@ -1200,8 +1223,7 @@ fn edit_config() -> Result<()> {
     edit_file(&path)
 }
 
-/// Hand a file to the user's editor. Shared by `--edit` and `--aliases --edit`,
-/// which open different files.
+/// Hand a file to the user's editor.
 fn edit_file(path: &std::path::Path) -> Result<()> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -1219,95 +1241,7 @@ fn edit_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-
-
-
-
-
-/// The explanation at the top of a fresh aliases file. A raw string starting at
-/// column zero, because a continued literal indented itself into the output.
-const ALIAS_HEADER: &str = r#"# Author aliases: spellings of one person the tool cannot prove are the same.
-# Accents, punctuation, spacing and the umlaut/digraph pair (ö/oe, å/aa) are
-# handled without being told, so they need no entry here.
-#
-#   Yuval Ishai  = Yual Ishai, Y. Ishai
-#   Yu Chen     != Yue Chen        # never the same person, whatever the rules think
-#
-# The name on the left is the one shown; anything on the right is found by it.
-# Below are the names that look alike. Uncomment the ones that are right.
-
-"#;
-
-/// `config --aliases`: start the author aliases file off with everything the
-/// rules could not decide for themselves.
-///
-/// Suggestions are written commented out. Merging two names is a claim about
-/// people, and the tool has no business making it silently — but it does know
-/// which names look alike, and finding them by hand across 20,000 spellings is
-/// not a reasonable thing to ask.
-fn write_aliases(open_after: bool) -> Result<()> {
-    let path = config::aliases_path().context("could not determine the config directory")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let conn = db::open()?;
-    let suggestions = names::alias_suggestions(&conn)?;
-    // Only what the file does not mention yet, so this can be run again after the
-    // archive grows without disturbing anything already decided.
-    let fresh: Vec<&String> = suggestions
-        .iter()
-        .filter(|s| {
-            let name = s.split(" = ").next().unwrap_or("");
-            !name.is_empty() && !existing.contains(name)
-        })
-        .collect();
-    let mut out = existing.clone();
-    if out.is_empty() {
-        out.push_str(ALIAS_HEADER);
-    } else if !fresh.is_empty() {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str("\n# Further suggestions:\n");
-    }
-    for s in &fresh {
-        out.push_str(&format!("# {s}\n"));
-    }
-    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
-    // Suggestions are only added if the file does not mention that name yet, so a
-    // second run has nothing to add. Saying "0 suggestions written" reads as a
-    // failure; say what is actually there.
-    let active = config::aliases().len();
-    println!();
-    match (fresh.len(), existing.is_empty()) {
-        (0, false) => println!(
-            "  {} already lists every name that looks alike, {} in use — {}",
-            path.display(),
-            active,
-            if active == 0 { "none uncommented yet" } else { "nothing to add" }
-        ),
-        (n, _) => println!(
-            "  {n} suggestion{} written to {}",
-            if n == 1 { "" } else { "s" },
-            path.display()
-        ),
-    }
-    // Naming the command that opens *this* file: `--edit` alone opens the config
-    // file, which is a different file and used to be promised here by mistake.
-    if open_after {
-        println!("  uncomment the ones that are right\n");
-        return edit_file(&path);
-    }
-    println!("  uncomment the ones that are right — `eprint config --aliases --edit` opens it\n");
-    Ok(())
-}
-
-fn do_config(init: bool, edit: bool, completions: bool, aliases: bool) -> Result<()> {
-    if aliases {
-        return write_aliases(edit);
-    }
+fn do_config(init: bool, edit: bool, completions: bool) -> Result<()> {
     if completions {
         return completions::install_completions();
     }
@@ -1355,18 +1289,6 @@ fn do_config(init: bool, edit: bool, completions: bool, aliases: bool) -> Result
             "off  (eprint config --completions)".to_string()
         }
     );
-    match config::aliases_path() {
-        Some(p) if p.exists() => println!(
-            "  author aliases {}  ({} in use)",
-            p.display(),
-            config::aliases().len()
-        ),
-        Some(p) => println!(
-            "  author aliases {}  (not created yet — eprint config --aliases)",
-            p.display()
-        ),
-        None => {}
-    }
     if path.is_some() {
         println!("\n  edit with `eprint config --edit`");
     }
@@ -1404,7 +1326,11 @@ fn do_status() -> Result<()> {
     println!("  papers indexed  {total}");
     println!("  newest entry    {newest}");
     println!("  last harvest    {last}  ({age})");
-    println!("  database        {}  ({:.1} MB)", path.display(), size as f64 / 1e6);
+    println!(
+        "  database        {}  ({:.1} MB)",
+        path.display(),
+        size as f64 / 1e6
+    );
     println!();
     Ok(())
 }
@@ -1463,8 +1389,7 @@ fn real_main() -> Result<()> {
             init,
             edit,
             completions,
-            aliases,
-        }) => do_config(init, edit, completions, aliases),
+        }) => do_config(init, edit, completions),
         Some(Cmd::Show { id }) => {
             let conn = db::open()?;
             let st = Style::detect(StyleOpts {
@@ -1502,7 +1427,9 @@ fn real_main() -> Result<()> {
             // everywhere, including shells with no completion installed.
             None => do_library(),
         },
-        Some(Cmd::Completions { what, needle }) => completions::do_completions(&what, needle.as_deref()),
+        Some(Cmd::Completions { what, needle }) => {
+            completions::do_completions(&what, needle.as_deref())
+        }
     }
 }
 
@@ -1516,7 +1443,10 @@ mod tests {
         // A typo used to default each unreadable component and answer a question
         // nobody asked: "2024-o6-01" quietly became 2024-01-01.
         for bad in ["2024-o6-01", "not-a-date", "2024-xx-yy", "abc-def-ghi"] {
-            assert!(dates::parse_bound(bad, false).is_err(), "{bad} should not parse");
+            assert!(
+                dates::parse_bound(bad, false).is_err(),
+                "{bad} should not parse"
+            );
         }
         // Out-of-range components were already caught; keep them caught.
         assert!(dates::parse_bound("2024-13-01", false).is_err());
@@ -1525,13 +1455,22 @@ mod tests {
 
     #[test]
     fn dates_still_accept_what_they_should() {
-        assert_eq!(dates::parse_bound("2024-06-15", false).unwrap(), "2024-06-15");
-        assert_eq!(dates::parse_bound("28/04/2024", false).unwrap(), "2024-04-28");
+        assert_eq!(
+            dates::parse_bound("2024-06-15", false).unwrap(),
+            "2024-06-15"
+        );
+        assert_eq!(
+            dates::parse_bound("28/04/2024", false).unwrap(),
+            "2024-04-28"
+        );
         assert_eq!(dates::parse_bound("2024", false).unwrap(), "2024-01-01");
         // The upper bound is the day *after* the period: stored dates are
         // timestamps, so an inclusive `<=` would drop the final day.
         assert_eq!(dates::parse_bound("2024", true).unwrap(), "2025-01-01");
-        assert_eq!(dates::parse_bound("28/04/2024", true).unwrap(), "2024-04-29");
+        assert_eq!(
+            dates::parse_bound("28/04/2024", true).unwrap(),
+            "2024-04-29"
+        );
         assert_eq!(dates::parse_bound("02/2024", true).unwrap(), "2024-03-01");
     }
 
@@ -1552,7 +1491,14 @@ mod tests {
             assert!(valid_id(good), "{good} should be an id");
         }
         // "2026/1523extra" was handed to the browser as a URL.
-        for bad in ["2026/1523extra", "abc", "2026/", "/1523", "26/15", "2026-1539"] {
+        for bad in [
+            "2026/1523extra",
+            "abc",
+            "2026/",
+            "/1523",
+            "26/15",
+            "2026-1539",
+        ] {
             assert!(!valid_id(bad), "{bad} should not be an id");
         }
     }

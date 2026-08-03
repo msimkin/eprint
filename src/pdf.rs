@@ -222,10 +222,7 @@ pub fn slug_words(path: &Path) -> String {
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return String::new();
     };
-    stem.splitn(3, '-')
-        .nth(2)
-        .unwrap_or("")
-        .replace('-', " ")
+    stem.splitn(3, '-').nth(2).unwrap_or("").replace('-', " ")
 }
 
 /// True when the filename names a *different* year than the one being asked for,

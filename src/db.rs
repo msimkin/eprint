@@ -59,7 +59,7 @@ impl Scope {
 fn scoped(expr: &str, scope: Scope) -> String {
     match scope {
         Scope::All => expr.to_string(),
-        Scope::Title => format!("{{title authors}} : ({expr})"),
+        Scope::Title => format!("{{title authors_fold}} : ({expr})"),
     }
 }
 
@@ -71,13 +71,14 @@ const WATCH_MATCH_CAP: usize = 50_000;
 /// it saw. Stored verbatim rather than hashed — a few hundred bytes, and a stale
 /// cache should be diagnosable by reading `meta`.
 const KEY_CACHE_FOR: &str = "watch_cache_for";
-/// What the cached `author_class` was built from: the harvest, and the aliases
-/// file verbatim. Both change what "the same author" means.
-pub(crate) const KEY_NAMES_FOR: &str = "author_class_for";
+/// Which revision of `names::PEOPLE` the stored bylines were written with. Author
+/// names are canonicalised on the way in, so an existing index needs one pass when
+/// the table changes.
+const KEY_NAMES_FOR: &str = "author_names_for";
 
-/// Bumped when matching changes, so every cache rebuilds once. v4 records which
-/// watch matched each paper; v3 and earlier stored ids alone.
-pub(crate) const CACHE_VERSION: &str = "v4";
+/// Bumped when matching changes, so every cache rebuilds once. v5 canonicalises
+/// author names in `papers`; v4 recorded which watch matched each paper.
+pub(crate) const CACHE_VERSION: &str = "v5";
 const KEY_CACHE_HARVEST: &str = "watch_cache_harvest";
 
 pub const MARK_START: char = '\x01';
@@ -121,11 +122,34 @@ pub fn open() -> Result<Connection> {
         },
     )?;
     init(&conn)?;
-    // Rebuilt here only when the archive or the aliases file has moved; otherwise
-    // this is one small query.
-    crate::names::load(&conn);
     Ok(conn)
 }
+
+/// The FTS index and the triggers that keep it in step. Its own constant because
+/// `migrate` has to recreate it: an FTS5 column list cannot be altered, so moving
+/// author search onto `authors_fold` means dropping and rebuilding the table, and
+/// one definition is the only way the two cannot drift.
+const FTS_SCHEMA: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
+  title, authors_fold, abstract, category,
+  content='papers', content_rowid='rowid', tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
+  INSERT INTO papers_fts(rowid, title, authors_fold, abstract, category)
+  VALUES (new.rowid, new.title, new.authors_fold, new.abstract, new.category);
+END;
+CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors_fold, abstract, category)
+  VALUES ('delete', old.rowid, old.title, old.authors_fold, old.abstract, old.category);
+END;
+CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors_fold, abstract, category)
+  VALUES ('delete', old.rowid, old.title, old.authors_fold, old.abstract, old.category);
+  INSERT INTO papers_fts(rowid, title, authors_fold, abstract, category)
+  VALUES (new.rowid, new.title, new.authors_fold, new.abstract, new.category);
+END;
+"#;
 
 fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -134,6 +158,13 @@ CREATE TABLE IF NOT EXISTS papers (
   id       TEXT PRIMARY KEY,
   title    TEXT NOT NULL DEFAULT '',
   authors  TEXT NOT NULL DEFAULT '',
+  -- What FTS5 indexes for author search. `fold_name` of `authors`, written by
+  -- `upsert`: the tokenizer folds diacritics but not `ø`, `ß` or `đ`, which are
+  -- letters rather than accents, so a prefix query built from a folded needle
+  -- could never reach `Rønne` while the index held the raw spelling. Indexing what
+  -- the matcher compares makes `author_probe` exact instead of a guess at which
+  -- spellings might be in there.
+  authors_fold TEXT NOT NULL DEFAULT '',
   abstract TEXT NOT NULL DEFAULT '',
   category TEXT NOT NULL DEFAULT '',
   date     TEXT NOT NULL DEFAULT '',
@@ -148,26 +179,6 @@ CREATE INDEX IF NOT EXISTS papers_date_idx ON papers(date);
 -- every paper plus a temp B-tree, which was 44ms of a 50ms `eprint`.
 -- `added` is created in `migrate`, after the column exists.
 CREATE INDEX IF NOT EXISTS papers_category_idx ON papers(category);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
-  title, authors, abstract, category,
-  content='papers', content_rowid='rowid', tokenize='porter unicode61'
-);
-
-CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
-  INSERT INTO papers_fts(rowid, title, authors, abstract, category)
-  VALUES (new.rowid, new.title, new.authors, new.abstract, new.category);
-END;
-CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
-  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, category)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.category);
-END;
-CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
-  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, category)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.category);
-  INSERT INTO papers_fts(rowid, title, authors, abstract, category)
-  VALUES (new.rowid, new.title, new.authors, new.abstract, new.category);
-END;
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 
@@ -201,16 +212,10 @@ CREATE TABLE IF NOT EXISTS watch_hits (
 );
 -- Its index is created in `migrate`, which runs after the old one-column shape
 -- has been dropped — there is no `label` to index until then.
-
--- Which spellings of an author name are the same person. Derived: the rules in
--- `build_author_classes` plus whatever the aliases file adds or vetoes, rebuilt
--- when either the archive or that file moves.
-CREATE TABLE IF NOT EXISTS author_class (
-  name      TEXT PRIMARY KEY,
-  canonical TEXT NOT NULL
-);
 "#,
     )?;
+    // After the tables it indexes and the triggers reference.
+    conn.execute_batch(FTS_SCHEMA)?;
     migrate(conn)?;
     Ok(())
 }
@@ -252,9 +257,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE INDEX IF NOT EXISTS papers_added_idx ON papers(added);")?;
     // Deleting or counting one watch's rows has to be cheap: that is what makes
     // adding and removing a watch incremental rather than a rebuild.
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS watch_hits_label_idx ON watch_hits(label);",
-    )?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS watch_hits_label_idx ON watch_hits(label);")?;
     let has_entry: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('bib') WHERE name = 'entry'",
         [],
@@ -263,7 +266,118 @@ fn migrate(conn: &Connection) -> Result<()> {
     if has_entry == 0 {
         conn.execute_batch("ALTER TABLE bib ADD COLUMN entry TEXT NOT NULL DEFAULT '';")?;
     }
+    // Author equivalence used to be computed and cached; it is a table in `names`
+    // now, applied to the stored byline instead.
+    conn.execute_batch("DROP TABLE IF EXISTS author_class;")?;
+    fold_authors_for_fts(conn)?;
+    canonicalise_authors(conn)?;
     Ok(())
+}
+
+/// Move author search onto `papers.authors_fold`, for an index whose `papers_fts`
+/// was declared over the raw `authors` column.
+///
+/// The declaration cannot be altered, so the FTS table is dropped and rebuilt. The
+/// triggers go first and the backfill happens while they are gone: leaving them in
+/// place would reindex all 26,000 rows one at a time on the way past.
+fn fold_authors_for_fts(conn: &Connection) -> Result<()> {
+    let folded_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('papers') WHERE name = 'authors_fold'",
+        [],
+        |r| r.get(0),
+    )?;
+    let folded_index: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('papers_fts') WHERE name = 'authors_fold'",
+        [],
+        |r| r.get(0),
+    )?;
+    if folded_column == 1 && folded_index == 1 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS papers_ai;
+         DROP TRIGGER IF EXISTS papers_ad;
+         DROP TRIGGER IF EXISTS papers_au;
+         DROP TABLE IF EXISTS papers_fts;",
+    )?;
+    if folded_column == 0 {
+        conn.execute_batch("ALTER TABLE papers ADD COLUMN authors_fold TEXT NOT NULL DEFAULT '';")?;
+    }
+    let mut rows: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, authors FROM papers")?;
+        let found = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in found {
+            rows.push(row?);
+        }
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let written = (|| -> Result<()> {
+        {
+            let mut stmt = conn.prepare("UPDATE papers SET authors_fold = ?2 WHERE id = ?1")?;
+            for (id, authors) in &rows {
+                stmt.execute(rusqlite::params![id, crate::names::fold_name(authors)])?;
+            }
+        }
+        Ok(())
+    })();
+    conn.execute_batch(if written.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    })?;
+    written?;
+    conn.execute_batch(FTS_SCHEMA)?;
+    conn.execute_batch("INSERT INTO papers_fts(papers_fts) VALUES('rebuild');")?;
+    Ok(())
+}
+
+/// Rewrite stored bylines through `names::canonical_byline`, once per revision of
+/// the name table.
+///
+/// `harvest` does this on the way in, so this exists for an index that already
+/// exists — and for the next time the table gains an entry. About 600 rows move on
+/// a full index; the whole pass is one transaction, which is what makes it cheap
+/// (the same updates committed one at a time are two orders of magnitude slower,
+/// because each one reindexes the row for FTS and fsyncs).
+fn canonicalise_authors(conn: &Connection) -> Result<()> {
+    let fingerprint = format!("{CACHE_VERSION} {}", crate::names::table_fingerprint());
+    if meta_get(conn, KEY_NAMES_FOR)?.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
+    let mut fixes: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, authors FROM papers")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, authors) = row?;
+            let canonical = crate::names::canonical_byline(&authors);
+            if canonical != authors {
+                fixes.push((id, canonical));
+            }
+        }
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let written = (|| -> Result<()> {
+        {
+            // Both columns, always: `authors_fold` is what FTS5 indexes, so leaving
+            // it behind would file `I. Damgard`'s paper under the old spelling and
+            // the probe would never reach it.
+            let mut stmt =
+                conn.prepare("UPDATE papers SET authors = ?2, authors_fold = ?3 WHERE id = ?1")?;
+            for (id, authors) in &fixes {
+                stmt.execute([id, authors, &crate::names::fold_name(authors)])?;
+            }
+        }
+        meta_set(conn, KEY_NAMES_FOR, &fingerprint)?;
+        Ok(())
+    })();
+    conn.execute_batch(if written.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    })?;
+    written
 }
 
 pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -429,16 +543,18 @@ pub fn count(conn: &Connection) -> Result<i64> {
 /// `now` is stored as the first-seen timestamp; an update leaves it untouched.
 pub fn upsert(conn: &Connection, p: &Paper, now: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO papers (id,title,authors,abstract,category,date,year,rights,url,added)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+        "INSERT INTO papers (id,title,authors,authors_fold,abstract,category,date,year,rights,url,added)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          ON CONFLICT(id) DO UPDATE SET
-           title=excluded.title, authors=excluded.authors, abstract=excluded.abstract,
+           title=excluded.title, authors=excluded.authors,
+           authors_fold=excluded.authors_fold, abstract=excluded.abstract,
            category=excluded.category, date=excluded.date, year=excluded.year,
            rights=excluded.rights, url=excluded.url",
         rusqlite::params![
             p.id,
             p.title,
             p.authors,
+            crate::names::fold_name(&p.authors),
             p.abstract_,
             p.category,
             p.date,
@@ -746,22 +862,20 @@ fn sync_watch_cache(conn: &Connection, watches: &[Watch]) -> Result<()> {
         meta_set(conn, KEY_CACHE_HARVEST, &harvest)?;
         Ok(())
     })();
-    conn.execute_batch(if written.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    conn.execute_batch(if written.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    })?;
     written
 }
 
 /// The labels the cache covers, behind a version tag. Bumping the tag invalidates
-/// every cache, which is what a change to *how* matching works requires.
-fn watch_fingerprint(conn: &Connection, watches: &[Watch]) -> String {
-    // The author classes are part of what a watch *means*: if `Damgård` starts
-    // matching `Damgaard`, the cached rows for that watch are wrong. This used to
-    // fold in the *number* of classes, so swapping one alias for another left the
-    // badges stale while searches moved — 278 against 191 for the same watch.
-    let classes = meta_get(conn, KEY_NAMES_FOR)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    std::iter::once(format!("{CACHE_VERSION}\n{classes}"))
+/// every cache, which is what a change to *how* matching works requires — and
+/// canonicalising author names is such a change, so `CACHE_VERSION` moves with the
+/// name table.
+fn watch_fingerprint(_conn: &Connection, watches: &[Watch]) -> String {
+    std::iter::once(CACHE_VERSION.to_string())
         .chain(watches.iter().map(|w| w.label()))
         .collect::<Vec<_>>()
         .join("\n")
@@ -976,7 +1090,9 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
     // Error code 1" at the user. Checking the quoted tokens rather than the whole
     // expression matters: under `--scope title` the wrapper makes even an empty
     // query non-empty.
-    if quote_terms(q.terms, q.prefix).trim().is_empty() && run_search(conn, q, &primary_expr(q)).is_err() {
+    if quote_terms(q.terms, q.prefix).trim().is_empty()
+        && run_search(conn, q, &primary_expr(q)).is_err()
+    {
         bail!("could not parse query: {}", q.terms);
     }
     two_shot(q, |expr| run_search(conn, q, expr))
@@ -1010,7 +1126,7 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     // of a single author's name, in any order. See that module for why it is per
     // author rather than per byline.
     if let Some(a) = &q.author {
-        let folded = crate::names::fold_name(a);
+        let folded = crate::names::fold_needle(a);
         args.push(Box::new(folded));
         sql.push_str(&format!(" AND author_match(p.authors, ?{})", args.len()));
     }
@@ -1142,6 +1258,9 @@ mod tests {
             "zk --author \"Adi Shamir\" --category Foundations --title"
         );
         // Display is a sentence and deliberately does not round-trip.
-        assert_eq!(w.describe(), "zk · by Adi Shamir · in Foundations · titles only");
+        assert_eq!(
+            w.describe(),
+            "zk · by Adi Shamir · in Foundations · titles only"
+        );
     }
 }

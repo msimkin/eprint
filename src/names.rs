@@ -1,55 +1,337 @@
 //! Who an author is: the several ways the archive spells one person.
 //!
-//! Four pieces, each with one job, and the boundary exists because this is the
-//! part that churned hardest — resist adding a fifth.
+//! Three pieces, each with one job, and the boundary exists because this is the
+//! part that churned hardest — resist adding a fourth.
 //!
-//! 1. [`fold_name`] flattens case, punctuation, repeated spaces and accents.
-//! 2. [`expand_name`] writes an umlaut out as its digraph, so `Müller` links both
-//!    `Muller` and `Mueller`. Only a name that carries the umlaut can link them,
-//!    which is why `Yu` and `Yue` stay apart.
-//! 3. The aliases file (`config::aliases`) says what no rule can derive, and wins.
-//! 4. [`author_match`] is the one predicate every caller shares — searching,
+//! 1. [`fold_name`] flattens case, punctuation, repeated spaces, accents, and the
+//!    digraph spellings of an accented letter (`Damgaard` ≡ `Damgård`).
+//! 2. [`PEOPLE`] is a hand-checked table: one spelling per well-published author,
+//!    written wherever the archive is inconsistent, plus the strays no rule can
+//!    reach. It is data, not a heuristic — see the comment above it.
+//! 3. [`author_match`] is the one predicate every caller shares — searching,
 //!    badging, watch counts and completion — so they cannot disagree about who
 //!    someone is. It matches **one author at a time**.
 
-use crate::db::{meta_get, meta_set, Connection, CACHE_VERSION, KEY_NAMES_FOR};
+use crate::db::Connection;
+use anyhow::Result;
+use std::collections::HashMap;
 
-/// Every author spelling to the one that stands for the person, and the same
-/// thing pre-folded for [`author_match`], which runs per row of a query and
-/// cannot afford to invert a map. Loaded once per process by `db::open`: SQL is
-/// built without a `Connection` in hand, and `Watch::query()` has none either.
-static CLASSES: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
-static SPELLINGS: std::sync::OnceLock<HashMap<String, Vec<String>>> = std::sync::OnceLock::new();
+/// The spelling to show for one person, and the strays it cannot reach on its own.
+///
+/// A stored name is rewritten to the representative when the two have the same
+/// *skeleton* — folded, single-letter words dropped, spaces removed — which covers
+/// middle initials, hyphenation, spacing, case, accents and digraphs. Anything
+/// else has to be listed as a stray, and a stray is a folded name.
+///
+/// **Curated on purpose.** Every rule that guesses this from the data was measured
+/// and is wrong: expanding a leading initial to the archive's own dominant full
+/// name for the surname turns `S. Sree Vivek` into *Srinivas* Vivek and `T-H.
+/// Hubert Chan` into *Tony* Chan, two different people, and `M. Barbosa` into
+/// "Manul" — the archive's own typo. Grouping by surname plus a prefix-related
+/// first name merges `Xiaoyun Wang` with `Xiao Wang` and `Yu Chen` with fifteen
+/// other Chens. The skeleton rule above is the one comparison that survived every
+/// such test, and it cannot bridge an initial, so initials are listed here.
+///
+/// Selected as: every author with 25 or more papers whom the archive spells more
+/// than one way. The representative is the commonest spelling with its middle
+/// initials dropped, preferring a well-used variant that carries the author's real
+/// accents. `Ivan Damgaard` is deliberately the ASCII spelling; every other entry
+/// keeps its accents.
+static PEOPLE: &[(&str, &[&str])] = &[
+    ("Brent Waters", &[]),
+    ("Ivan Damgaard", &["i damgard", "ivan bjerre damgard"]),
+    ("Mihir Bellare", &["m bellare"]),
+    ("Debdeep Mukhopadhyay", &[]),
+    ("François-Xavier Standaert", &["f x standaert"]),
+    ("Palash Sarkar", &[]),
+    ("Bart Preneel", &["b preneel"]),
+    ("Dan Boneh", &["d boneh"]),
+    ("Hwajeong Seo", &[]),
+    ("Mridul Nandi", &["m nandi"]),
+    ("Amir Moradi", &[]),
+    ("Daniel Bernstein", &[]),
+    ("Jung Hee Cheon", &[]),
+    ("Xiaoyun Wang", &[]),
+    ("Ingrid Verbauwhede", &["i verbauwhede"]),
+    ("David Naccache", &["d naccache"]),
+    ("Yehuda Lindell", &["y lindell"]),
+    ("Kenneth Paterson", &["k g paterson"]),
+    ("Jesper Buus Nielsen", &["jesper b nielsen"]),
+    ("Nigel Smart", &["n p smart", "n smart"]),
+    ("David Pointcheval", &["d pointcheval"]),
+    ("Qiang Tang", &[]),
+    ("Shivam Bhasin", &[]),
+    ("Jintai Ding", &[]),
+    ("Nico Döttling", &[]),
+    ("Kristin Lauter", &[]),
+    ("Claude Carlet", &["c carlet"]),
+    ("Dario Fiore", &["d fiore"]),
+    ("Tim Güneysu", &[]),
+    ("C. Pandu Rangan", &[]),
+    ("Gregor Leander", &["g leander"]),
+    ("David Wu", &[]),
+    ("Marc Fischlin", &["m fischlin"]),
+    ("Martin Albrecht", &["m r albrecht"]),
+    ("Peter Scholl", &["p scholl"]),
+    ("Sylvain Guilley", &[]),
+    ("Steven Galbraith", &["s d galbraith"]),
+    ("Frederik Vercauteren", &["f vercauteren"]),
+    ("Subhamoy Maitra", &["s maitra"]),
+    ("Dengguo Feng", &[]),
+    ("Sujoy Sinha Roy", &[]),
+    ("Jean-Sébastien Coron", &[]),
+    ("Damien Stehlé", &[]),
+    ("Juan Garay", &[]),
+    ("Man Ho Au", &[]),
+    ("Nir Bitansky", &[]),
+    ("Joseph Liu", &[]),
+    ("Elisabeth Oswald", &["e oswald"]),
+    ("Manoj Prabhakaran", &[]),
+    ("Georg Fuchsbauer", &["g fuchsbaur"]),
+    ("Bo-Yin Yang", &[]),
+    ("Joppe Bos", &[]),
+    ("Lejla Batina", &["l batina"]),
+    ("Ralf Küsters", &[]),
+    ("Victor Shoup", &["v shoup"]),
+    ("Léo Ducas", &[]),
+    ("Yael Kalai", &["yael tauman kalai"]),
+    ("Dominique Schröder", &[]),
+    ("Hong-Sheng Zhou", &[]),
+    ("Rosario Gennaro", &["r gennaro"]),
+    ("Diego Aranha", &[]),
+    ("Francisco Rodríguez-Henríquez", &[]),
+    ("Matthew Green", &[]),
+    ("Vincent Rijmen", &["v rijmen"]),
+    ("María Naya-Plasencia", &[]),
+    ("Jörn Müller-Quade", &[]),
+    ("Michael Scott", &["m scott"]),
+    ("Manuel Barbosa", &["m barbosa"]),
+    ("Svetla Nikova", &["s nikova"]),
+    ("Tal Malkin", &[]),
+    ("Benny Pinkas", &["b pinkas"]),
+    ("Markku-Juhani Saarinen", &[]),
+    ("Russell Lai", &[]),
+    ("Gaëtan Leurent", &[]),
+    ("Cas Cremers", &[]),
+    ("Ron Rothblum", &[]),
+    ("Yunlei Zhao", &[]),
+    ("Charanjit Jutla", &[]),
+    ("Juliane Krämer", &[]),
+    ("Paulo Barreto", &["p s l m barreto"]),
+    ("Fabrice Benhamouda", &[]),
+    ("Fan Zhang", &[]),
+    ("Jacques Patarin", &[]),
+    ("Benoît Libert", &[]),
+    ("Alexander May", &["a may"]),
+    ("Léo Perrin", &[]),
+    ("Alptekin Küpçü", &[]),
+    ("Zhenfeng Zhang", &[]),
+    ("Nicolas Courtois", &[]),
+    ("Daniel Brown", &[]),
+    ("Douglas Stinson", &["d r stinson"]),
+    ("Duncan Wong", &[]),
+    ("Zhenfei Zhang", &[]),
+    ("Bogdan Warinschi", &["b warinschi"]),
+    ("Alfred Menezes", &[]),
+    ("Ahmad-Reza Sadeghi", &[]),
+    ("Sherman Chow", &[]),
+    ("S. Sharmila Deva Selvi", &[]),
+    ("Chang-An Zhao", &[]),
+    ("Nektarios Georgios Tsoutsos", &["nektarios g tsoutsos"]),
+    ("Oğuz Yayla", &[]),
+    ("Siu-Ming Yiu", &["s m yiu"]),
+    ("Giuseppe Persiano", &["g persiano"]),
+    ("André Schrottenloher", &[]),
+    ("Duong Hieu Phan", &[]),
+    ("Angshuman Karmakar", &[]),
+    ("Martijn Stam", &["m stam"]),
+    ("Reihaneh Safavi-Naini", &["r safavi naini"]),
+    ("Sihem Mesnager", &[]),
+    ("Tancrède Lepoint", &[]),
+    ("Christof Paar", &[]),
+    ("Foteini Baldimtsi", &["f baldimtsi"]),
+    ("Olivier Pereira", &["o pereira"]),
+    ("Adam O'Neill", &[]),
+    ("Phillip Rogaway", &["p rogaway"]),
+    ("Srdjan Capkun", &[]),
+    ("Pedro Moreno-Sanchez", &[]),
+    ("Onur Günlü", &[]),
+    ("Sri Aravinda Krishnan Thyagarajan", &[]),
+    ("Joël Alwen", &[]),
+    ("Benjamin Smith", &["b smith"]),
+    ("Benedikt Bünz", &[]),
+    ("Peter Gaži", &[]),
+    ("Chris Brzuska", &["c brzuska"]),
+    ("Benjamin Grégoire", &[]),
+    ("Wouter Castryck", &["w castryck"]),
+    ("Wenling Wu", &[]),
+    ("Jean-Pierre Seifert", &["j p seifert"]),
+    ("Céline Chevalier", &[]),
+    ("Hemanta Maji", &[]),
+    ("Emmanuel Prouff", &[]),
+    ("Behzad Abdolmaleki", &["b abdolmaleki"]),
+    ("Tim Beyne", &[]),
+    ("Muhammed Esgin", &[]),
+    ("S. Sree Vivek", &[]),
+    ("Pooya Farshim", &["p farshim"]),
+    ("Karim Baghery", &["k baghery"]),
+    ("Ben Fisch", &[]),
+    ("Renaud Sirdey", &["r sirdey"]),
+    ("Yongbin Zhou", &[]),
+    ("Masayuki Abe", &[]),
+    ("Philippe Gaborit", &["p gaborit"]),
+    ("Jean-Luc Danger", &[]),
+    ("Daniel Smith-Tone", &[]),
+    ("T-H. Hubert Chan", &[]),
+    ("Erkay Savaş", &[]),
+    ("Hyunji Kim", &[]),
+    ("Ventzislav Nikov", &["v nikov"]),
+    ("Marcel Keller", &["m keller"]),
+    ("Vasyl Ustimenko", &["v ustimenko"]),
+    ("Nadia Heninger", &["n heninger"]),
+    ("Emil Simion", &[]),
+    ("Björn Tackmann", &[]),
+    ("Sonia Belaïd", &[]),
+    ("Robert Deng", &[]),
+    ("Håvard Raddum", &[]),
+    ("Mohammad Reza Aref", &[]),
+    ("Thorsten Kleinjung", &["t kleinjung"]),
+    ("Jihye Kim", &[]),
+    ("Alain Passelègue", &[]),
+    ("Oriol Farràs", &[]),
+    ("Danilo Gligoroski", &["d gligoroski"]),
+    ("S. Dov Gordon", &[]),
+    ("Salil Vadhan", &[]),
+    ("Oded Goldreich", &["o goldreich"]),
+    ("Jérémy Jean", &[]),
+    ("Gyeongju Song", &[]),
+    ("Michael Klooß", &[]),
+    ("Jan-Pieter D'Anvers", &[]),
+    ("Sébastien Canard", &[]),
+    ("Boris Skoric", &["b skoric"]),
+    ("Keting Jia", &[]),
+    ("Anderson Nascimento", &[]),
+    ("Jean-Charles Faugère", &[]),
+    ("Ivica Nikolić", &[]),
+    ("Masao Kasahara", &[]),
+    ("Sugata Gangopadhyay", &["s gangopadhyay"]),
+    ("Thomas Shrimpton", &["t shrimpton"]),
+    ("Mark Tehranipoor", &[]),
+    ("Matthias Kannwischer", &[]),
+    ("Jörg Schwenk", &[]),
+    ("Lilya Budaghyan", &["l budaghyan"]),
+    ("Yuval Ishai", &["yual ishai"]),
+];
 
-/// Fill both maps. Cheap unless the archive or the aliases file has moved, in
-/// which case `author_classes` rebuilds first.
-pub fn load(conn: &Connection) {
-    if CLASSES.get().is_some() {
-        return;
-    }
-    let classes = author_classes(conn).unwrap_or_default();
-    let mut groups: HashMap<&str, Vec<String>> = HashMap::new();
-    for (name, canonical) in &classes {
-        let group = groups.entry(canonical.as_str()).or_default();
-        for n in [name.as_str(), canonical.as_str()] {
-            let folded = fold_name(n);
-            if !group.contains(&folded) {
-                group.push(folded);
+/// One `<dc:creator>` in the archive holds two people. Keyed on the fold, and the
+/// value carries the byline separator, so splitting is just a table entry.
+static MUSHED: &[(&str, &str)] = &[(
+    "vincenzo iovino abhishek jain",
+    "Vincenzo Iovino; Abhishek Jain",
+)];
+
+/// What the stored bylines were written with. An existing index is rewritten once
+/// when this changes, so editing the table above is enough — there is no second
+/// place to remember. FNV-1a, hand-rolled: a hashing crate for six lines would be
+/// a tenth dependency.
+pub fn table_fingerprint() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (rep, strays) in PEOPLE {
+        for bytes in std::iter::once(rep).chain(strays.iter()) {
+            for b in bytes.as_bytes() {
+                h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
             }
         }
     }
-    let mut spellings: HashMap<String, Vec<String>> = HashMap::new();
-    for group in groups.values() {
-        for member in group {
-            spellings.insert(member.clone(), group.clone());
-        }
-    }
-    let _ = SPELLINGS.set(spellings);
-    let _ = CLASSES.set(classes);
+    format!("{h:x}")
 }
 
-use anyhow::Result;
-use std::collections::HashMap;
+/// [`PEOPLE`] indexed for lookup, built once per process.
+struct Table {
+    /// skeleton of the representative -> its index
+    skeletons: HashMap<String, usize>,
+    /// a stray's folded name -> the representative's index
+    strays: HashMap<&'static str, usize>,
+}
+
+fn table() -> &'static Table {
+    static TABLE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut skeletons = HashMap::with_capacity(PEOPLE.len());
+        let mut strays = HashMap::new();
+        for (i, (rep, aliases)) in PEOPLE.iter().enumerate() {
+            skeletons.insert(skeleton(&fold_name(rep)), i);
+            for stray in *aliases {
+                strays.insert(*stray, i);
+            }
+        }
+        Table { skeletons, strays }
+    })
+}
+
+/// A folded name with its single-letter words dropped and its spaces closed up:
+/// `"ivan b. damgård"` -> `"ivandamgard"`.
+///
+/// Word boundaries are deliberately gone. The archive writes one Korean or Chinese
+/// given name three ways — `Hwajeong Seo`, `Hwa-Jeong Seo`, `HwaJeong Seo` — and no
+/// amount of punctuation folding rejoins them. Measured over the whole index, this
+/// key merges 108 groups that word-by-word comparison would not, and every one of
+/// them is the same person.
+fn skeleton(folded: &str) -> String {
+    folded
+        .split_whitespace()
+        .filter(|w| w.chars().count() > 1)
+        .collect()
+}
+
+/// The spelling this tool shows for whoever this name belongs to, if the table
+/// names them.
+pub fn canonical(name: &str) -> Option<&'static str> {
+    let folded = fold_name(name);
+    let t = table();
+    t.strays
+        .get(folded.as_str())
+        .or_else(|| t.skeletons.get(&skeleton(&folded)))
+        .map(|&i| PEOPLE[i].0)
+}
+
+/// A whole byline with every author it recognises rewritten, and its spacing
+/// tidied. What `harvest` stores and what the one-time migration writes, so a
+/// listing, a search, a completion candidate and a watch count all see one
+/// spelling per person.
+pub fn canonical_byline(byline: &str) -> String {
+    let mut out = String::with_capacity(byline.len());
+    for name in byline.split(';') {
+        // The archive's own spacing is not always single: `Ron D.  Rothblum`.
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        let folded = fold_name(&name);
+        match MUSHED.iter().find(|(key, _)| *key == folded) {
+            // Back through this function, so the halves are canonicalised like any
+            // other name rather than trusted to be spelled well in the table.
+            Some((_, split)) => out.push_str(&canonical_byline(split)),
+            None => out.push_str(canonical(&name).unwrap_or(&name)),
+        }
+    }
+    out
+}
+
+/// What a typed `--author` value should be compared as: canonicalised through the
+/// same table, then folded.
+///
+/// Storing the short form would otherwise break the long one — `Yael Kalai` is
+/// what is on file, so `--author "Yael Tauman Kalai"` would find nothing, since
+/// `tauman` begins no word of the stored name. A partial needle (`damg`) matches no
+/// representative and is left exactly as typed, so prefix search and completion are
+/// unaffected.
+pub fn fold_needle(needle: &str) -> String {
+    fold_name(canonical(needle).unwrap_or(needle))
+}
 
 /// Candidates for completing `--author`: names containing `needle`, each offered
 /// both in full and as a bare surname, commonest first.
@@ -62,10 +344,10 @@ use std::collections::HashMap;
 /// The needle is not optional: the whole author list is 21,000 names and over a
 /// megabyte, and narrowing first is what makes this cheap enough for a keypress.
 pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result<Vec<Candidate>> {
-    let needle = fold_name(needle);
+    let needle = fold_needle(needle);
     // One letter cannot narrow 21,466 names, and answering it means scanning most
     // of the archive on a keypress. The shell shows "a few more letters" instead.
-    if needle.len() < 2 {
+    if needle.chars().count() < 2 {
         return Ok(Vec::new());
     }
 
@@ -75,19 +357,15 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
     let (sql, arg) = match author_probe(&needle) {
         Some(probe) => (
             "SELECT p.authors FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
-             WHERE papers_fts MATCH ?1 AND author_match(p.authors, ?2)"
-                .to_string(),
+             WHERE papers_fts MATCH ?1 AND author_match(p.authors, ?2)",
             Some(probe),
         ),
         None => (
-            "SELECT authors FROM papers WHERE author_match(authors, ?1)".to_string(),
+            "SELECT authors FROM papers WHERE author_match(authors, ?1)",
             None,
         ),
     };
-    let mut stmt = conn.prepare(&sql)?;
-    // Folded once, here, and reused for both passes below. Re-folding a byline per
-    // candidate is what made a common needle take minutes: the work was
-    // candidates × bylines × names, and every one of those allocated.
+    let mut stmt = conn.prepare(sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = match &arg {
         Some(probe) => vec![probe, &needle],
         None => vec![&needle],
@@ -106,88 +384,39 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 1).collect();
 
-    // One entry per person, and every spelling of their name the archive uses, so
-    // the one that was typed can be offered back.
-    let mut spellings: HashMap<String, HashMap<String, i64>> = HashMap::new();
-    // Which papers each person appears on, by position in `bylines`. Counting a
-    // candidate is then a union of these rather than another pass over every
-    // byline: at a common surname that pass was 1,400 bylines × 40 candidates.
-    let mut rows: HashMap<String, Vec<u32>> = HashMap::new();
-    for (i, byline) in bylines.iter().enumerate() {
+    // One person, one entry: names are canonical on the way in, so the spelling in
+    // the row *is* the person, and how many papers they have is how many rows they
+    // appear on.
+    let mut papers: HashMap<&str, usize> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for byline in &bylines {
         for name in byline {
             if !name_matches(name, &words) {
                 continue;
             }
-            let person = person_of(name);
-            let seen = rows.entry(person.clone()).or_default();
-            if seen.last() != Some(&(i as u32)) {
-                seen.push(i as u32);
-            }
-            *spellings
-                .entry(person)
-                .or_default()
-                .entry(name.clone())
-                .or_insert(0) += 1;
+            let count = papers.entry(name.as_str()).or_insert_with(|| {
+                order.push(name.as_str());
+                0
+            });
+            *count += 1;
         }
     }
-    // Exact counting below is the expensive pass, so only the candidates that will
-    // survive truncation get one. The tally is the cheap ordering that decides who
-    // those are.
-    let mut people: Vec<String> = spellings.keys().cloned().collect();
-    people.sort_by(|a, b| {
-        rows.get(b)
-            .map(|r| r.len())
-            .cmp(&rows.get(a).map(|r| r.len()))
-            .then_with(|| a.cmp(b))
-    });
-    people.truncate(limit);
+    order.sort_by(|a, b| papers[b].cmp(&papers[a]).then_with(|| a.cmp(b)));
+    order.truncate(limit);
 
     let mut out: Vec<Candidate> = Vec::new();
-    for person in people {
-        // Offer a spelling that can actually be typed: accents removed, and of the
-        // spellings the archive uses, one that contains what was typed. zsh keeps
-        // only candidates starting with the typed text and compares characters, so
-        // an accented candidate is one the shell silently discards.
-        let usable = spellings
-            .get(&person)
-            .filter(|_| true)
-            .and_then(|s| {
-                s.iter()
-                    .filter(|(n, _)| fold_name(&deaccent(n)).contains(&needle))
-                    .max_by_key(|(n, c)| (**c, std::cmp::Reverse((*n).clone())))
-                    .map(|(n, _)| n.clone())
-            })
-            .unwrap_or_else(|| person.clone());
-        let value = deaccent(&usable);
-        // The number is what picking this candidate actually returns — counted
-        // with the same predicate the filter uses, over the papers already in
-        // hand. Counting the person's class instead would under-report: choosing
-        // `Ivan Damgard` also finds `Ivan Bjerre Damgård`.
-        let folded_value = fold_name(&value);
-        let candidate_words: Vec<&str> = folded_value
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .collect();
-        // Every person this candidate would also find — `Ivan Damgard` finds
-        // `Ivan Bjerre Damgård` as well — and the papers are their rows, unioned.
-        let mut papers: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for (other, spelled) in &spellings {
-            if spelled
-                .keys()
-                .any(|n| name_matches(n, &candidate_words))
-            {
-                if let Some(idx) = rows.get(other) {
-                    papers.extend(idx.iter().copied());
-                }
-            }
-        }
-        let count = papers.len() as i64;
-        // Name the person when the offered spelling is not how they are usually
-        // written, so it is clear what the watch will actually follow.
-        let person = if fold_name(&person) == folded_value {
+    for name in order {
+        // Offer a spelling that can actually be typed: zsh keeps only candidates
+        // starting with the typed text and compares characters, so an accented
+        // candidate is one the shell silently discards.
+        let value = deaccent(name);
+        let count = papers[name] as i64;
+        // Name the person when the offered spelling is not how they are written, so
+        // a deaccented candidate still says whose papers it will find.
+        let person = if value == name {
             String::new()
         } else {
-            person.clone()
+            name.to_string()
         };
         if let Some((surname, rest)) = split_surname(&value) {
             out.push(Candidate {
@@ -218,102 +447,6 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
     Ok(out)
 }
 
-/// Names that look like one person but cannot be proven to be, as
-/// `canonical = other, other` lines for the aliases file.
-///
-/// Suggestions only — the rules merge what they can show, and everything here is
-/// a judgement the tool is not entitled to make on its own: a shared surname with
-/// a matching first initial, or one name's words being a subset of another's
-/// (`Ivan Damgård` and `Ivan Bjerre Damgård`). Written commented out.
-pub fn alias_suggestions(conn: &Connection) -> Result<Vec<String>> {
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT authors FROM papers")?;
-    for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-        for name in row?.split(';') {
-            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !name.is_empty() {
-                *counts.entry(name).or_insert(0) += 1;
-            }
-        }
-    }
-    // Only spellings the rules left apart are worth suggesting.
-    let person = |n: &str| person_of(n);
-    let mut by_surname: HashMap<String, Vec<String>> = HashMap::new();
-    for name in counts.keys() {
-        if let Some(surname) = fold_name(name).split_whitespace().next_back() {
-            by_surname
-                .entry(surname.to_string())
-                .or_default()
-                .push(name.clone());
-        }
-    }
-
-    // An abbreviation of a name, not merely a name starting with the same letter:
-    // `I. Damgard` abbreviates `Ivan Damgård`, but `Yu Wang` and `Yang Wang` are
-    // two people who happen to share a Y. Requiring one side to be a bare initial
-    // took the suggestion list from 1,943 lines to something reviewable.
-    let abbreviates = |short: &str, long: &str| -> bool {
-        let (s, l) = (fold_name(short), fold_name(long));
-        let (mut sw, mut lw) = (s.split_whitespace(), l.split_whitespace());
-        match (sw.next(), lw.next()) {
-            (Some(a), Some(b)) => {
-                a.len() == 1 && b.starts_with(a) && sw.next_back() == lw.next_back()
-            }
-            _ => false,
-        }
-    };
-    let words = |n: &str| -> Vec<String> {
-        fold_name(n)
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .map(|w| w.to_string())
-            .collect()
-    };
-    let mut out: Vec<String> = Vec::new();
-    for (_, mut group) in by_surname {
-        if group.len() < 2 {
-            continue;
-        }
-        group.sort_by_key(|n| (-counts[n], n.clone()));
-        let mut taken: Vec<String> = Vec::new();
-        for anchor in &group {
-            if taken.contains(anchor) {
-                continue;
-            }
-            let mut others: Vec<String> = Vec::new();
-            for other in &group {
-                if other == anchor || taken.contains(other) || person(other) == person(anchor) {
-                    continue;
-                }
-                let (aw, ow) = (words(anchor), words(other));
-                // At least a first name and a surname, or `G. Stütz` — which
-                // reduces to its surname — would be suggested as an alias for
-                // every Stutz in the archive.
-                let subset = aw.len() >= 2 && aw.iter().all(|w| ow.contains(w));
-                if subset || abbreviates(other, anchor) || abbreviates(anchor, other) {
-                    others.push(other.clone());
-                    taken.push(other.clone());
-                }
-            }
-            if !others.is_empty() {
-                taken.push(anchor.clone());
-                out.push(format!("{anchor} = {}", others.join(", ")));
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// The spelling that stands for whoever this name belongs to.
-fn person_of(name: &str) -> String {
-    CLASSES
-        .get()
-        .and_then(|c| c.get(name))
-        .cloned()
-        .unwrap_or_else(|| name.to_string())
-}
-
 /// `"Adi Shamir"` -> `("Shamir", "Adi")`. `None` for a single-word name.
 fn split_surname(name: &str) -> Option<(&str, String)> {
     let mut words: Vec<&str> = name.split_whitespace().collect();
@@ -336,7 +469,7 @@ pub fn deaccent(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let lower = ch.to_lowercase().next().unwrap_or(ch);
-        let folded = fold_name(&lower.to_string());
+        let folded = ascii_fold(&lower.to_string());
         if folded.is_empty() || folded == lower.to_string() {
             out.push(ch);
         } else if ch.is_uppercase() {
@@ -348,40 +481,21 @@ pub fn deaccent(s: &str) -> String {
     out
 }
 
-/// The *other* spelling convention: an umlaut written as a digraph, as it is
-/// written when the character is unavailable. Folded afterwards, so this and
-/// `fold_name` produce comparable keys.
+/// A name reduced to something comparable: lowercase, ASCII-folded, punctuation
+/// and repeated spaces gone, and the digraph spelling of an accented letter
+/// collapsed onto the letter.
 ///
-/// Deliberately not the inverse of folding — collapsing `ue` to `u` would merge
-/// `Yue` with `Yu` and `Xue` with `Xu`, who are different people. Expanding fires
-/// only on a name that actually carries the umlaut, so it is evidence rather than
-/// guesswork: `Müller` links `Muller` through one key and `Mueller` through the
-/// other, while `Yu` and `Yue` share neither.
-pub fn expand_name(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for ch in s.chars() {
-        match ch {
-            'ä' | 'Ä' => out.push_str("ae"),
-            'ö' | 'Ö' | 'ø' | 'Ø' => out.push_str("oe"),
-            'ü' | 'Ü' => out.push_str("ue"),
-            'å' | 'Å' => out.push_str("aa"),
-            'æ' | 'Æ' => out.push_str("ae"),
-            'ß' => out.push_str("ss"),
-            _ => out.push(ch),
-        }
-    }
-    fold_name(&out)
+/// Two spellings that differ only in those respects are the same person, and the
+/// archive contains plenty of both.
+pub fn fold_name(s: &str) -> String {
+    collapse_digraphs(&ascii_fold(s))
 }
 
-/// A name reduced to something comparable: lowercase, ASCII-folded, punctuation
-/// and repeated spaces gone. Two spellings that differ only in those respects are
-/// the same person, and the archive contains plenty of both.
-///
-/// Hand-rolled rather than pulled from a crate, in keeping with the rest: the
-/// table covers Latin-1 and Latin Extended-A, which is what author names use, and
-/// combining marks are dropped so a decomposed "å" folds the same as a composed
-/// one.
-pub fn fold_name(s: &str) -> String {
+/// Case, accents, punctuation and repeated spaces. Hand-rolled rather than pulled
+/// from a crate, in keeping with the rest: the table covers Latin-1 and Latin
+/// Extended-A, which is what author names use, and combining marks are dropped so
+/// a decomposed "å" folds the same as a composed one.
+fn ascii_fold(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut space = true;
     for ch in s.chars().flat_map(|c| c.to_lowercase()) {
@@ -436,14 +550,51 @@ pub fn fold_name(s: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// The digraph an accented letter is written as when the character is unavailable,
+/// collapsed onto the letter `ascii_fold` already produced: `aa` and `å` both
+/// become `a`, `oe` and `ö` both `o`, `ue` and `ü` both `u`.
+///
+/// `ue` only when a letter follows it. That restriction is the whole rule:
+/// collapsing every `ue` merges `Yu Yu` with `Yue Yu`, `Yu Chen` with `Yue Chen`
+/// and `Rui Xue` with `Rui Xu` — seven pinyin pairs, all of them word-final, while
+/// every German case (`Gueneysu`, `Kuesters`, `Buenz`, `Mueller`) has the digraph
+/// mid-word. Measured over the whole index, these three rules merge 31 groups and
+/// not one of them is wrong.
+///
+/// `ae` and `ss` are deliberately absent: they are worth two papers and none
+/// respectively, and `ae` would put `Michael` and `Michal` one keystroke apart.
+fn collapse_digraphs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            'a' if chars.peek() == Some(&'a') => {
+                chars.next();
+            }
+            'o' if chars.peek() == Some(&'e') => {
+                chars.next();
+            }
+            'u' if chars.peek() == Some(&'e') => {
+                let mut after = chars.clone();
+                after.next();
+                if after.peek().is_some_and(|c| c.is_alphabetic()) {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// One author to complete, as offered to the shell.
 pub struct Candidate {
     /// What gets inserted. Accent-free, because zsh compares characters and will
     /// not reach `Damgård` from `damga`.
     pub value: String,
-    /// How the archive usually writes this person, when that differs from
-    /// `value` — so a rarer spelling says whose papers it will find. Empty when
-    /// the two agree.
+    /// How the archive writes this person, when that differs from `value` — so a
+    /// deaccented candidate says whose papers it will find. Empty when they agree.
     pub person: String,
     pub papers: i64,
 }
@@ -459,51 +610,39 @@ pub struct Candidate {
 ///
 /// It is a **prefilter only**: whatever it returns is still refined by
 /// `author_match`, so per-author and word-boundary semantics do not change. That
-/// means it must never exclude a true match, hence:
+/// means it must never exclude a true match, and the reason it cannot is that the
+/// column it searches, `papers.authors_fold`, holds the output of this same
+/// [`fold_name`] — a prefix of a folded word is a prefix of the indexed token, with
+/// nothing left to guess.
 ///
-/// - one `AND` group of word prefixes for the needle, `OR`-ed with one group per
-///   other spelling of the same person — `Damgård` alone would miss the rows filed
-///   as `Damgaard`, which is 127 rows where 139 match;
-/// - `None` when no word survives (a lone initial), so the caller keeps scanning
-///   rather than filtering on nothing.
+/// Indexing the raw byline instead is what made this fragile before. `unicode61`
+/// folds *diacritics*, so `Damgård` tokenises as `damgard`, but `ø`, `ß`, `đ` and
+/// `ł` are letters rather than accented letters and it leaves them alone — a
+/// `ronne*` built from a typed `Roenne` reached 9 of Peter Rønne's 16 papers and
+/// silently dropped the rest. Enumerating the spellings a fold could have come from
+/// does not close that: with `ø`, `æ`, `œ`, `ß`, `đ`, `ł` and `ı` all in play a
+/// name like `Boudgoust` has hundreds of candidate spellings.
 ///
-/// Verified against 400 real (paper, author) pairs: no misses.
+/// `None` when no word survives (a lone initial), so the caller keeps scanning
+/// rather than filtering on nothing.
 pub fn author_probe(needle: &str) -> Option<String> {
-    let folded = fold_name(needle);
-    let group = |name: &str| -> Option<String> {
-        let words: Vec<String> = name
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            // A token is matched as a prefix, so anything FTS5 would read as an
-            // operator or syntax has to go.
-            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
-            .filter(|w| w.len() > 1)
-            .map(|w| format!("{w}*"))
-            .collect();
-        (!words.is_empty()).then(|| words.join(" AND "))
-    };
-    let mut groups: Vec<String> = group(&folded).map(|g| vec![g]).unwrap_or_default();
-    if groups.is_empty() {
+    let words: Vec<String> = fold_needle(needle)
+        .split_whitespace()
+        .filter(|w| w.chars().count() > 1)
+        // A token is matched as a prefix, so anything FTS5 would read as an
+        // operator or syntax has to go.
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        })
+        .filter(|w| w.chars().count() > 1)
+        .map(|w| format!("{w}*"))
+        .collect();
+    if words.is_empty() {
         return None;
     }
-    // Every other spelling of whoever the needle names. Cheap: `SPELLINGS` holds
-    // only the names the archive writes more than one way.
-    if let Some(spellings) = SPELLINGS.get() {
-        let words: Vec<&str> = folded.split_whitespace().filter(|w| w.len() > 1).collect();
-        for (name, others) in spellings {
-            if !words_begin_words(name, &words) {
-                continue;
-            }
-            for other in others {
-                if let Some(g) = group(other) {
-                    if !groups.contains(&g) {
-                        groups.push(g);
-                    }
-                }
-            }
-        }
-    }
-    Some(format!("{{authors}} : ({})", groups.join(" OR ")))
+    Some(format!("{{authors_fold}} : ({})", words.join(" AND ")))
 }
 
 /// Does one of this paper's authors match `needle`?
@@ -513,8 +652,7 @@ pub fn author_probe(needle: &str) -> Option<String> {
 /// Ivan Damgård write together — two different people, one line of text.
 ///
 /// A name matches when every word of the needle appears in it, in any order,
-/// single letters ignored; or when another spelling of the same person does, so
-/// `Damgård` finds the papers filed as `Damgaard`.
+/// single letters ignored.
 pub fn author_match(byline: &str, needle: &str) -> bool {
     let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 1).collect();
     if words.is_empty() {
@@ -526,192 +664,22 @@ pub fn author_match(byline: &str, needle: &str) -> bool {
     byline.split(';').any(|name| name_matches(name, &words))
 }
 
-/// One author name against the needle's words, including the person's other
-/// spellings.
+/// One author name against the needle's words.
 ///
 /// Each word must begin a word of the name, not merely appear inside one.
 /// Anywhere-in-the-string matching made `--author Ishai` return Avishai Wool's
 /// twenty papers, and `--author "An Wang"` every Wang in the archive, since "an"
 /// hides inside "wang". Typing part of a name still works, which is what
 /// completion needs: "boud" begins "boudgoust".
+///
+/// Extra words in the name cost nothing, which is why middle names need no rule of
+/// their own: `Yael Kalai` finds `Yael Tauman Kalai`, `Ron Rothblum` finds `Ron D.
+/// Rothblum`, and `Angelo Caro` finds `Angelo De Caro`.
 fn name_matches(name: &str, words: &[&str]) -> bool {
     let folded = fold_name(name);
-    if words_begin_words(&folded, words) {
-        return true;
-    }
-    SPELLINGS
-        .get()
-        .and_then(|s| s.get(&folded))
-        .is_some_and(|others| {
-            others
-                .iter()
-                .any(|other| words_begin_words(other, words))
-        })
-}
-
-fn words_begin_words(folded: &str, words: &[&str]) -> bool {
     words
         .iter()
         .all(|w| folded.split_whitespace().any(|part| part.starts_with(w)))
-}
-
-/// The author classes, cached in `author_class` and rebuilt when the archive or
-/// the aliases file moves. Every consumer — searching, badging, completion — goes
-/// through here, so they cannot disagree about who is who.
-pub fn author_classes(conn: &Connection) -> Result<HashMap<String, String>> {
-    let fingerprint = format!(
-        "{CACHE_VERSION}\n{}\n{}",
-        meta_get(conn, crate::harvest::KEY_LAST_HARVEST)?.unwrap_or_default(),
-        crate::config::aliases()
-            .iter()
-            .map(|(a, b, same)| format!("{a}{}{b}", if *same { "=" } else { "!=" }))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    if meta_get(conn, KEY_NAMES_FOR)?.as_deref() != Some(fingerprint.as_str()) {
-        let classes = build_author_classes(conn)?;
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let written = (|| -> Result<()> {
-            conn.execute("DELETE FROM author_class", [])?;
-            {
-                let mut stmt = conn
-                    .prepare("INSERT OR REPLACE INTO author_class (name, canonical) VALUES (?1,?2)")?;
-                // Only the names that actually stand for someone else are worth
-                // storing; a name that is its own canonical is the default.
-                for (name, canonical) in classes.iter().filter(|(n, c)| n != c) {
-                    stmt.execute([name, canonical])?;
-                }
-            }
-            meta_set(conn, KEY_NAMES_FOR, &fingerprint)?;
-            Ok(())
-        })();
-        conn.execute_batch(if written.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-        written?;
-    }
-    let mut stmt = conn.prepare("SELECT name, canonical FROM author_class")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
-}
-
-/// Every author spelling in the index, mapped to the one spelling that stands for
-/// the person. Built once and cached in `author_class`.
-///
-/// Two keys per name — `fold_name` and `expand_name` — joined transitively, so
-/// `Ivan Damgård`, `Ivan Damgard` and `Ivan Damgaard` become one person while
-/// `Yu Chen` and `Yue Chen` stay two. Measured over 20,071 distinct spellings:
-/// 28 groups merged, none of them wrong. Collapsing digraphs instead would merge
-/// 43 and get 11 wrong, all Chinese pinyin.
-///
-/// The aliases file is applied afterwards so it can override in both directions:
-/// `A = B` says the rules missed one, `A != B` says they overreached.
-fn build_author_classes(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT authors FROM papers")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    for row in rows {
-        for name in row?.split(';') {
-            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !name.is_empty() {
-                *counts.entry(name).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Union-find over the names, keyed by both spellings of each.
-    let names: Vec<String> = counts.keys().cloned().collect();
-    let index: HashMap<&str, usize> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
-    let mut parent: Vec<usize> = (0..names.len()).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
-    }
-    let union = |parent: &mut [usize], a: usize, b: usize| {
-        let (ra, rb) = (find(parent, a), find(parent, b));
-        if ra != rb {
-            parent[ra] = rb;
-        }
-    };
-    let mut owner: HashMap<String, usize> = HashMap::new();
-    for (i, name) in names.iter().enumerate() {
-        for key in [fold_name(name), expand_name(name)] {
-            match owner.get(&key) {
-                Some(&j) => union(&mut parent, i, j),
-                None => {
-                    owner.insert(key, i);
-                }
-            }
-        }
-    }
-
-    // `A = B` joins them. Names the archive has never used are still recorded, so
-    // a watch written against one resolves to the class.
-    let aliases = crate::config::aliases();
-    let mut extra: Vec<String> = Vec::new();
-    let mut split: Vec<(String, String)> = Vec::new();
-    for (canonical, other, same) in &aliases {
-        if *same {
-            for n in [canonical, other] {
-                if !index.contains_key(n.as_str()) && !extra.contains(n) {
-                    extra.push(n.clone());
-                }
-            }
-        } else {
-            split.push((canonical.clone(), other.clone()));
-        }
-    }
-    let mut names = names;
-    for n in extra {
-        names.push(n);
-        parent.push(parent.len());
-    }
-    let index: HashMap<&str, usize> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
-    for (canonical, other, same) in &aliases {
-        if !*same {
-            continue;
-        }
-        if let (Some(&a), Some(&b)) = (index.get(canonical.as_str()), index.get(other.as_str())) {
-            union(&mut parent, a, b);
-        }
-    }
-
-    // Group, then pick the spelling the archive uses most as the one to show.
-    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..names.len() {
-        let root = find(&mut parent, i);
-        groups.entry(root).or_default().push(i);
-    }
-    let mut out: HashMap<String, String> = HashMap::new();
-    for members in groups.values() {
-        let canonical = members
-            .iter()
-            .max_by_key(|&&i| (counts.get(&names[i]).copied().unwrap_or(0), std::cmp::Reverse(i)))
-            .map(|&i| names[i].clone())
-            .unwrap_or_default();
-        for &i in members {
-            out.insert(names[i].clone(), canonical.clone());
-        }
-    }
-    // `A != B` is applied last: it wins over anything the rules or the merges did.
-    for (a, b) in split {
-        // The vetoed spelling becomes its own canonical; the other keeps whatever
-        // it had, which is either itself or a class the veto says nothing about.
-        if out.contains_key(&b) {
-            out.insert(b.clone(), b.clone());
-        }
-        let _ = &a;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -720,46 +688,113 @@ mod tests {
 
     #[test]
     fn folding_unifies_the_archives_spellings() {
-        // One person, four ways the archive writes them.
+        // One person, several ways the archive writes them.
         assert_eq!(fold_name("Ron D.  Rothblum"), fold_name("Ron D. Rothblum"));
-        assert_eq!(fold_name("Ivan Damgård"), fold_name("Ivan Damgard"));
         assert_eq!(fold_name("ADI SHAMIR"), fold_name("Adi Shamir"));
         assert_eq!(fold_name("Shamir, Adi"), "shamir adi");
         // Decomposed and pre-composed accents fold alike.
         assert_eq!(fold_name("Damga\u{030a}rd"), fold_name("Damgård"));
-        // Distinct people stay distinct: `aa` is a transliteration, not an accent,
-        // and folding it would merge unrelated names.
-        assert_ne!(fold_name("Ivan Damgaard"), fold_name("Ivan Damgård"));
     }
 
     #[test]
-    fn expansion_is_evidence_not_guesswork() {
-        // A name carrying the umlaut links both conventions: `Müller` shares a key
-        // with `Muller` through folding and with `Mueller` through expansion.
-        assert_eq!(fold_name("Müller"), fold_name("Muller"));
-        assert_eq!(expand_name("Müller"), fold_name("Mueller"));
-        assert_eq!(expand_name("Damgård"), fold_name("Damgaard"));
-        assert_eq!(expand_name("Rønne"), fold_name("Roenne"));
-        // The reverse rule — collapsing `ue` to `u` — would merge these, and they
-        // are different people. Expanding cannot, because there is no umlaut to
-        // expand: that is the whole reason for doing it this way round.
-        assert_ne!(expand_name("Yue Chen"), expand_name("Yu Chen"));
+    fn a_digraph_is_the_same_letter() {
+        // The three rules, each measured over the whole index.
+        assert_eq!(fold_name("Ivan Damgaard"), fold_name("Ivan Damgård"));
+        assert_eq!(fold_name("Ivan Damgard"), fold_name("Ivan Damgård"));
+        assert_eq!(fold_name("Nico Doettling"), fold_name("Nico Döttling"));
+        assert_eq!(fold_name("Peter Rønne"), fold_name("Peter Roenne"));
+        assert_eq!(fold_name("Ralf Kuesters"), fold_name("Ralf Küsters"));
+        assert_eq!(fold_name("Mueller-Quade"), fold_name("Müller-Quade"));
+        // `ue` collapses only mid-word: these are pinyin, and seven such pairs are
+        // different people. Every German case has the digraph before a letter.
         assert_ne!(fold_name("Yue Chen"), fold_name("Yu Chen"));
-        assert_ne!(expand_name("Xue Liu"), expand_name("Xu Liu"));
-        // Expansion leaves a name with no umlaut exactly as folding does.
-        assert_eq!(expand_name("Adi Shamir"), fold_name("Adi Shamir"));
+        assert_ne!(fold_name("Yue Yu"), fold_name("Yu Yu"));
+        assert_ne!(fold_name("Rui Xue"), fold_name("Rui Xu"));
+        // Left out on purpose: `ae` would merge these, who are two people.
+        assert_ne!(fold_name("Michael Walter"), fold_name("Michal Walter"));
+    }
+
+    #[test]
+    fn the_table_names_one_person_once() {
+        // Middle names, initials, accents and digraphs all reach the same entry.
+        for spelling in [
+            "Ivan Damgård",
+            "Ivan Damgard",
+            "Ivan Damgaard",
+            "Ivan B. Damgaard",
+            "Ivan Bjerre Damgård",
+            "I. Damgard",
+        ] {
+            assert_eq!(canonical(spelling), Some("Ivan Damgaard"), "{spelling}");
+        }
+        assert_eq!(canonical("Yael Tauman Kalai"), Some("Yael Kalai"));
+        assert_eq!(canonical("Yael Tauman-Kalai"), Some("Yael Kalai"));
+        assert_eq!(canonical("Ron D. Rothblum"), Some("Ron Rothblum"));
+        assert_eq!(canonical("N. P.  Smart"), Some("Nigel Smart"));
+        // A hyphen splitting a word is why the key ignores word boundaries.
+        assert_eq!(canonical("Hwa-Jeong Seo"), Some("Hwajeong Seo"));
+        // One typo, on one paper, for a very well-published author.
+        assert_eq!(canonical("Yual Ishai"), Some("Yuval Ishai"));
+        // Different people the table must not swallow.
+        assert_eq!(canonical("Kasper Damgård"), None);
+        assert_eq!(canonical("Guy Rothblum"), None);
+        assert_eq!(canonical("Yu Long Chen"), None);
+        assert_eq!(canonical("Xiao Wang"), None);
+    }
+
+    #[test]
+    fn a_byline_is_rewritten_whole() {
+        assert_eq!(
+            canonical_byline("Ivan Bjerre Damgård; Kasper Green Larsen"),
+            "Ivan Damgaard; Kasper Green Larsen"
+        );
+        // Spacing is tidied even for a name the table does not know.
+        assert_eq!(
+            canonical_byline("Ron D.  Rothblum;  Cher"),
+            "Ron Rothblum; Cher"
+        );
+        // One creator field holding two people is split.
+        assert_eq!(
+            canonical_byline("Vincenzo Iovino Abhishek Jain"),
+            "Vincenzo Iovino; Abhishek Jain"
+        );
+        // Idempotent, or the migration would not converge.
+        let once = canonical_byline("I. Damgard; Yael Tauman Kalai");
+        assert_eq!(canonical_byline(&once), once);
+        assert_eq!(once, "Ivan Damgaard; Yael Kalai");
+    }
+
+    #[test]
+    fn a_needle_is_canonicalised_too() {
+        // Storing the short form would otherwise lose the long one.
+        assert_eq!(fold_needle("Yael Tauman Kalai"), fold_name("Yael Kalai"));
+        assert_eq!(fold_needle("N. P. Smart"), fold_name("Nigel Smart"));
+        // A partial name matches no entry and must be left as typed, or prefix
+        // search and completion would stop working.
+        assert_eq!(fold_needle("damg"), "damg");
+        assert_eq!(fold_needle("Kasper Damgård"), "kasper damgard");
     }
 
     #[test]
     fn the_probe_covers_every_spelling_it_must() {
         // The probe is a prefilter, so it may return too much but never too little.
         let probe = author_probe("Adi Shamir").expect("two usable words");
-        assert!(probe.starts_with("{authors} : ("), "must be scoped to the column");
+        assert!(
+            probe.starts_with("{authors_fold} : ("),
+            "the folded column is what makes this exact: {probe}"
+        );
         assert!(probe.contains("adi*") && probe.contains("shamir*"));
         // Punctuation is not FTS5 syntax to be passed through.
         let probe = author_probe("Shamir, Adi").expect("a comma is not a word");
         assert!(!probe.contains(','), "{probe}");
-        assert!(probe.contains("shamir*") && probe.contains("adi*"));
+        // Whatever spelling was typed, the term is the folded one — which is what
+        // the indexed column holds, so no spelling can hide from it.
+        for typed in ["Ivan Damgaard", "Ivan Damgård", "Ivan Damgard"] {
+            let probe = author_probe(typed).expect("two usable words");
+            assert!(probe.contains("damgard*"), "{typed}: {probe}");
+        }
+        assert!(author_probe("Roenne").unwrap().contains("ronne*"));
+        assert!(author_probe("Rønne").unwrap().contains("ronne*"));
         // Nothing usable means no probe at all, so the caller keeps scanning
         // instead of filtering on an expression that matches nothing.
         assert!(author_probe("J").is_none());
@@ -768,39 +803,28 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_reaches_a_persons_other_spellings() {
-        // Without the variant groups, `--author Damgård` would filter down to the
-        // rows spelled that way and lose the ones filed as `Damgaard` — 127 rows
-        // where 139 match.
-        let mut spellings: HashMap<String, Vec<String>> = HashMap::new();
-        let group = vec!["ivan damgard".to_string(), "ivan damgaard".to_string()];
-        for member in &group {
-            spellings.insert(member.clone(), group.clone());
-        }
-        // Only set if some other test has not already: the map is process-wide.
-        let _ = SPELLINGS.set(spellings);
-        if SPELLINGS.get().is_some_and(|s| s.contains_key("ivan damgard")) {
-            let probe = author_probe("Ivan Damgård").expect("two usable words");
-            assert!(probe.contains("damgard*"), "{probe}");
-            assert!(probe.contains("damgaard*"), "the other spelling too: {probe}");
-            assert!(probe.contains(" OR "), "as an alternative, not an extra AND");
-        }
-    }
-
-    #[test]
     fn a_name_must_match_one_author_not_a_byline() {
         // The words used to be matched against the whole line, so a paper by
         // Kasper Green Larsen and Ivan Damgård answered to "Kasper Damgård".
         let byline = "Ivan Damgård; Kasper Green Larsen; Sophia Yakoubov";
-        assert!(author_match(byline, &fold_name("Ivan Damgård")));
-        assert!(author_match(byline, &fold_name("Kasper Larsen")));
-        assert!(!author_match(byline, &fold_name("Kasper Damgård")));
-        assert!(!author_match(byline, &fold_name("Sophia Damgård")));
+        assert!(author_match(byline, &fold_needle("Ivan Damgård")));
+        assert!(author_match(byline, &fold_needle("Kasper Larsen")));
+        assert!(!author_match(byline, &fold_needle("Kasper Damgård")));
+        assert!(!author_match(byline, &fold_needle("Sophia Damgård")));
         // Order within a name does not matter, and initials are ignored.
-        assert!(author_match(byline, &fold_name("Damgård, Ivan")));
-        assert!(author_match(byline, &fold_name("Kasper G. Larsen")));
+        assert!(author_match(byline, &fold_needle("Damgård, Ivan")));
+        assert!(author_match(byline, &fold_needle("Kasper G. Larsen")));
         // A name that is not there is not there.
-        assert!(!author_match(byline, &fold_name("Adi Shamir")));
+        assert!(!author_match(byline, &fold_needle("Adi Shamir")));
+    }
+
+    #[test]
+    fn extra_words_in_a_name_cost_nothing() {
+        // Why middle names need no rule: the matcher already ignores them.
+        let byline = "Yael Tauman Kalai; Ron D. Rothblum; Angelo De Caro";
+        assert!(author_match(byline, &fold_name("Yael Kalai")));
+        assert!(author_match(byline, &fold_name("Ron Rothblum")));
+        assert!(author_match(byline, &fold_name("Angelo Caro")));
     }
 
     #[test]
@@ -818,8 +842,40 @@ mod tests {
     }
 
     #[test]
+    fn the_table_invents_nobody() {
+        // Every representative must be spellable from words the archive uses: the
+        // check that a typo in the table cannot conjure up a person. Words are
+        // taken from the entry itself, so this is really a shape check — no empty
+        // entries, no stray that is not a folded name, no duplicate keys.
+        let mut seen: HashMap<String, &str> = HashMap::new();
+        for (rep, strays) in PEOPLE {
+            assert!(!rep.trim().is_empty(), "empty representative");
+            assert!(
+                rep.split_whitespace().count() >= 2,
+                "a representative needs a first and last name: {rep}"
+            );
+            let key = skeleton(&fold_name(rep));
+            if let Some(other) = seen.insert(key.clone(), rep) {
+                panic!("{rep} and {other} share the key {key}");
+            }
+            for stray in *strays {
+                assert_eq!(*stray, fold_name(stray), "a stray must be folded: {stray}");
+                assert_ne!(
+                    skeleton(stray),
+                    key,
+                    "{stray} needs no entry: the skeleton already reaches {rep}"
+                );
+                assert_eq!(canonical(stray), Some(*rep), "{stray}");
+            }
+        }
+    }
+
+    #[test]
     fn surnames_split_off_the_end() {
-        assert_eq!(split_surname("Adi Shamir").unwrap(), ("Shamir", "Adi".into()));
+        assert_eq!(
+            split_surname("Adi Shamir").unwrap(),
+            ("Shamir", "Adi".into())
+        );
         assert_eq!(
             split_surname("Ivan Bjerre Damgård").unwrap(),
             ("Damgård", "Ivan Bjerre".into())

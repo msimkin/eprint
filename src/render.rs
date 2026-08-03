@@ -449,7 +449,11 @@ pub fn render_hit(
     };
     let mut lopen = false;
     for line in wrap(&byline, width) {
-        let _ = writeln!(out, "{pad}{}", st.marked(&line, Tone::Meta, Tone::Love, &mut lopen));
+        let _ = writeln!(
+            out,
+            "{pad}{}",
+            st.marked(&line, Tone::Meta, Tone::Love, &mut lopen)
+        );
     }
 
     if st.bare_urls {
@@ -465,7 +469,11 @@ pub fn render_hit(
             if line.is_empty() {
                 let _ = writeln!(out);
             } else {
-                let _ = writeln!(out, "{pad}{}", st.marked(&line, Tone::Body, Tone::Match, &mut open));
+                let _ = writeln!(
+                    out,
+                    "{pad}{}",
+                    st.marked(&line, Tone::Body, Tone::Match, &mut open)
+                );
             }
         }
     }
@@ -513,7 +521,11 @@ pub fn render_full(out: &mut String, p: &Paper, st: &Style, bib: Option<&(String
     };
     let mut lopen = false;
     for line in wrap(&byline, bw) {
-        let _ = writeln!(out, "{}", st.marked(&line, Tone::Meta, Tone::Love, &mut lopen));
+        let _ = writeln!(
+            out,
+            "{}",
+            st.marked(&line, Tone::Meta, Tone::Love, &mut lopen)
+        );
     }
     let _ = writeln!(out);
     let mut meta = vec![format!("ePrint {}", p.id)];
@@ -536,11 +548,7 @@ pub fn render_full(out: &mut String, p: &Paper, st: &Style, bib: Option<&(String
         };
         let _ = writeln!(out, "{}", th.paint(Tone::Meta, &note));
     }
-    let _ = writeln!(
-        out,
-        "{}",
-        st.link(&p.url, &th.paint(Tone::Url, &p.url))
-    );
+    let _ = writeln!(out, "{}", st.link(&p.url, &th.paint(Tone::Url, &p.url)));
     if !p.abstract_.is_empty() {
         let _ = writeln!(out);
         for line in wrap_body(&p.abstract_, width) {
@@ -589,7 +597,11 @@ mod tests {
         for w in [20usize, 40, 83, 200] {
             for s in samples {
                 assert_eq!(wrap(s, w).len(), wrap_count(s, w), "wrap {s:?} at {w}");
-                assert_eq!(wrap_body(s, w).len(), wrap_body_count(s, w), "body {s:?} at {w}");
+                assert_eq!(
+                    wrap_body(s, w).len(),
+                    wrap_body_count(s, w),
+                    "body {s:?} at {w}"
+                );
             }
         }
     }

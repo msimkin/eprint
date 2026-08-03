@@ -229,7 +229,10 @@ fn parse_page(xml: &str) -> Result<Page> {
                             page.records.push(Record::Live(Paper {
                                 id: oai_id.clone(),
                                 title: title.trim().to_string(),
-                                authors: creators.join("; "),
+                                // One spelling per person, decided on the way in —
+                                // see `names::PEOPLE`. Doing it here is what makes
+                                // a first-time download correct without a repair.
+                                authors: crate::names::canonical_byline(&creators.join("; ")),
                                 abstract_: description.trim().to_string(),
                                 category: subject.trim().to_string(),
                                 date: date.clone(),

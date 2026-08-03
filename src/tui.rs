@@ -11,9 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 
 use crate::db::{self, Hit, Query, Scope, MARK_END, MARK_START};
-use crate::render::{
-    full_authors, loved, short_authors, wrap, wrap_body, BADGE, BADGE_W, LOVE_W,
-};
+use crate::render::{full_authors, loved, short_authors, wrap, wrap_body, BADGE, BADGE_W, LOVE_W};
 use crate::theme::{Theme, Tone};
 
 /// Which prompt, if any, is taking keystrokes. Was a bool when the query was the
@@ -743,7 +741,11 @@ pub fn run(
                         Some((k, p)) => (k.clone(), *p),
                         None => (bibtex_key(&h.paper.id), false),
                     };
-                    let note = if published { " (published version)" } else { "" };
+                    let note = if published {
+                        " (published version)"
+                    } else {
+                        ""
+                    };
                     app.status = Some(if copy_to_clipboard(&key) {
                         format!("copied {key}{note}{}", app.stale_hint())
                     } else {
@@ -756,16 +758,18 @@ pub fn run(
                 if let Some(id) = id {
                     app.status = Some(match db::bib_entry(&conn, &id) {
                         Ok(Some((key, entry, published))) if !entry.is_empty() => {
-                            let note = if published { " (published version)" } else { "" };
+                            let note = if published {
+                                " (published version)"
+                            } else {
+                                ""
+                            };
                             if copy_to_clipboard(&entry) {
                                 format!("copied BibTeX entry {key}{note}{}", app.stale_hint())
                             } else {
                                 "could not reach the clipboard".to_string()
                             }
                         }
-                        Ok(Some(_)) => {
-                            "entry text missing — run `eprint bib --update`".to_string()
-                        }
+                        Ok(Some(_)) => "entry text missing — run `eprint bib --update`".to_string(),
                         _ => format!("{id} is not in CryptoBib; no entry to copy"),
                     });
                 }
