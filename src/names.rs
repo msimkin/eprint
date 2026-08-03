@@ -384,39 +384,60 @@ pub fn authors_matching(conn: &Connection, needle: &str, limit: usize) -> Result
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 1).collect();
 
-    // One person, one entry: names are canonical on the way in, so the spelling in
-    // the row *is* the person, and how many papers they have is how many rows they
-    // appear on.
-    let mut papers: HashMap<&str, usize> = HashMap::new();
-    let mut order: Vec<&str> = Vec::new();
-    for byline in &bylines {
+    // One entry per *inserted value*, not per stored spelling. Names are canonical
+    // on the way in, so mostly one spelling is one person — but two spellings the
+    // table does not cover can still deaccent to the same text, and the archive has
+    // both `Ivana Klasovita` and `Ivana Klasovitá`. Offering both puts two
+    // identical rows in the menu, each under-reporting the papers the other finds.
+    struct Group {
+        /// How the archive writes this person, preferring an accented spelling.
+        spelling: String,
+        /// Which of the fetched rows they appear on, so the count is a union
+        /// rather than a sum.
+        rows: Vec<u32>,
+    }
+    let mut groups: HashMap<String, Group> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (row, byline) in bylines.iter().enumerate() {
         for name in byline {
             if !name_matches(name, &words) {
                 continue;
             }
-            let count = papers.entry(name.as_str()).or_insert_with(|| {
-                order.push(name.as_str());
-                0
+            let value = deaccent(name);
+            let group = groups.entry(value.clone()).or_insert_with(|| {
+                order.push(value.clone());
+                Group {
+                    spelling: name.clone(),
+                    rows: Vec::new(),
+                }
             });
-            *count += 1;
+            if group.rows.last() != Some(&(row as u32)) {
+                group.rows.push(row as u32);
+            }
+            if group.spelling == value && *name != value {
+                group.spelling = name.clone();
+            }
         }
     }
-    order.sort_by(|a, b| papers[b].cmp(&papers[a]).then_with(|| a.cmp(b)));
+    order.sort_by(|a, b| {
+        groups[b]
+            .rows
+            .len()
+            .cmp(&groups[a].rows.len())
+            .then_with(|| a.cmp(b))
+    });
     order.truncate(limit);
 
     let mut out: Vec<Candidate> = Vec::new();
-    for name in order {
-        // Offer a spelling that can actually be typed: zsh keeps only candidates
-        // starting with the typed text and compares characters, so an accented
-        // candidate is one the shell silently discards.
-        let value = deaccent(name);
-        let count = papers[name] as i64;
+    for value in order {
+        let group = &groups[&value];
+        let count = group.rows.len() as i64;
         // Name the person when the offered spelling is not how they are written, so
         // a deaccented candidate still says whose papers it will find.
-        let person = if value == name {
+        let person = if group.spelling == value {
             String::new()
         } else {
-            name.to_string()
+            group.spelling.clone()
         };
         if let Some((surname, rest)) = split_surname(&value) {
             out.push(Candidate {
@@ -868,6 +889,21 @@ mod tests {
                 assert_eq!(canonical(stray), Some(*rep), "{stray}");
             }
         }
+    }
+
+    #[test]
+    fn one_row_per_thing_the_shell_would_insert() {
+        // Completion is keyed by the inserted text, so two spellings that deaccent
+        // alike cannot produce two identical menu rows. The archive has both
+        // `Ivana Klasovita` and `Ivana Klasovitá`, one paper each, and the old build
+        // offered them twice over, each row claiming one paper where picking either
+        // returns two.
+        assert_eq!(deaccent("Ivana Klasovitá"), deaccent("Ivana Klasovita"));
+        // The predicate behind the count agrees with the filter the value becomes.
+        let needle = fold_needle("Ivana Klasovita");
+        let words: Vec<&str> = needle.split_whitespace().collect();
+        assert!(name_matches("Ivana Klasovitá", &words));
+        assert!(name_matches("Ivana Klasovita", &words));
     }
 
     #[test]
