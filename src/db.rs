@@ -24,10 +24,14 @@ pub struct Paper {
 pub struct Hit {
     pub paper: Paper,
     /// The complete abstract with match markers, used by `-a` and by `browse`
-    /// when an abstract is expanded.
+    /// when an abstract is expanded. Empty until `hydrate` fills it — see there
+    /// for why it is not fetched with the rest of the row.
     pub abstract_hl: String,
-    /// The title with match markers.
+    /// The title with match markers. Empty until `hydrate` fills it.
     pub title_hl: String,
+    /// The `papers` rowid, carried so `hydrate` can seek straight back to this
+    /// row instead of re-running the match.
+    pub rowid: i64,
 }
 
 /// Which columns a query is matched against. Authors are always included —
@@ -107,6 +111,13 @@ pub fn open() -> Result<Connection> {
     // rebuild — would otherwise fail instantly rather than wait the few
     // milliseconds the writer actually needs.
     conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+    // SQLite's default page cache is 2MB, against a 110MB index — every broad
+    // query evicted the lot, which is why a cold search measured 330ms and the
+    // same one warm measured 20ms. The sort below also spills: `browse` orders
+    // every match by date, and that temp B-tree belongs in memory.
+    conn.pragma_update(None, "cache_size", -65_536)?; // KiB, i.e. 64MB
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "mmap_size", 268_435_456i64)?;
     // Author matching is one predicate, evaluated per row. It replaced a `fold`
     // function that compared whole bylines, which is why no query folds any more.
     conn.create_scalar_function(
@@ -570,7 +581,7 @@ pub fn upsert(conn: &Connection, p: &Paper, now: &str) -> Result<()> {
 /// Papers that arrived in the index after `watermark`, newest first.
 pub fn added_since(conn: &Connection, watermark: &str, limit: usize) -> Result<Vec<Hit>> {
     let mut stmt = conn.prepare(
-        "SELECT id,title,authors,abstract,category,date,year,rights,url
+        "SELECT id,title,authors,abstract,category,date,year,rights,url,rowid
          FROM papers WHERE added > ?1
          ORDER BY added DESC, date DESC LIMIT ?2",
     )?;
@@ -582,6 +593,7 @@ pub fn added_since(conn: &Connection, watermark: &str, limit: usize) -> Result<V
             paper,
             abstract_hl,
             title_hl,
+            rowid: r.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -595,7 +607,7 @@ pub fn added_since(conn: &Connection, watermark: &str, limit: usize) -> Result<V
 /// a bare `eprint`: when nothing is new there is still something to look at.
 pub fn recent_arrivals(conn: &Connection, limit: usize) -> Result<Vec<Hit>> {
     let mut stmt = conn.prepare(
-        "SELECT id,title,authors,abstract,category,date,year,rights,url
+        "SELECT id,title,authors,abstract,category,date,year,rights,url,rowid
          FROM papers ORDER BY added DESC, date DESC LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit as i64], |r| {
@@ -606,6 +618,7 @@ pub fn recent_arrivals(conn: &Connection, limit: usize) -> Result<Vec<Hit>> {
             paper,
             abstract_hl,
             title_hl,
+            rowid: r.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1143,26 +1156,28 @@ fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>
     args.push(Box::new(q.limit as i64));
     let limit_idx = args.len();
 
+    // No `highlight()` here, deliberately. It re-tokenises the whole abstract per
+    // row, and `browse` runs unbounded: on a two-character query that is 26,000
+    // abstracts and 1.25s per keystroke, against 110ms without. The marked-up
+    // strings are fetched by `hydrate` for the handful of rows on screen.
     let sql = format!(
         "SELECT p.id,p.title,p.authors,p.abstract,p.category,p.date,p.year,p.rights,p.url,
-                highlight(papers_fts, 2, char(1), char(2)),
-                highlight(papers_fts, 0, char(1), char(2))
+                f.rowid
          FROM papers_fts f JOIN papers p ON p.rowid = f.rowid
          WHERE papers_fts MATCH ?1{filters}
          ORDER BY p.date DESC
          LIMIT ?{limit_idx}"
     );
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(refs.as_slice(), |r| {
         let paper = row_to_paper(r, 0)?;
-        let abstract_hl: String = r.get(9)?;
-        let title_hl: String = r.get(10)?;
         Ok(Hit {
             paper,
-            abstract_hl,
-            title_hl,
+            abstract_hl: String::new(),
+            title_hl: String::new(),
+            rowid: r.get(9)?,
         })
     })?;
 
@@ -1171,6 +1186,64 @@ fn run_search(conn: &Connection, q: &Query, match_expr: &str) -> Result<Vec<Hit>
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Fill in `title_hl` and `abstract_hl` for one row that a search already
+/// returned.
+///
+/// Split out of the bulk query because `highlight()` costs far more than the
+/// rest of the row put together — measured on the real index, a two-character
+/// query matching 26,556 papers takes 1250ms with it and 110ms without. Doing it
+/// per visible row instead is free: FTS5 honours a rowid *equality* constraint as
+/// a seek (`VIRTUAL TABLE INDEX 0:=M4`), so thirty of these measure 0ms.
+///
+/// Note `rowid IN (...)` does **not** get that treatment — FTS5 evaluates the
+/// whole match and then filters, which measured 840ms. One query per row is the
+/// fast shape here, counterintuitive as that looks.
+pub fn hydrate(conn: &Connection, q: &Query, hit: &mut Hit) -> Result<()> {
+    if !hit.title_hl.is_empty() || !hit.abstract_hl.is_empty() {
+        return Ok(()); // already done, or a non-matching listing
+    }
+    if !uses_fts(q) {
+        hit.title_hl = hit.paper.title.clone();
+        hit.abstract_hl = hit.paper.abstract_.clone();
+        return Ok(());
+    }
+    let rowid = hit.rowid;
+    let fetch = |expr: &str| -> Result<(String, String)> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT highlight(papers_fts, 0, char(1), char(2)),
+                    highlight(papers_fts, 2, char(1), char(2))
+             FROM papers_fts
+             WHERE papers_fts MATCH ?1 AND rowid = ?2",
+        )?;
+        Ok(stmt.query_row(rusqlite::params![expr, rowid], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?)
+    };
+    // The same two-shot the search used, so the expression that produced this row
+    // is the one that marks it.
+    match two_shot(q, fetch) {
+        Ok((title_hl, abstract_hl)) => {
+            hit.title_hl = title_hl;
+            hit.abstract_hl = abstract_hl;
+        }
+        // Leave them empty rather than fail a render: both front-ends fall back
+        // to the unmarked text, which only costs the highlighting.
+        Err(_) => {
+            hit.title_hl = hit.paper.title.clone();
+            hit.abstract_hl = hit.paper.abstract_.clone();
+        }
+    }
+    Ok(())
+}
+
+/// Hydrate a whole slice — what the non-interactive `search` wants, since it
+/// prints every row it fetched.
+pub fn hydrate_all(conn: &Connection, q: &Query, hits: &mut [Hit]) {
+    for hit in hits.iter_mut() {
+        let _ = hydrate(conn, q, hit);
+    }
 }
 
 /// Total number of matches, ignoring the display limit, so the header can
@@ -1215,20 +1288,24 @@ fn browse(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
     args.push(Box::new(q.limit as i64));
     let limit_idx = args.len();
     let sql = format!(
-        "SELECT p.id,p.title,p.authors,p.abstract,p.category,p.date,p.year,p.rights,p.url
+        "SELECT p.id,p.title,p.authors,p.abstract,p.category,p.date,p.year,p.rights,p.url,
+                p.rowid
          FROM papers p WHERE 1=1{filters}
          ORDER BY p.date DESC LIMIT ?{limit_idx}"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let refs: Vec<&dyn ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(refs.as_slice(), |r| {
         let paper = row_to_paper(r, 0)?;
+        // Nothing matched, so there is nothing to mark: these are already their
+        // own "highlighted" form and need no hydration.
         let abstract_hl = paper.abstract_.clone();
         let title_hl = paper.title.clone();
         Ok(Hit {
             paper,
             abstract_hl,
             title_hl,
+            rowid: r.get(9)?,
         })
     })?;
     let mut out = Vec::new();

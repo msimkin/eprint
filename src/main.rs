@@ -469,12 +469,27 @@ pub fn open_url(url: &str) -> Result<()> {
     } else {
         "xdg-open"
     };
-    std::process::Command::new(opener)
-        .arg(url)
+    let mut cmd = std::process::Command::new(opener);
+    cmd.arg(url)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .with_context(|| format!("launching {opener}"))?;
+        .stderr(std::process::Stdio::null());
+
+    // macOS `open` hands off and returns; several `xdg-open` backends do not,
+    // and waiting on one of those freezes the browser TUI until the browser
+    // itself exits. So wait only where waiting is known to be cheap.
+    if cfg!(target_os = "macos") {
+        let status = cmd
+            .status()
+            .with_context(|| format!("launching {opener}"))?;
+        // Previously fetched and thrown away, which made "no application is
+        // registered for this" indistinguishable from success.
+        if !status.success() {
+            bail!("{opener} could not open {url}");
+        }
+    } else {
+        cmd.spawn()
+            .with_context(|| format!("launching {opener}"))?;
+    }
     Ok(())
 }
 
@@ -631,7 +646,14 @@ fn save_hint() -> String {
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
     };
-    format!("⌘S anywhere in {places} and it will be kept")
+    // The key that saves a page is not the same one everywhere, and naming the
+    // wrong one is worse than naming none.
+    let save_key = if cfg!(target_os = "macos") {
+        "⌘S"
+    } else {
+        "Ctrl+S"
+    };
+    format!("{save_key} anywhere in {places} and it will be kept")
 }
 
 /// Detached child that files the PDF once the browser has saved it. Same recipe
@@ -728,7 +750,11 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         prefix: !a.exact,
     };
 
-    let hits = db::search(&conn, &q)?;
+    let mut hits = db::search(&conn, &q)?;
+    // The marked-up strings are no longer part of the search itself, since
+    // `browse` runs unbounded and cannot afford them. This path prints every row
+    // it fetched, so it wants all of them — a few dozen rowid seeks, ~0ms.
+    db::hydrate_all(&conn, &q, &mut hits);
 
     if a.json {
         println!("{}", render::json_of(&hits));

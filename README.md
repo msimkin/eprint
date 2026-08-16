@@ -127,7 +127,26 @@ on screen are ever laid out. `-n` still exists if you want a smaller set.
 
 `/` refines the current query rather than replacing it, so you can narrow a search by
 typing more terms; `ctrl-u` clears it to start fresh. Expansion is tracked per paper id, so
-it survives re-searching.
+it survives re-searching. Typing is debounced: the query line updates on every keystroke, the
+listing catches up once you pause, and a `…` next to the cursor means it has not caught up yet.
+
+### Copying needs a clipboard tool on Linux
+
+`y`, `b` and `B` shell out, because a terminal cannot write your clipboard by itself. macOS has
+`pbcopy` built in; Linux does not ship anything by default, so install one:
+
+```sh
+sudo apt install wl-clipboard      # Wayland — the Ubuntu default session
+sudo apt install xclip             # X11
+```
+
+`wl-copy`, `xclip` and `xsel` are all tried, in whichever order suits the session, so either
+package is enough and having both is fine. If none is present the status line says so and names
+the package rather than just reporting failure.
+
+Terminals that implement OSC 52 (kitty, WezTerm, foot, Alacritty, tmux, and so over ssh) are used
+as a last resort and need nothing installed. GNOME Terminal is not one of them — VTE has never
+implemented it — which is why the packages above matter there.
 
 Because nothing needs to be clicked, `browse` works identically on terminals without OSC 8
 support — press `enter` instead.
@@ -160,7 +179,7 @@ eprint --version
 
 The first search builds the local index automatically — about 30 seconds, once.
 
-Switch on Tab completion while you are here (zsh):
+Switch on Tab completion while you are here (zsh or bash):
 
 ```sh
 eprint config --completions
@@ -223,7 +242,7 @@ eprint status                         # index stats
 eprint update                         # refresh now
 eprint update --full                  # rebuild from scratch
 eprint update --quiet                 # refresh with no progress output
-eprint config --completions           # switch on Tab completion (zsh)
+eprint config --completions           # switch on Tab completion (zsh or bash)
 ```
 
 Every short flag has a long form: `-n` is `--limit`, `-a` is `--abstracts`, `-t` is `--title`.
@@ -232,23 +251,32 @@ A query is just the first argument, so `eprint search <query>` and `eprint <quer
 thing; `search` is kept for the fingers that expect it. `new` and `Bib` are not — those words are
 now ordinary query terms.
 
-## Tab completion (zsh)
+## Tab completion (zsh and bash)
 
 ```sh
-eprint config --completions      # adds one line to ~/.zshrc, then open a new shell
+eprint config --completions      # adds one line to your shell's rc file
 ```
 
-It is idempotent, tells you the file it touched, and does nothing if the line is already there.
-`eprint config` reports whether completion is on. To do it by hand instead:
+It reads `$SHELL`, writes to `~/.zshrc` or `~/.bashrc` accordingly, is idempotent, tells you the
+file it touched, and does nothing if the line is already there. `eprint config` reports whether
+completion is on. To do it by hand instead:
 
 ```sh
-echo 'eval "$(eprint completions zsh)"' >> ~/.zshrc
+echo 'eval "$(eprint completions zsh)"'  >> ~/.zshrc
+echo 'eval "$(eprint completions bash)"' >> ~/.bashrc
 ```
 
-Either way that one line is enough even on a bare `.zshrc`: the function ships inside the binary and
-initialises zsh's completion system itself if your shell has not already done so. Without that,
-`compdef` is undefined and Tab does nothing **anywhere** — not just for `eprint` — which is a
-confusing way to discover that your shell never ran `compinit`.
+Either way that one line is enough even on a bare rc file: the function ships inside the binary.
+Under zsh it initialises the completion system itself if your shell has not already done so —
+without that, `compdef` is undefined and Tab does nothing **anywhere**, not just for `eprint`, which
+is a confusing way to discover that your shell never ran `compinit`. The bash function needs no
+such bootstrap, and deliberately depends on nothing outside bash itself: not the `bash-completion`
+package, and no syntax newer than bash 3.2.
+
+The two are not quite equal. Bash has no description column, so where zsh shows a paper's title or
+an author's paper count beside each candidate, bash can only offer the value. Everything else — the
+commands, the per-command flags, paper ids, categories, authors, watch numbers, and the
+`--flag=value` form — completes the same in both, case-insensitively in both.
 
 `eprint open <TAB>` then offers the papers you have already downloaded, with their titles:
 
@@ -317,7 +345,7 @@ Completion ignores case everywhere, like the filters themselves: `--author shami
 capitalisation but without accents, since a shell cannot reach `Damgård` from a typed `damga`; the
 description beside the candidate shows the real spelling when the two differ.
 
-Changing completion means starting a new shell, or `exec zsh` — the function is loaded once when the
+Changing completion means starting a new shell, or `exec $SHELL` — the function is loaded once when the
 shell starts, so an already-open terminal keeps the version it read at login.
 
 Paper ids complete from your **library**, not the whole archive: a short changing list is what
@@ -624,9 +652,15 @@ deliberate trade: the sixteen offer no muted mid-tones and their brightness is w
 theme decides, so a palette built on them could not stay balanced. `mono` still inherits
 everything.
 
-`auto` reads `COLORFGBG` when the terminal sets it — rxvt and Konsole do, but macOS
-Terminal.app and iTerm2 do not — and otherwise assumes a dark background. If that guess is
-wrong, set `theme` explicitly; that is what the setting is for.
+`auto` tries two things, cheapest first. `COLORFGBG` is free but only rxvt and Konsole set it;
+Terminal.app, iTerm2 and GNOME Terminal all leave it unset. So when it is missing, `auto` asks the
+terminal directly with an **OSC 11** query and reads the `rgb:` background it answers with — the
+same mechanism vim, tmux and `bat` use for this. xterm, VTE (so GNOME Terminal), kitty, foot,
+WezTerm, Alacritty and Terminal.app all answer.
+
+A terminal that stays silent costs one 100ms timeout and then falls back to assuming dark, as
+before. Setting `theme` explicitly skips the query entirely, and is still the right answer if you
+just want a particular palette.
 
 ### Paging
 
@@ -778,7 +812,7 @@ Pass `EPRINT_DB=/tmp/scratch.db` to work against a throwaway index instead of yo
 | `src/config.rs` | Config file reading and writing (settings and watches) |
 | `src/names.rs` | Who an author is: folding, the name table, the one matching predicate |
 | `src/dates.rs` | Civil-date arithmetic, ISO storage, the day-first grammar |
-| `src/completions.rs` | The zsh function, and installing it |
+| `src/completions.rs` | The zsh and bash functions, and installing them |
 
 Two independent data sources feed one SQLite database: ePrint's OAI-PMH endpoint supplies
 paper metadata (`papers`, plus an FTS5 index), and CryptoBib supplies citation keys

@@ -171,9 +171,153 @@ zstyle ':completion:*:*:eprint:*' list-grouped false
 compdef _eprint eprint
 "#;
 
+/// The same function for bash, which is what Ubuntu gives you.
+///
+/// Deliberately self-contained: no `_init_completion`, no
+/// `_get_comp_words_by_ref`, because those live in the `bash-completion`
+/// package and this should work without it. Written to bash 3.2 syntax — not
+/// for macOS's sake, but because anything newer would fail to *parse* on a
+/// shell that old, taking the whole `eval` down with it.
+///
+/// Bash has no description column, so the `value:description` lines the other
+/// targets emit are cut at the first colon. That loses the paper counts zsh
+/// shows; there is nowhere to put them.
+const BASH_COMPLETION: &str = r##"
+# eprint bash completion. Install with:
+#   echo 'eval "$(eprint completions bash)"' >> ~/.bashrc
+
+_eprint_offer() {
+  # $1 newline-separated candidates, $2 the word being completed.
+  local IFS=$'\n'
+  local word pattern esc
+  COMPREPLY=()
+  # Matched case-insensitively here rather than with `compgen -W`, which folds
+  # nothing: `--author shamir` and `--category crypto` are perfectly good
+  # filters everywhere else in the tool, so they should be here too.
+  pattern=$(printf '%s' "$2" | sed 's/[^a-zA-Z0-9_ -]/\\&/g')
+  for word in $(printf '%s\n' "$1" | grep -i "^$pattern" 2>/dev/null); do
+    # Author names contain spaces. Unescaped, bash inserts the first word and
+    # leaves the rest looking like a second argument.
+    printf -v esc '%q' "$word"
+    COMPREPLY[${#COMPREPLY[@]}]=$esc
+  done
+}
+
+_eprint() {
+  local cur prev flag cmd sub vals search_flags
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]}
+  COMPREPLY=()
+
+  # `--flag=value` arrives split in three, because '=' is in COMP_WORDBREAKS:
+  # the value is the current word and the flag is two back.
+  flag=$prev
+  if [ "$prev" = "=" ]; then
+    flag=${COMP_WORDS[COMP_CWORD-2]}
+  fi
+
+  # Flag values before the per-command arms, because --category and --author are
+  # taken by searches, browse and `watch add` alike and the answer is the same.
+  case $flag in
+    --category)
+      vals=$(eprint completions categories 2>/dev/null | cut -d: -f1)
+      _eprint_offer "$vals" "$cur"; return ;;
+    --author)
+      # Filtered by what has been typed: the whole list is 21,000 names.
+      vals=$(eprint completions authors "$cur" 2>/dev/null | cut -d: -f1)
+      _eprint_offer "$vals" "$cur"; return ;;
+    --scope)
+      _eprint_offer 'all
+title' "$cur"; return ;;
+    --theme)
+      _eprint_offer 'auto
+dark
+light
+mono' "$cur"; return ;;
+  esac
+
+  cmd=${COMP_WORDS[1]}
+  sub=${COMP_WORDS[2]}
+
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    _eprint_offer 'browse
+open
+show
+watch
+bib
+status
+update
+config' "$cur"
+    return
+  fi
+
+  # A word being typed as a flag. These mirror the flags clap shows in --help,
+  # so they must be updated alongside it; deliberately hidden flags stay out,
+  # since completion is a discovery surface too.
+  if [ "${cur:0:1}" = "-" ]; then
+    search_flags='-n
+--limit
+--date
+--author
+--category
+-t
+--title'
+    case $cmd in
+      open) vals='--rm' ;;
+      show|status) vals='' ;;
+      browse) vals=$search_flags ;;
+      bib) vals='--entry
+--update
+--force' ;;
+      update) vals='--full
+--quiet' ;;
+      config) vals='--init
+-e
+--edit
+--completions' ;;
+      watch)
+        case $sub in
+          add) vals='--author
+--category
+-t
+--title' ;;
+          rm) vals='--all' ;;
+          *) vals='' ;;
+        esac ;;
+      # A bare `eprint`, a query, or the hidden `search`: the feed's own flags.
+      *) vals="$search_flags
+-a
+--abstracts" ;;
+    esac
+    if [ -n "$vals" ]; then _eprint_offer "$vals" "$cur"; fi
+    return
+  fi
+
+  case $cmd in
+    open|show|bib)
+      vals=$(eprint completions ids 2>/dev/null | cut -d: -f1)
+      _eprint_offer "$vals" "$cur" ;;
+    watch)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        _eprint_offer 'add
+rm
+list' "$cur"
+      elif [ "$sub" = "rm" ]; then
+        # `watch rm` takes the position `eprint watch` prints, and those numbers
+        # renumber after a removal.
+        vals=$(eprint completions watches 2>/dev/null | cut -d: -f1)
+        _eprint_offer "$vals" "$cur"
+      fi ;;
+  esac
+}
+
+complete -F _eprint eprint
+"##;
+
 pub(crate) fn do_completions(what: &str, needle: Option<&str>) -> Result<()> {
     match what {
         "zsh" => print!("{ZSH_COMPLETION}"),
+        "bash" => print!("{BASH_COMPLETION}"),
         "ids" => {
             for (id, title, _) in library_listing() {
                 // `id:title`, the shape `_describe` expects.
@@ -218,43 +362,68 @@ pub(crate) fn do_completions(what: &str, needle: Option<&str>) -> Result<()> {
         }
         other => bail!(
             "unknown completion target {other:?} — \
-             try `zsh`, `ids`, `categories`, `watches` or `authors`"
+             try `zsh`, `bash`, `ids`, `categories`, `watches` or `authors`"
         ),
     }
     Ok(())
 }
 
-/// The line a shell needs to load the completion function, and where it goes.
-/// Cargo has no post-install hook, so someone has to put it there; this makes it
-/// one command instead of an editor session.
-pub(crate) const COMPLETION_LINE: &str = r#"eval "$(eprint completions zsh)"   # eprint Tab completion"#;
-
-pub(crate) fn rc_path() -> Option<PathBuf> {
-    let dir = std::env::var("ZDOTDIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(dir.join(".zshrc"))
+/// Which shell is running, as far as `$SHELL` admits. `None` for anything with
+/// no completion function here — fish and friends.
+pub(crate) fn shell_kind() -> Option<&'static str> {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    // Matched on the basename so `/usr/local/bin/zsh-5.9` and `-bash` both land.
+    let name = shell.rsplit('/').next().unwrap_or_default().to_string();
+    if name.contains("zsh") {
+        Some("zsh")
+    } else if name.contains("bash") {
+        Some("bash")
+    } else {
+        None
+    }
 }
 
-/// Has the line already been added? Matched loosely, so a hand-written variant
-/// still counts and nothing is ever appended twice.
+/// The line a shell needs to load the completion function. Cargo has no
+/// post-install hook, so someone has to put it there; this makes it one command
+/// instead of an editor session.
+pub(crate) fn completion_line(kind: &str) -> String {
+    format!(r#"eval "$(eprint completions {kind})"   # eprint Tab completion"#)
+}
+
+pub(crate) fn rc_path() -> Option<PathBuf> {
+    match shell_kind()? {
+        // `$ZDOTDIR` only means anything to zsh.
+        "zsh" => {
+            let dir = std::env::var("ZDOTDIR")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir)?;
+            Some(dir.join(".zshrc"))
+        }
+        "bash" => Some(dirs::home_dir()?.join(".bashrc")),
+        _ => None,
+    }
+}
+
+/// Has the line already been added? Matched loosely — on the command rather than
+/// the shell name — so a hand-written variant still counts, and switching shells
+/// does not make an installed line invisible.
 pub(crate) fn completions_installed() -> bool {
     rc_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| t.contains("eprint completions zsh"))
+        .map(|t| t.contains("eprint completions"))
         .unwrap_or(false)
 }
 
 pub(crate) fn install_completions() -> Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_default();
-    if !shell.ends_with("zsh") {
+    let Some(kind) = shell_kind() else {
         bail!(
-            "only zsh completion exists so far, and $SHELL is {:?}.\n       \
-             The function itself is `eprint completions zsh` if you want to adapt it.",
+            "there is a completion function for zsh and for bash, and $SHELL is {:?}.\n       \
+             `eprint completions zsh` prints one of them if you want to adapt it.",
             shell
         );
-    }
+    };
     let path = rc_path().context("could not determine your home directory")?;
     if completions_installed() {
         println!("\n  already set up in {}\n", path.display());
@@ -264,7 +433,7 @@ pub(crate) fn install_completions() -> Result<()> {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(COMPLETION_LINE);
+    text.push_str(&completion_line(kind));
     text.push('\n');
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     println!(
@@ -279,7 +448,7 @@ pub(crate) fn install_completions() -> Result<()> {
 pub(crate) fn nudge_completions(conn: &rusqlite::Connection) {
     const KEY: &str = "completions_hint";
     if !std::io::stderr().is_terminal()
-        || !std::env::var("SHELL").unwrap_or_default().ends_with("zsh")
+        || shell_kind().is_none()
         || completions_installed()
         || db::meta_get(conn, KEY).unwrap_or(None).is_some()
     {

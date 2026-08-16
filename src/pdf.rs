@@ -43,7 +43,15 @@ fn watch_dirs() -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .collect();
+    // Ubuntu's default Firefox is a snap, and a confined snap saves here rather
+    // than to the real ~/Downloads — so the adopter would sit watching a
+    // directory the browser never writes to. Added rather than substituted,
+    // because the same machine may also run an unconfined browser.
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("snap/firefox/common/Downloads"));
+    }
     dirs.dedup();
+    // Also what keeps the snap path out of the list on every other machine.
     dirs.retain(|d| d.is_dir());
     dirs
 }

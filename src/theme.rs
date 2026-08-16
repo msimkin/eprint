@@ -41,9 +41,12 @@ pub struct Theme {
     pub color: bool,
 }
 
-/// Best-effort background detection. `COLORFGBG` is set by a handful of
-/// terminals (rxvt, Konsole, some others); macOS Terminal.app and iTerm2 do
-/// not set it, so the documented fallback is "assume dark".
+/// Best-effort background detection, cheapest signal first.
+///
+/// `COLORFGBG` is free but set by only a handful of terminals (rxvt, Konsole);
+/// Terminal.app, iTerm2 and GNOME Terminal all leave it unset, which is how a
+/// light-background user ended up with the dark palette. So when it is missing,
+/// ask the terminal directly — see `query_background`.
 fn detect_mode() -> Mode {
     if let Ok(v) = std::env::var("COLORFGBG") {
         if let Some(bg) = v.rsplit(';').next() {
@@ -56,7 +59,106 @@ fn detect_mode() -> Mode {
             }
         }
     }
-    Mode::Dark
+    // Cached for the life of the process: `Theme::resolve` is called more than
+    // once per command and the terminal's answer cannot change underneath it.
+    static PROBED: std::sync::OnceLock<Option<Mode>> = std::sync::OnceLock::new();
+    PROBED
+        .get_or_init(query_background)
+        .unwrap_or(Mode::Dark)
+}
+
+/// Ask the terminal what colour it is painting behind us (OSC 11), and read the
+/// `rgb:RRRR/GGGG/BBBB` it answers with.
+///
+/// Worth doing where OSC 52 was not: writing the clipboard is unimplemented in
+/// VTE, but *querying* colours is supported there and in xterm, kitty, foot,
+/// WezTerm, Alacritty and Terminal.app — it is how vim, tmux and bat decide the
+/// same question. A terminal that stays silent costs one timeout and falls back
+/// to the old assumption.
+fn query_background() -> Option<Mode> {
+    use std::io::{Read, Write};
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return None;
+    }
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let reader = tty.try_clone().ok()?;
+
+    // The reply arrives as ordinary input, so the terminal must not be line
+    // buffering or echoing it. Restored by the guard however this returns.
+    ratatui::crossterm::terminal::enable_raw_mode().ok()?;
+    struct Cooked;
+    impl Drop for Cooked {
+        fn drop(&mut self) {
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        }
+    }
+    let _cooked = Cooked;
+
+    tty.write_all(b"\x1b]11;?\x07").ok()?;
+    tty.flush().ok()?;
+
+    // Read on a thread so a terminal that never answers costs a timeout rather
+    // than a hang. The thread is left to the process to clean up: it is blocked
+    // on a read that will never return, and there is nothing to wait for.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut out = Vec::new();
+        let mut byte = [0u8; 1];
+        while out.len() < 64 {
+            match reader.read(&mut byte) {
+                Ok(1) => {
+                    out.push(byte[0]);
+                    // Terminals answer with whichever terminator was asked for,
+                    // but not all of them are consistent about it.
+                    if byte[0] == 0x07 || out.ends_with(b"\x1b\\") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let _ = tx.send(out);
+    });
+
+    let reply = rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .ok()?;
+    luminance_of(&String::from_utf8_lossy(&reply)).map(|l| {
+        if l > 0.5 {
+            Mode::Light
+        } else {
+            Mode::Dark
+        }
+    })
+}
+
+/// Pull `rgb:RRRR/GGGG/BBBB` out of an OSC 11 reply and weigh it into one
+/// number. Components are hex of any width — 4 digits in practice, but 2 and 1
+/// are legal and some terminals use them.
+fn luminance_of(reply: &str) -> Option<f32> {
+    let rest = reply.split("rgb:").nth(1)?;
+    let mut parts = rest.split('/');
+    let mut channel = || -> Option<f32> {
+        let raw: String = parts
+            .next()?
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        if raw.is_empty() {
+            return None;
+        }
+        let value = u32::from_str_radix(&raw, 16).ok()?;
+        let full = 16u32.pow(raw.len() as u32) - 1;
+        Some(value as f32 / full as f32)
+    };
+    let (r, g, b) = (channel()?, channel()?, channel()?);
+    // Rec. 709 luma: green carries most of what the eye reads as brightness.
+    Some(0.2126 * r + 0.7152 * g + 0.0722 * b)
 }
 
 impl Theme {
@@ -176,5 +278,40 @@ impl Theme {
                 .bg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_shapes_terminals_actually_reply_with() {
+        // xterm/VTE: 16-bit components, BEL-terminated.
+        let white = luminance_of("\x1b]11;rgb:ffff/ffff/ffff\x07").unwrap();
+        assert!(white > 0.99, "white was {white}");
+        let black = luminance_of("\x1b]11;rgb:0000/0000/0000\x07").unwrap();
+        assert!(black < 0.01, "black was {black}");
+        // 8-bit components, ST-terminated — also legal.
+        let same = luminance_of("\x1b]11;rgb:ff/ff/ff\x1b\\").unwrap();
+        assert!((same - white).abs() < 0.01, "width should not change the value");
+    }
+
+    #[test]
+    fn picks_the_palette_the_background_calls_for() {
+        let dark = luminance_of("rgb:1c1c/1c1c/1c1c").unwrap();
+        let light = luminance_of("rgb:ffff/fff8/f0f0").unwrap();
+        assert!(dark <= 0.5, "a near-black background must read as dark");
+        assert!(light > 0.5, "an off-white background must read as light");
+        // Solarized light and dark, the classic pair that must not collide.
+        assert!(luminance_of("rgb:fdfd/f6f6/e3e3").unwrap() > 0.5);
+        assert!(luminance_of("rgb:0000/2b2b/3636").unwrap() <= 0.5);
+    }
+
+    #[test]
+    fn nonsense_is_declined_rather_than_guessed() {
+        assert!(luminance_of("").is_none());
+        assert!(luminance_of("\x1b]11;?\x07").is_none());
+        assert!(luminance_of("rgb:ffff/ffff").is_none(), "two channels is not a colour");
     }
 }

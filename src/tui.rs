@@ -80,16 +80,23 @@ struct App {
     bib_stale_days: Option<i64>,
     /// The one name to wrap in hearts, if the config names one.
     favourite: Option<String>,
+    /// The query moved and the results have not caught up yet. Set by typing,
+    /// cleared by the search the event loop runs once the typing pauses.
+    pending_search: bool,
 }
 
+/// How long to wait for the next keystroke before searching. Short enough to feel
+/// immediate, long enough that a word typed at speed costs one query instead of
+/// one per letter — which on a two-character prefix is the difference between
+/// 110ms and seven times that.
+const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
 impl App {
-    fn search(&mut self, conn: &Connection) {
-        // Whatever `w` off would have restored is stale the moment the query or a
-        // filter moves, so the stash is dropped on every search and re-taken by the
-        // `w` handler alone.
-        self.unfiltered = None;
-        let q = Query {
-            terms: &self.query,
+    /// The query the current state describes. `terms` is borrowed rather than
+    /// owned so callers can hand in a clone and keep mutating `self`.
+    fn query_for<'a>(&self, terms: &'a str) -> Query<'a> {
+        Query {
+            terms,
             year: self.filters.year,
             since: self.filters.since.clone(),
             before: self.filters.before.clone(),
@@ -100,12 +107,62 @@ impl App {
             limit: self.filters.limit,
             scope: self.scope,
             prefix: self.filters.prefix,
+        }
+    }
+
+    /// Fetch the marked-up title and abstract for the rows about to be drawn.
+    ///
+    /// Safe to run *after* the heights are known, because marking does not change
+    /// how text wraps — `visible_len` skips the markers. That is the whole reason
+    /// the layout can cover every hit while only a screenful is hydrated.
+    fn hydrate_visible(&mut self, conn: &Connection, first: usize, rows: usize) {
+        let terms = self.query.clone();
+        let q = self.query_for(&terms);
+        let end = (first + rows).min(self.hits.len());
+        for i in first..end {
+            let _ = db::hydrate(conn, &q, &mut self.hits[i]);
+        }
+    }
+
+    /// A citation key is only ever drawn on an expanded row, so it is fetched
+    /// when a row is expanded rather than for all 26,000 on every keystroke.
+    fn expand_selected(&mut self, conn: &Connection) {
+        let Some(id) = self.selected_hit().map(|h| h.paper.id.clone()) else {
+            return;
         };
+        if self.expanded.remove(&id) {
+            return;
+        }
+        if !self.bib.contains_key(&id) {
+            if let Ok(Some(entry)) = db::bib_for(conn, &id) {
+                self.bib.insert(id.clone(), entry);
+            }
+        }
+        self.expanded.insert(id);
+    }
+
+    fn search(&mut self, conn: &Connection) {
+        // Whatever `w` off would have restored is stale the moment the query or a
+        // filter moves, so the stash is dropped on every search and re-taken by the
+        // `w` handler alone.
+        self.unfiltered = None;
+        let terms = self.query.clone();
+        let q = self.query_for(&terms);
         match db::search(conn, &q) {
             Ok(hits) => {
-                self.total = db::count_matches(conn, &q).unwrap_or(hits.len());
-                let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
-                self.bib = db::bib_map(conn, &ids).unwrap_or_default();
+                // Unbounded, so every match is already here and a second
+                // `COUNT(*)` over the same expression could only agree with
+                // `hits.len()` — it was repeating the whole match to learn
+                // nothing. Only a limited listing needs asking.
+                self.total = if self.filters.limit == usize::MAX {
+                    hits.len()
+                } else {
+                    db::count_matches(conn, &q).unwrap_or(hits.len())
+                };
+                // Citation keys are shown only on an expanded row, so they are
+                // looked up on expansion. Asking for all of them built an
+                // `IN (...)` with 26,000 bind parameters on every keystroke.
+                self.bib.clear();
                 self.hits = hits;
                 self.status = None;
             }
@@ -187,12 +244,11 @@ fn hit_height(app: &App, hit: &Hit, width: usize) -> usize {
     let is_open = app.expanded.contains(&p.id);
     let fav = app.favourite.as_deref();
     let (body_w, title_w, meta_w) = widths(app, hit, width);
-    let title_src = if hit.title_hl.is_empty() {
-        &p.title
-    } else {
-        &hit.title_hl
-    };
-    let mut n = crate::render::wrap_count(title_src, title_w);
+    // Counted from the *unmarked* text on purpose. `visible_len` skips the match
+    // markers, so the marked and unmarked forms wrap identically — which is what
+    // lets heights be known for all 26,000 hits while only the rows on screen are
+    // hydrated. `hit_lines` wraps the marked form and debug-asserts they agree.
+    let mut n = crate::render::wrap_count(&p.title, title_w);
     let byline = if is_open {
         full_authors(&p.authors, fav)
     } else {
@@ -210,7 +266,7 @@ fn hit_height(app: &App, hit: &Hit, width: usize) -> usize {
         if !trailer.is_empty() {
             n += crate::render::wrap_count(&trailer.join(" · "), meta_w);
         }
-        n += crate::render::wrap_body_count(&hit.abstract_hl, body_w);
+        n += crate::render::wrap_body_count(&p.abstract_, body_w);
     }
     n + 1 // the blank line between entries
 }
@@ -347,27 +403,121 @@ fn bibtex_key(id: &str) -> String {
     format!("cryptoeprint:{id}")
 }
 
-fn copy_to_clipboard(text: &str) -> bool {
-    let (prog, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("pbcopy", &[])
-    } else if cfg!(target_os = "windows") {
-        ("clip", &[])
+/// Is this a Wayland session? Decides only the *order* of the candidates, never
+/// which ones are tried, so a wrong guess costs one failed spawn.
+fn on_wayland() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").map(|s| s == "wayland") == Ok(true)
+}
+
+/// The clipboard tools worth trying, best first. There is no single one to pick:
+/// macOS has `pbcopy`, X11 has `xclip`/`xsel`, Wayland has `wl-copy`, and Ubuntu
+/// ships *none* of the three Linux ones by default.
+fn clipboard_candidates() -> Vec<(&'static str, &'static [&'static str])> {
+    candidates_for(
+        cfg!(target_os = "macos"),
+        cfg!(target_os = "windows"),
+        on_wayland(),
+    )
+}
+
+/// Split out from the `cfg!`s so the Linux ordering can be tested from macOS,
+/// where it is compiled but never reached.
+fn candidates_for(
+    macos: bool,
+    windows: bool,
+    wayland: bool,
+) -> Vec<(&'static str, &'static [&'static str])> {
+    const XCLIP: (&str, &[&str]) = ("xclip", &["-selection", "clipboard"]);
+    const XSEL: (&str, &[&str]) = ("xsel", &["--clipboard", "--input"]);
+    const WLCOPY: (&str, &[&str]) = ("wl-copy", &[]);
+    if macos {
+        vec![("pbcopy", &[])]
+    } else if windows {
+        vec![("clip", &[])]
+    } else if wayland {
+        vec![WLCOPY, XCLIP, XSEL]
     } else {
-        ("xclip", &["-selection", "clipboard"])
-    };
-    match std::process::Command::new(prog)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            if let Some(mut sin) = child.stdin.take() {
-                let _ = sin.write_all(text.as_bytes());
-            }
-            child.wait().map(|s| s.success()).unwrap_or(false)
-        }
+        vec![XCLIP, XSEL, WLCOPY]
+    }
+}
+
+/// What to tell someone who has none of them, naming the package rather than the
+/// binary — "install xclip" is not a command anyone can run.
+pub fn clipboard_hint() -> &'static str {
+    if on_wayland() {
+        "no clipboard tool — sudo apt install wl-clipboard"
+    } else {
+        "no clipboard tool — sudo apt install xclip"
+    }
+}
+
+/// Ask the terminal itself to take the text (OSC 52). Written to the controlling
+/// terminal rather than stdout, because the TUI owns stdout while this runs.
+///
+/// This does *not* rescue GNOME Terminal: VTE has never implemented OSC 52
+/// (gitlab.gnome.org/GNOME/vte/-/issues/2495, open since 2018). It is here for
+/// kitty, WezTerm, foot, Alacritty and tmux, and for sessions over ssh where no
+/// local clipboard binary can help.
+fn osc52(text: &str) -> bool {
+    let payload = base64(text.as_bytes());
+    match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(mut tty) => write!(tty, "\x1b]52;c;{payload}\x07").is_ok(),
         Err(_) => false,
     }
+}
+
+/// Standard base64, because OSC 52 carries its payload that way and pulling in a
+/// crate for twenty lines would be the tenth dependency.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(match chunk.len() {
+            1 => '=',
+            _ => ALPHABET[(n >> 6 & 63) as usize] as char,
+        });
+        out.push(match chunk.len() {
+            3 => ALPHABET[(n & 63) as usize] as char,
+            _ => '=',
+        });
+    }
+    out
+}
+
+/// First candidate that exists and exits cleanly wins; a missing binary is not a
+/// failure, just the next one's turn.
+fn copy_to_clipboard(text: &str) -> bool {
+    for (prog, args) in clipboard_candidates() {
+        let spawned = std::process::Command::new(prog)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            // Not installed — try the next one rather than giving up.
+            Err(_) => continue,
+        };
+        if let Some(mut sin) = child.stdin.take() {
+            if sin.write_all(text.as_bytes()).is_err() {
+                continue;
+            }
+            // Closed here rather than at the end of the loop body: wl-copy and
+            // xclip both wait for EOF before taking ownership of the selection.
+            drop(sin);
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    osc52(text)
 }
 
 struct Guard;
@@ -401,6 +551,7 @@ pub fn run(
         watched_only: false,
         watch_list,
         favourite: crate::config::load().favourite_author,
+        pending_search: false,
         status: None,
         filters,
         theme,
@@ -424,6 +575,71 @@ pub fn run(
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
     loop {
+        // The viewport is worked out before drawing rather than inside the draw
+        // closure, because the rows it lands on have to be hydrated first and that
+        // needs `&mut app`. The layout below is `Length(2) / Min(1) / Length(1)`
+        // over the full area, so these two are exactly what the closure will see.
+        let size = term.size()?;
+        let width = size.width as usize;
+        let view_h = (size.height as usize).saturating_sub(3);
+
+        // --- results: heights for every hit, spans for the visible few ---
+        // Counting is cheap enough to do for every hit on every frame, where
+        // laying them all out is not. This is what removed the entry limit.
+        let heights: Vec<usize> = app
+            .hits
+            .iter()
+            .map(|h| hit_height(&app, h, width))
+            .collect();
+        let mut starts: Vec<usize> = Vec::with_capacity(heights.len() + 1);
+        let mut acc = 0usize;
+        for h in &heights {
+            starts.push(acc);
+            acc += h;
+        }
+        let total_lines = acc;
+
+        // Keep the selected entry on screen.
+        if let Some(&start) = starts.get(app.selected) {
+            let end = start + heights[app.selected];
+            if start < app.scroll {
+                app.scroll = start;
+            } else if end > app.scroll + view_h {
+                app.scroll = end.saturating_sub(view_h);
+            }
+            if heights[app.selected] > view_h {
+                app.scroll = start;
+            }
+        }
+        app.scroll = app.scroll.min(total_lines.saturating_sub(view_h));
+
+        // Lay out only what the viewport can show, starting from the hit the
+        // scroll offset falls inside.
+        let first = starts.partition_point(|&s| s <= app.scroll).saturating_sub(1);
+        let intra = app.scroll - starts.get(first).copied().unwrap_or(0);
+
+        // Fetch the marked-up text for just those rows. Done here, after the
+        // heights, because marking cannot change them — see `hit_height`.
+        let mut visible = 0usize;
+        let mut used = 0usize;
+        while first + visible < app.hits.len() && used < view_h + intra {
+            used += heights[first + visible];
+            visible += 1;
+        }
+        app.hydrate_visible(&conn, first, visible);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for i in first..(first + visible).min(app.hits.len()) {
+            lines.extend(hit_lines(&app, i, &app.hits[i], width));
+        }
+        if app.hits.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  No matches.",
+                app.theme.style(Tone::Meta),
+            )));
+        }
+
         term.draw(|f| {
             let area = f.area();
             let chunks = Layout::default()
@@ -435,8 +651,6 @@ pub fn run(
                 ])
                 .split(area);
 
-            let width = chunks[1].width as usize;
-            let view_h = chunks[1].height as usize;
             let th = &app.theme;
 
             // --- header ---
@@ -473,6 +687,12 @@ pub fn run(
                     Span::styled("  search ", th.style(Tone::Meta)),
                     Span::styled(app.query.clone(), th.style(Tone::Title)),
                     Span::styled("▏", th.style(Tone::Marker)),
+                    // The listing below is one query behind until the debounce
+                    // fires; say so rather than let it look like a wrong answer.
+                    Span::styled(
+                        if app.pending_search { "  …" } else { "" },
+                        th.style(Tone::Meta),
+                    ),
                 ])
             } else {
                 let q = if app.query.is_empty() {
@@ -487,55 +707,6 @@ pub fn run(
                 ])
             };
             f.render_widget(Paragraph::new(vec![head, Line::raw("")]), chunks[0]);
-
-            // --- results ---
-            // Heights only: counting is cheap enough to do for every hit on every
-            // frame, where laying them all out is not. This is what removed the
-            // entry limit.
-            let heights: Vec<usize> = app
-                .hits
-                .iter()
-                .map(|h| hit_height(&app, h, width))
-                .collect();
-            let mut starts: Vec<usize> = Vec::with_capacity(heights.len() + 1);
-            let mut acc = 0usize;
-            for h in &heights {
-                starts.push(acc);
-                acc += h;
-            }
-            let total = acc;
-
-            // Keep the selected entry on screen.
-            if let Some(&start) = starts.get(app.selected) {
-                let end = start + heights[app.selected];
-                if start < app.scroll {
-                    app.scroll = start;
-                } else if end > app.scroll + view_h {
-                    app.scroll = end.saturating_sub(view_h);
-                }
-                if heights[app.selected] > view_h {
-                    app.scroll = start;
-                }
-            }
-            app.scroll = app.scroll.min(total.saturating_sub(view_h));
-
-            // Lay out only what the viewport can show, starting from the hit the
-            // scroll offset falls inside.
-            let first = starts.partition_point(|&s| s <= app.scroll).saturating_sub(1);
-            let intra = app.scroll - starts.get(first).copied().unwrap_or(0);
-            let mut lines: Vec<Line<'static>> = Vec::new();
-            let mut i = first;
-            while i < app.hits.len() && lines.len() < view_h + intra {
-                lines.extend(hit_lines(&app, i, &app.hits[i], width));
-                i += 1;
-            }
-            if app.hits.is_empty() {
-                lines.push(Line::raw(""));
-                lines.push(Line::from(Span::styled(
-                    "  No matches.",
-                    app.theme.style(Tone::Meta),
-                )));
-            }
 
             // `intra` is at most one entry's height, so this cast is safe. Passing
             // the absolute line offset here was the old bug: past ~65,535 lines the
@@ -562,7 +733,21 @@ pub fn run(
             f.render_widget(Paragraph::new(foot), chunks[2]);
         })?;
 
-        let ev = event::read()?;
+        // Blocking while idle, so a still screen costs nothing; bounded while a
+        // search is owed, so a burst of typing collapses into one query rather
+        // than one per keystroke. The old unconditional `event::read()` meant
+        // every queued keystroke ran its own full search, and they stacked.
+        let ev = if app.pending_search {
+            if event::poll(DEBOUNCE)? {
+                event::read()?
+            } else {
+                app.pending_search = false;
+                app.search(&conn);
+                continue;
+            }
+        } else {
+            event::read()?
+        };
         let key = match ev {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
@@ -615,24 +800,34 @@ pub fn run(
         if app.editing == Editing::Query {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => app.editing = Editing::None,
+                // Leaving the prompt must not leave the listing behind: if the
+                // debounce has not fired yet, settle it here.
+                KeyCode::Esc | KeyCode::Enter => {
+                    app.editing = Editing::None;
+                    if app.pending_search {
+                        app.pending_search = false;
+                        app.search(&conn);
+                    }
+                }
                 // Ctrl-C has to work here too. Without this arm it fell through to
                 // `Char(c)` and typed a "c" — an app that swallows Ctrl-C is worse
                 // than one that ignores the key.
                 KeyCode::Char('c') if ctrl => break,
+                // Each of these only marks the query dirty. The search itself runs
+                // from the event loop once the keystrokes stop.
                 KeyCode::Backspace => {
                     app.query.pop();
-                    app.search(&conn);
+                    app.pending_search = true;
                 }
                 KeyCode::Char('u') if ctrl => {
                     app.query.clear();
-                    app.search(&conn);
+                    app.pending_search = true;
                 }
                 // Only unmodified characters are text; every other chord (ctrl-d,
                 // ctrl-a, alt-x …) is ignored rather than inserted as its letter.
                 KeyCode::Char(c) if !ctrl => {
                     app.query.push(c);
-                    app.search(&conn);
+                    app.pending_search = true;
                 }
                 _ => {}
             }
@@ -656,17 +851,15 @@ pub fn run(
             }
             KeyCode::PageDown => app.selected = (app.selected + 10).min(last),
             KeyCode::PageUp => app.selected = app.selected.saturating_sub(10),
-            KeyCode::Char(' ') | KeyCode::Tab => {
-                if let Some(h) = app.selected_hit() {
-                    let id = h.paper.id.clone();
-                    if !app.expanded.remove(&id) {
-                        app.expanded.insert(id);
-                    }
-                }
-            }
+            KeyCode::Char(' ') | KeyCode::Tab => app.expand_selected(&conn),
             KeyCode::Char('a') => {
                 if app.expanded.is_empty() {
-                    app.expanded = app.hits.iter().map(|h| h.paper.id.clone()).collect();
+                    let ids: Vec<String> = app.hits.iter().map(|h| h.paper.id.clone()).collect();
+                    // The one place the bulk lookup still earns its keep: an
+                    // explicit keypress that really does expand everything, once,
+                    // rather than a query rerun on every keystroke.
+                    app.bib = db::bib_map(&conn, &ids).unwrap_or_default();
+                    app.expanded = ids.into_iter().collect();
                 } else {
                     app.expanded.clear();
                 }
@@ -749,7 +942,7 @@ pub fn run(
                     app.status = Some(if copy_to_clipboard(&key) {
                         format!("copied {key}{note}{}", app.stale_hint())
                     } else {
-                        "could not reach the clipboard".to_string()
+                        clipboard_hint().to_string()
                     });
                 }
             }
@@ -766,7 +959,7 @@ pub fn run(
                             if copy_to_clipboard(&entry) {
                                 format!("copied BibTeX entry {key}{note}{}", app.stale_hint())
                             } else {
-                                "could not reach the clipboard".to_string()
+                                clipboard_hint().to_string()
                             }
                         }
                         Ok(Some(_)) => "entry text missing — run `eprint bib --update`".to_string(),
@@ -780,7 +973,7 @@ pub fn run(
                     app.status = Some(if copy_to_clipboard(&url) {
                         format!("copied {url}")
                     } else {
-                        "could not reach the clipboard".to_string()
+                        clipboard_hint().to_string()
                     });
                 }
             }
@@ -789,4 +982,72 @@ pub fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Hand-rolled, so pinned to the RFC 4648 vectors — a padding slip here would
+    // corrupt whatever OSC 52 handed the terminal, silently.
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input.as_bytes()), want, "base64({input:?})");
+        }
+    }
+
+    #[test]
+    fn base64_survives_non_ascii() {
+        // A citation key can carry an accented author name.
+        assert_eq!(base64("Grégoire".as_bytes()), "R3LDqWdvaXJl");
+    }
+
+    #[test]
+    fn every_platform_offers_a_clipboard_candidate() {
+        assert!(!clipboard_candidates().is_empty());
+    }
+
+    // The Linux arms never run on macOS, so this is the only thing standing
+    // between them and shipping untested.
+    #[test]
+    fn linux_tries_the_session_s_own_tool_first() {
+        let wayland: Vec<&str> = candidates_for(false, false, true)
+            .iter()
+            .map(|(p, _)| *p)
+            .collect();
+        assert_eq!(wayland, ["wl-copy", "xclip", "xsel"]);
+
+        let x11: Vec<&str> = candidates_for(false, false, false)
+            .iter()
+            .map(|(p, _)| *p)
+            .collect();
+        assert_eq!(x11, ["xclip", "xsel", "wl-copy"]);
+
+        // Whichever session, all three remain reachable: guessing wrong costs a
+        // failed spawn, not a failed copy.
+        for probe in [true, false] {
+            let names: Vec<&str> = candidates_for(false, false, probe)
+                .iter()
+                .map(|(p, _)| *p)
+                .collect();
+            for tool in ["wl-copy", "xclip", "xsel"] {
+                assert!(names.contains(&tool), "{tool} missing when wayland={probe}");
+            }
+        }
+    }
+
+    #[test]
+    fn mac_and_windows_use_their_builtin() {
+        assert_eq!(candidates_for(true, false, false)[0].0, "pbcopy");
+        assert_eq!(candidates_for(false, true, false)[0].0, "clip");
+    }
 }
