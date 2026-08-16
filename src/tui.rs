@@ -271,6 +271,37 @@ fn hit_height(app: &App, hit: &Hit, width: usize) -> usize {
     n + 1 // the blank line between entries
 }
 
+/// As many hints as the terminal can hold, most useful first, with `tail`
+/// always kept.
+///
+/// The line was a fixed string of 123 columns, so on an 80-column terminal a
+/// third of it ran off the edge — including `q quit`, which is the one hint
+/// nobody can afford to lose. Dropping whole hints from the end beats letting
+/// the renderer cut one in half.
+fn fit_hints(width: usize, hints: &[&str], tail: &str) -> String {
+    const SEP: &str = " · ";
+    let mut out = String::from("  ");
+    // Reserve the tail before spending anything on the rest.
+    let budget = width.saturating_sub(2 + SEP.len() + tail.chars().count());
+    let mut used = 0usize;
+    for hint in hints {
+        let cost = hint.chars().count() + if used == 0 { 0 } else { SEP.len() };
+        if used + cost > budget {
+            break;
+        }
+        if used > 0 {
+            out.push_str(SEP);
+        }
+        out.push_str(hint);
+        used += cost;
+    }
+    if used > 0 {
+        out.push_str(SEP);
+    }
+    out.push_str(tail);
+    out
+}
+
 /// Lay out one hit. Only ever called for rows on screen.
 fn hit_lines(app: &App, i: usize, hit: &Hit, width: usize) -> Vec<Line<'static>> {
     let (body_w, _, _) = widths(app, hit, width);
@@ -718,13 +749,44 @@ pub fn run(
 
             // --- footer ---
             let help = match app.editing {
-                Editing::Date => {
-                    "  2024 · 04/2024 · 28/04/2024 · 2023..2024 · 30d · enter apply · empty clears · esc cancel"
-                }
-                Editing::Query => "  type to filter · enter accept · ctrl-u clear · esc cancel",
-                Editing::None => {
-                    "  j/k move · space expand · t scope · d date · w watched · enter open · y url · b key · B entry · / search · q quit"
-                }
+                Editing::Date => fit_hints(
+                    width,
+                    // Enough of the grammar to show its shape, then what the
+                    // keys do — a narrow terminal should lose a fourth example
+                    // before it loses "enter apply".
+                    &[
+                        "2024",
+                        "2023..2024",
+                        "30d",
+                        "enter apply",
+                        "empty clears",
+                        "04/2024",
+                        "28/04/2024",
+                    ],
+                    "esc cancel",
+                ),
+                Editing::Query => fit_hints(
+                    width,
+                    &["type to filter", "enter accept", "ctrl-u clear"],
+                    "esc cancel",
+                ),
+                Editing::None => fit_hints(
+                    width,
+                    &[
+                        "j/k move",
+                        "space expand",
+                        "a all",
+                        "/ search",
+                        "enter open",
+                        "y url",
+                        "b key",
+                        "B entry",
+                        "t scope",
+                        "d date",
+                        "w watched",
+                    ],
+                    "q quit",
+                ),
             };
             let foot = match &app.status {
                 Some(s) => Line::from(Span::styled(format!("  {s}"), th.style(Tone::Id))),

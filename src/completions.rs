@@ -188,17 +188,38 @@ const BASH_COMPLETION: &str = r##"
 
 _eprint_offer() {
   # $1 newline-separated candidates, $2 the word being completed.
+  #
+  # Every entry put in COMPREPLY must begin with $2 *exactly*. readline works
+  # out the longest common prefix of the matches case-sensitively and replaces
+  # the typed word with it, so one candidate that differs in case is enough to
+  # shorten the line instead of extending it: with the archive's all-caps
+  # "DAMIEN COUROUSSE" in the list, typing `--author Dam` collapsed to `D`.
   local IFS=$'\n'
-  local word pattern esc
+  local word esc pattern cur
   COMPREPLY=()
-  # Matched case-insensitively here rather than with `compgen -W`, which folds
-  # nothing: `--author shamir` and `--category crypto` are perfectly good
-  # filters everywhere else in the tool, so they should be here too.
-  pattern=$(printf '%s' "$2" | sed 's/[^a-zA-Z0-9_ -]/\\&/g')
-  for word in $(printf '%s\n' "$1" | grep -i "^$pattern" 2>/dev/null); do
+  # bash hands the word over exactly as it sits on the line, backslashes and
+  # all. A name half-inserted as "Damien\ St" has to be unescaped before it can
+  # match anything, or completion dies the moment a space is involved.
+  cur=${2//\\/}
+
+  # Exactly what was typed, case and all. The common case, and the one that
+  # keeps a name's real spelling.
+  for word in $(compgen -W "$1" -- "$cur"); do
     # Author names contain spaces. Unescaped, bash inserts the first word and
     # leaves the rest looking like a second argument.
     printf -v esc '%q' "$word"
+    COMPREPLY[${#COMPREPLY[@]}]=$esc
+  done
+  if [ ${#COMPREPLY[@]} -gt 0 ]; then return; fi
+
+  # Nothing matched as typed, so fold case — `--author shamir` and
+  # `--category crypto` are perfectly good filters everywhere else in the tool
+  # and should be here too. Each candidate's opening characters are rewritten
+  # to what was actually typed, which is what keeps the invariant above true;
+  # the filters fold case, so the value still finds the same papers.
+  pattern=$(printf '%s' "$cur" | sed 's/[^a-zA-Z0-9_ -]/\\&/g')
+  for word in $(printf '%s\n' "$1" | grep -i "^$pattern" 2>/dev/null); do
+    printf -v esc '%q' "$cur${word:${#cur}}"
     COMPREPLY[${#COMPREPLY[@]}]=$esc
   done
 }
