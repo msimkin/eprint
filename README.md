@@ -25,10 +25,8 @@ rather than its title. Add `-a` for full abstracts, `-t` to match titles and aut
 `eprint show <id>` for one paper in full. For reading rather than looking something up, there is a
 full-screen [interactive browser](#interactive-browser).
 
-It can also keep up with the archive on its own: `eprint config --notify watched` posts a desktop
-notification when a paper matching one of your [watches](#watches) appears, and
-`eprint config --launcher on` puts the browser one ⌘Space away. Both are off until you ask, and both
-are covered under [desktop notifications and a launcher](#desktop-notifications-and-a-launcher).
+It can also keep up on its own: [desktop notifications](#desktop-notifications-and-a-launcher) when
+a paper matching one of your [watches](#watches) appears, and the browser one ⌘Space away.
 
 ### Opening papers
 
@@ -374,8 +372,7 @@ The sizes are there because "which of these can go?" is the question that comes 
 
 ## Desktop notifications and a launcher
 
-Two optional pieces of desktop integration. Both are off until you ask for them, and both are one
-command to add and the same command to remove.
+Two optional pieces of desktop integration, both off until you ask, both removed the same way.
 
 ### Notifications for new papers
 
@@ -384,35 +381,24 @@ eprint config --notify summary   # off | all | summary | watched
 eprint config --notify off       # and it is gone again
 ```
 
-That writes `notify = summary` to the config file *and* installs a background updater — a launchd
-agent on macOS, a systemd user timer on Linux — that harvests every 30 minutes and announces what
-arrived. It posts a test banner immediately, which is deliberate: macOS asks permission the first
-time anything shows a notification, and the moment to be asked is while you are looking at the
-screen rather than at three in the morning.
+That writes the mode to the config file *and* installs a background updater — a launchd agent on
+macOS, a systemd user timer on Linux — which harvests every 30 minutes and announces what arrived.
+A test banner is posted straight away, so macOS asks its permission question while you are watching.
 
 | mode | what you get |
 |---|---|
 | `off` | nothing. The default |
 | `summary` | one banner: *7 new papers* |
-| `all` | one banner per paper, then `+N more new papers` once a burst runs past five |
+| `all` | one banner per paper, capped at five, then `+N more` |
 | `watched` | only papers matching a [watch](#watches), each naming the watch it matched |
 
-ePrint posts in bursts, and forty in a morning is ordinary — hence the cap in `all` mode, and hence
-`watched` being the mode worth having if your watch list is any good.
+ePrint posts in bursts of forty, so `watched` is the mode worth having. A harvest you asked for
+never posts a banner; one that happened behind your back does. `eprint config` and `eprint status`
+both say whether the updater is installed.
 
-The scheduled harvest is not the only thing that can notify. Any background refresh does, so
-notifications work before you install anything; the scheduler just adds wake-ups for the hours when
-you are not typing. A harvest you *asked* for never posts a banner — `eprint update` already tells
-you what it did on the terminal, and repeating it on a banner is noise.
-
-Notifications are delivered by whatever the platform already has, so there is nothing to install on
-macOS. `brew install terminal-notifier` is worth it if you want them attributed to `eprint` rather
-than to "Script Editor", and clickable through to the paper. On Linux they need `notify-send`
-(`sudo apt install libnotify-bin`).
-
-`eprint config` reports the mode and whether the updater is installed; `eprint status` grows a
-`background` line when there is one, which is where to look when you are wondering why the index is
-older than you expected.
+Banners use whatever the platform already ships, so there is nothing to install on macOS —
+`brew install terminal-notifier` only buys you better attribution and a clickable banner. Linux
+needs `notify-send` (`sudo apt install libnotify-bin`).
 
 ### Opening `browse` from Spotlight
 
@@ -420,28 +406,17 @@ older than you expected.
 eprint config --launcher on
 ```
 
-On macOS this writes a small application bundle to `~/Applications/eprint.app`. Press ⌘Space, type
-`eprint`, hit ⏎, and a Terminal window opens, updates the index in front of you, and drops into
-`eprint browse`. Quit with `q` and you are left at a working shell prompt in that window — `browse`
-runs as a child of the shell, so the shell is still there when it exits. Closing the window is then
-Terminal's business, governed by your own profile settings rather than by anything `eprint` does.
-<img src="docs/icon.png" width="96" align="right" alt="the eprint app icon: a lattice with one lit node">
+On macOS this writes `~/Applications/eprint.app`. Press ⌘Space, type `eprint`, hit ⏎: a Terminal
+window opens, updates the index in front of you, and goes into `eprint browse`. Quit with `q` and
+the shell is still there, so you are left at a working prompt. On Linux it writes
+`~/.local/share/applications/eprint.desktop`, which your desktop's application search finds and
+opens in whatever terminal you already use.
 
-The bundle carries its own icon: a lattice with one lit node, in the same brass and verdigris as
-everything else, the lit node being the gold of the watch badge. Spotlight can take a few seconds to
-notice a newly written bundle, icon included.
+Spotlight will offer *"press Tab to search"*. Ignore it — that is macOS's app-scoped search, which
+`eprint` has no index to answer; press ⏎ without Tab. macOS offers it for every application.
 
-Spotlight also offers *"press Tab to search"* on the highlighted app. That is macOS's own
-app-scoped search — Tab asks `eprint` for results from inside itself, which it has no index to
-answer, so nothing is found and ⏎ does nothing in that mode. Just press ⏎ without pressing Tab.
-The affordance is offered for applications generally and there is no key that opts out of it.
-
-On Linux it writes `~/.local/share/applications/eprint.desktop`, which your desktop's application
-search finds the same way, and behaves the same way when you quit: `Terminal=true` means it opens in
-whatever terminal you already use, so there is no list of terminal emulators to configure.
-
-macOS defaults to Terminal.app. For anything else, set `terminal_command` in the config file, with
-`{cmd}` standing in for the command line to run:
+macOS defaults to Terminal.app. For anything else set `terminal_command`, with `{cmd}` standing in
+for the command to run:
 
 ```ini
 terminal_command = ghostty -e {cmd}
@@ -712,11 +687,8 @@ both.
 Results list authors only. The date joins them once an abstract is open (`space` in `browse`,
 `-a` inline). Category and licence are shown by `eprint show`.
 
-`notify` chooses what desktop notifications say — see
-[Desktop notifications](#desktop-notifications-and-a-launcher). Prefer
-`eprint config --notify <mode>` to editing it by hand, because that also installs the background
-updater the notifications come from. `terminal_command` is undocumented above because almost nobody
-needs it; it only affects the Spotlight launcher on macOS.
+Set `notify` with `eprint config --notify <mode>` rather than by hand — that also installs the
+background updater the notifications come from.
 
 Command-line flags override the config file, which overrides the built-in defaults.
 
@@ -846,11 +818,9 @@ author's own index a week of papers while `status` cheerfully reported a fresh h
 window by the newest paper you hold makes the request describe your data instead, so a gap of any
 size closes itself on the next update. Withdrawn papers arrive as OAI-PMH tombstones and are deleted.
 
-`eprint config --notify <mode>` changes this picture: with a background updater installed, the index
-is refreshed every 30 minutes whether or not you run anything, so the 24-hour staleness check above
-never fires and every command reads a fresh index. `eprint status` gains a `background` line saying
-so. The updater is the OS's own scheduler rather than a resident process of ours — nothing to start,
-nothing to leave running, and it catches up after the lid has been shut.
+With a [background updater](#desktop-notifications-and-a-launcher) installed the index is refreshed
+every 30 minutes regardless, so the staleness check above never fires. It is the OS's own scheduler,
+so there is nothing to start and nothing left running, and it catches up after the lid has been shut.
 
 ## Scope and licensing
 
@@ -877,8 +847,7 @@ Everything lives in two places, both safe to delete — the index rebuilds from 
 | Index + citation keys | `~/Library/Application Support/eprint/eprint.db` | `$XDG_DATA_HOME/eprint/eprint.db` |
 | Config | `~/.config/eprint/config.toml` | `~/.config/eprint/config.toml` |
 
-`eprint config --notify` and `--launcher` add a third kind of file, outside both, and each is
-removed by the same flag set to `off`:
+`--notify` and `--launcher` add files outside both, each removed by the same flag set to `off`:
 
 | What | macOS | Linux |
 |---|---|---|
@@ -899,13 +868,12 @@ cargo test --locked             # unit tests
 cargo fmt                       # formatting
 ```
 
-The launcher's icon is a committed asset, embedded with `include_bytes!`. Regenerate it with
-`swift assets/icon.swift assets/eprint.icns` — that needs AppKit, so it is a one-off by hand rather
-than part of the build, and nothing at build or run time depends on Swift.
+The launcher's icon is a committed asset, embedded with `include_bytes!`; regenerate it by hand with
+`swift assets/icon.swift assets/eprint.icns`, which is why nothing in the build needs Swift.
 
-Pass `EPRINT_DB=/tmp/scratch.db` to work against a throwaway index instead of your real one. It is
-honoured by `eprint config --notify` too: the scheduled updater is installed with whatever
-`EPRINT_*` overrides were in force, so testing this cannot schedule a job against your real index.
+Pass `EPRINT_DB=/tmp/scratch.db` to work against a throwaway index instead of your real one.
+`eprint config --notify` honours it too, baking whatever `EPRINT_*` overrides are set into the
+scheduled job, so testing this cannot point a background harvest at your real index.
 
 ### Layout
 
