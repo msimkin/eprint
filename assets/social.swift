@@ -69,7 +69,29 @@ text("from the command line", 446, 252, 36, .regular, teal)
 text("26,000 papers · offline full-text search · watches · notifications",
      446, 186, 23, .regular, dim)
 
+/// Keep only the chunks a PNG decoder actually needs.
+///
+/// AppKit stamps an `eXIf` chunk into every PNG it writes, and EXIF inside a PNG is
+/// unusual enough that image pipelines mishandle it — GitHub's accepted the upload and
+/// then served 404 for the content, twice, while a known-good card from another
+/// repository carried no `eXIf` at all. `sips --deleteColorManagementProperties` is no
+/// help: it leaves the profile in place and adds an `iTXt` chunk on top.
+func criticalChunksOnly(_ png: Data) -> Data {
+    let keep: Set<String> = ["IHDR", "PLTE", "IDAT", "IEND"]
+    var out = Data(png[0..<8])                       // signature
+    var i = 8
+    while i + 8 <= png.count {
+        let len = png[i..<i+4].reduce(0) { Int($0) << 8 | Int($1) }
+        let type = String(decoding: png[i+4..<i+8], as: UTF8.self)
+        let end = i + 12 + len
+        if end > png.count { break }
+        if keep.contains(type) { out.append(png[i..<end]) }
+        i = end
+    }
+    return out
+}
+
 let rep = NSBitmapImageRep(cgImage: ctx.makeImage()!)
-try! rep.representation(using: .png, properties: [:])!
-    .write(to: URL(fileURLWithPath: outPath))
+let png = criticalChunksOnly(rep.representation(using: .png, properties: [:])!)
+try! png.write(to: URL(fileURLWithPath: outPath))
 print("wrote \(outPath)")
