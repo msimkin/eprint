@@ -1,0 +1,55 @@
+# Runs the same three checks the README asks a contributor to run, on both
+# platforms the tool supports. Nothing here needs apt packages: TLS is rustls
+# rather than OpenSSL, and SQLite is compiled from the bundled C source, which
+# needs only the C compiler the runners already have.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # macOS is where this is developed; Ubuntu is the half that cannot be tested
+    # by hand here, and so the half most likely to break.
+    name: test · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Test
+        run: cargo test --locked
+      - name: The emitted shell functions must parse
+        # completions.rs promises bash 3.2 compatibility, where newer syntax is a
+        # parse error that would take the whole `eval` down rather than degrade.
+        run: |
+          cargo run --locked --quiet -- completions bash > /tmp/eprint.bash
+          bash -n /tmp/eprint.bash
+          cargo run --locked --quiet -- completions zsh > /tmp/eprint.zsh
+          if command -v zsh >/dev/null; then zsh -n /tmp/eprint.zsh; fi
+
+  lint:
+    # Pinned to the version the lockfile is held back for, deliberately: the
+    # lockfile keeps darling/instability on releases that still build here, and
+    # nothing else checks that. Pinning also stops a new stable clippy inventing
+    # a lint overnight and turning the repository red on its own.
+    name: clippy · rust 1.86 (declared minimum)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install 1.86 --profile minimal --component clippy
+      - name: Clippy, warnings denied
+        run: cargo +1.86 clippy --all-targets --locked -- -D warnings
+      - name: Tests, on the minimum supported version
+        run: cargo +1.86 test --locked

@@ -2,6 +2,8 @@
 
 <img src="docs/icon.png" width="80" align="right" alt="">
 
+[![CI](https://github.com/msimkin/eprint/actions/workflows/ci.yml/badge.svg)](https://github.com/msimkin/eprint/actions/workflows/ci.yml)
+
 Fast command-line search over the [IACR Cryptology ePrint Archive](https://eprint.iacr.org).
 
 Metadata for all ~26,000 papers is harvested from the archive's OAI-PMH interface into a
@@ -869,6 +871,10 @@ cargo clippy --all-targets      # lints
 cargo test --locked             # unit tests
 cargo fmt                       # formatting
 ```
+
+GitHub Actions runs the build and tests on macOS and Ubuntu, and clippy with warnings denied on
+Rust 1.86 — the version the lockfile is held back for. Ubuntu is the half that cannot be exercised
+by hand on a Mac, which is the point.
 
 The launcher's icon is a committed asset, embedded with `include_bytes!`; regenerate it by hand with
 `swift assets/icon.swift assets/eprint.icns`, which is why nothing in the build needs Swift.

@@ -69,7 +69,7 @@ impl Style {
     fn marked(&self, s: &str, base: Tone, hl: Tone, open: &mut bool) -> String {
         if !self.theme.color {
             *open = false;
-            return s.replace(MARK_START, "").replace(MARK_END, "");
+            return s.replace([MARK_START, MARK_END], "");
         }
         let reset = self.theme.reset();
         let base_code = self.theme.ansi(base);

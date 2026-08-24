@@ -522,8 +522,7 @@ pub fn bib_map(conn: &Connection, ids: &[String]) -> Result<HashMap<String, (Str
     if ids.is_empty() || bib_count(conn)? == 0 {
         return Ok(out);
     }
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
+    let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(

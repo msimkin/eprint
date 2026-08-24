@@ -477,7 +477,7 @@ fn effective_scope(title_flag: bool, cli: Option<&str>, cfg: &config::Config) ->
 /// `less -RFX` keeps colour, exits immediately if the output fits, and leaves
 /// the results in scrollback afterwards rather than clearing them.
 fn page(text: &str, st: &Style, no_pager: bool) -> Result<()> {
-    let fits = text.lines().count() + 1 <= st.height;
+    let fits = text.lines().count() < st.height;
     if no_pager || fits || !std::io::stdout().is_terminal() {
         print!("{text}");
         let _ = std::io::stdout().flush();
