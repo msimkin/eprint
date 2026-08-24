@@ -16,3 +16,6 @@ CLAUDE.md
 *.swp
 .idea/
 .vscode/
+
+# Dev artefact of assets/icon.swift, not the icon itself.
+assets/preview.png

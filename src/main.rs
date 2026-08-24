@@ -3,8 +3,10 @@ mod completions;
 mod config;
 mod dates;
 mod db;
+mod desktop;
 mod harvest;
 mod names;
+mod notify;
 mod pdf;
 mod render;
 mod theme;
@@ -35,6 +37,17 @@ const AUTHOR_MATCHES: usize = 40;
 /// CLI surface stays exactly as it was.
 const ADOPT_ID_VAR: &str = "EPRINT_ADOPT";
 const ADOPT_TITLE_VAR: &str = "EPRINT_ADOPT_TITLE";
+/// Set on a harvest that nobody is watching — the detached refresh, or the
+/// scheduled agent — to say that new papers may be announced with a desktop
+/// banner. Another env marker rather than a flag, for the reason above, and it
+/// keeps the rule honest: **notifications are for updates you did not ask for.**
+/// A hand-typed `eprint update` prints what it did; a banner would only repeat it.
+const NOTIFY_VAR: &str = "EPRINT_NOTIFY";
+/// A scheduled harvest that lands on top of one already running does nothing but
+/// contend for the write lock. There is no lock file anywhere in this tool — the
+/// whole concurrency story is WAL plus a five-second `busy_timeout` — which was
+/// fine while the only writer was one refresh an hour.
+const SCHEDULED_MIN_GAP_SECS: i64 = 60;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -115,6 +128,14 @@ enum Cmd {
         /// Switch on Tab completion by adding one line to your shell's rc file
         #[arg(long)]
         completions: bool,
+        /// Notify about new papers: all, summary, watched, or off. Installs (or
+        /// removes) the background updater that produces them
+        #[arg(long, value_name = "MODE")]
+        notify: Option<String>,
+        /// Add or remove the launcher that opens `browse` from Spotlight, or from
+        /// your desktop's application search: on or off
+        #[arg(long, value_name = "STATE")]
+        launcher: Option<String>,
     },
     /// Shell completion, hidden because it is plumbing: `completions zsh` prints
     /// the function to install, `completions ids` prints the candidates it offers.
@@ -337,8 +358,15 @@ fn spawn_background_refresh(conn: &rusqlite::Connection) -> Result<()> {
     )?;
 
     let exe = std::env::current_exe().context("locating own executable")?;
-    let _ = std::process::Command::new(exe)
-        .args(["update", "--quiet"])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["update", "--quiet"]);
+    // So notifications work with nothing installed at all: the scheduled agent only
+    // adds wake-ups for the hours when no command is being typed.
+    if notify::Mode::parse(&config::load().notify).unwrap_or(notify::Mode::Off) != notify::Mode::Off
+    {
+        cmd.env(NOTIFY_VAR, "1");
+    }
+    let _ = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -348,6 +376,27 @@ fn spawn_background_refresh(conn: &rusqlite::Connection) -> Result<()> {
 
 fn do_update(full: bool, quiet: bool) -> Result<()> {
     let mut conn = db::open()?;
+    // A scheduled harvest arriving seconds after one that already succeeded has
+    // nothing to add, so it backs off. Only the unattended path does — a harvest
+    // someone typed is a harvest they want now.
+    //
+    // The key here has to be `KEY_LAST_HARVEST`, and this was `KEY_LAST_ATTEMPT`
+    // first, which broke the ambient refresh completely: `spawn_background_refresh`
+    // stamps `last_attempt` in the *parent* to claim its cooldown and then spawns the
+    // child, so the child read a timestamp zero seconds old and returned immediately.
+    // Every background refresh became a no-op the moment notifications were switched
+    // on, and nothing said so — the only visible symptom was an index that stopped
+    // keeping itself current. `last_harvest` is written by `harvest::run` on success
+    // and by nothing else, so it cannot collide with its own caller.
+    let scheduled = std::env::var(NOTIFY_VAR).is_ok();
+    if scheduled {
+        let last = db::meta_get(&conn, harvest::KEY_LAST_HARVEST)?
+            .and_then(|v| dates::parse_iso(&v))
+            .unwrap_or(0);
+        if dates::now() - last < SCHEDULED_MIN_GAP_SECS {
+            return Ok(());
+        }
+    }
     let from = if full {
         None
     } else {
@@ -376,7 +425,18 @@ fn do_update(full: bool, quiet: bool) -> Result<()> {
     // New papers invalidate the watch cache. Rebuilding here keeps the cost inside
     // the update — usually the detached background child — rather than surprising
     // whichever command runs next.
-    let _ = db::watched(&conn, &watches(&conn));
+    // Read once: `watches()` parses the config file and may migrate a legacy table,
+    // and the notify pass below wants the same list.
+    let watch_list = watches(&conn);
+    let _ = db::watched(&conn, &watch_list);
+    // After the rebuild above, which is what leaves `watch_hits` able to say *which*
+    // watch a new paper matched. Errors are dropped for the same reason
+    // `spawn_adopter` drops them: a banner that cannot be delivered must not be able
+    // to fail the harvest that produced it.
+    if scheduled {
+        let mode = notify::Mode::parse(&config::load().notify).unwrap_or(notify::Mode::Off);
+        let _ = notify::announce(&conn, mode, &watch_list);
+    }
     if !quiet {
         let total = db::count(&conn)?;
         if n == 0 {
@@ -1297,9 +1357,81 @@ fn edit_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn do_config(init: bool, edit: bool, completions: bool) -> Result<()> {
+/// Write the mode *and* install the thing that acts on it. Two steps that always
+/// belong together: a mode with no updater notifies only when you happen to run a
+/// command, which is precisely the gap this feature exists to close.
+fn set_notify(mode: &str) -> Result<()> {
+    // Refused rather than defaulted, unlike the config file: this is someone typing,
+    // and a typo silently meaning "off" is the worst of the available answers.
+    let Some(m) = notify::Mode::parse(mode) else {
+        bail!(
+            "not a notification mode: {mode:?} — try {}",
+            notify::Mode::NAMES.join(", ")
+        );
+    };
+    let path = config::set_scalar("notify", m.label())?;
+    println!();
+    println!("  notify = {} in {}", m.label(), path.display());
+    if m == notify::Mode::Off {
+        println!("  {}", desktop::remove_scheduler()?);
+        println!();
+        return Ok(());
+    }
+    println!("  {}", desktop::install_scheduler(desktop::INTERVAL_SECS)?);
+    // Posted now, on purpose. macOS asks permission the first time anything shows a
+    // banner, and the moment to be asked is while you are looking at the screen —
+    // not silently at three in the morning when the first batch lands.
+    if notify::confirm(m) {
+        println!("  a test notification has just been posted");
+    } else {
+        println!("  {}", notify::hint());
+    }
+    println!();
+    Ok(())
+}
+
+fn set_launcher(state: &str) -> Result<()> {
+    let on = match state.trim().to_ascii_lowercase().as_str() {
+        "on" | "yes" | "true" => true,
+        "off" | "no" | "false" => false,
+        _ => bail!("not a launcher state: {state:?} — try on or off"),
+    };
+    println!();
+    if on {
+        let where_ = desktop::install_launcher(config::load().terminal_command.as_deref())?;
+        println!("  wrote {where_}");
+        if cfg!(target_os = "macos") {
+            // Spotlight indexes asynchronously however hard the installer nudges it,
+            // and "it did not appear" reads as a broken feature rather than as a
+            // wait, so say which it is.
+            println!(
+                "  ⌘Space, then type `eprint` (Spotlight may take a few seconds to notice it)"
+            );
+        } else {
+            println!("  search for `eprint` in your desktop's application list");
+        }
+    } else {
+        println!("  {}", desktop::remove_launcher()?);
+    }
+    println!();
+    Ok(())
+}
+
+fn do_config(
+    init: bool,
+    edit: bool,
+    completions: bool,
+    notify_mode: Option<&str>,
+    launcher: Option<&str>,
+) -> Result<()> {
     if completions {
         return completions::install_completions();
+    }
+    if let Some(mode) = notify_mode {
+        return set_notify(mode);
+    }
+    if let Some(state) = launcher {
+        return set_launcher(state);
     }
     if edit {
         return edit_config();
@@ -1338,11 +1470,44 @@ fn do_config(init: bool, edit: bool, completions: bool) -> Result<()> {
         }
     );
     println!(
-        "  completions   {}",
+        "  completions    {}",
         if completions::completions_installed() {
             "on".to_string()
         } else {
             "off  (eprint config --completions)".to_string()
+        }
+    );
+    // The file says what was asked for; the OS says whether it is actually running.
+    // Printing both is the only way a half-installed state is visible at all.
+    let mode = notify::Mode::parse(&cfg.notify);
+    println!(
+        "  notify         {}",
+        match (mode, desktop::scheduler_installed()) {
+            (Some(notify::Mode::Off), false) => "off  (eprint config --notify summary)".to_string(),
+            (Some(notify::Mode::Off), true) =>
+                "off  (but the background updater is still installed)".to_string(),
+            (Some(m), true) => format!(
+                "{}  (background updater {})",
+                m.label(),
+                desktop::interval_label(desktop::INTERVAL_SECS)
+            ),
+            (Some(m), false) => format!(
+                "{}  (no background updater — eprint config --notify {})",
+                m.label(),
+                m.label()
+            ),
+            (None, _) => format!(
+                "{:?}  (not a mode — try off, all, summary, watched)",
+                cfg.notify
+            ),
+        }
+    );
+    println!(
+        "  launcher       {}",
+        if desktop::launcher_installed() {
+            "on".to_string()
+        } else {
+            "off  (eprint config --launcher on)".to_string()
         }
     );
     if path.is_some() {
@@ -1354,12 +1519,13 @@ fn do_config(init: bool, edit: bool, completions: bool) -> Result<()> {
 
 fn do_status() -> Result<()> {
     let conn = db::open()?;
+    let cfg = config::load();
     let st = Style::detect(StyleOpts {
         plain: false,
         force_color: false,
         urls: None,
-        theme: config::load().theme,
-        favourite: config::load().favourite_author,
+        theme: cfg.theme,
+        favourite: cfg.favourite_author,
     });
     let total = db::count(&conn)?;
     let path = db::db_path()?;
@@ -1382,6 +1548,14 @@ fn do_status() -> Result<()> {
     println!("  papers indexed  {total}");
     println!("  newest entry    {newest}");
     println!("  last harvest    {last}  ({age})");
+    // Where "why is my index old" is actually answered: without this line a
+    // scheduler that failed to load is indistinguishable from a quiet archive.
+    if desktop::scheduler_installed() {
+        println!(
+            "  background      {}",
+            desktop::interval_label(desktop::INTERVAL_SECS)
+        );
+    }
     println!(
         "  database        {}  ({:.1} MB)",
         path.display(),
@@ -1445,15 +1619,24 @@ fn real_main() -> Result<()> {
             init,
             edit,
             completions,
-        }) => do_config(init, edit, completions),
+            notify,
+            launcher,
+        }) => do_config(
+            init,
+            edit,
+            completions,
+            notify.as_deref(),
+            launcher.as_deref(),
+        ),
         Some(Cmd::Show { id }) => {
             let conn = db::open()?;
+            let cfg = config::load();
             let st = Style::detect(StyleOpts {
                 plain: false,
                 force_color: false,
                 urls: None,
-                theme: config::load().theme,
-                favourite: config::load().favourite_author,
+                theme: cfg.theme,
+                favourite: cfg.favourite_author,
             });
             let id = normalise_id(&id);
             match db::get(&conn, &id)? {

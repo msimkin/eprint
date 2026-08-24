@@ -69,6 +69,21 @@ _eprint() {
       (( ${#values} )) && _describe -t categories 'IACR category' values $nocase
       return
       ;;
+    --notify)
+      values=(
+        'off:no notifications'
+        'all:one banner per new paper'
+        'summary:one banner saying how many arrived'
+        'watched:only papers matching a watch'
+      )
+      _describe -t modes 'notification mode' values $nocase
+      return
+      ;;
+    --launcher)
+      values=('on:add the desktop launcher' 'off:remove it')
+      _describe -t states 'launcher' values $nocase
+      return
+      ;;
     --author)
       # Filtered by what has been typed, because the whole list is 21,000 names.
       # The tool offers each match twice, as the full name and as the surname, so
@@ -124,6 +139,8 @@ _eprint() {
         '--init[write a default config file]'
         '-e[open the config in $EDITOR]' '--edit[open the config in $EDITOR]'
         '--completions[switch on Tab completion]'
+        '--notify[notify about new papers]'
+        '--launcher[add or remove the desktop launcher]'
       ) ;;
       watch)
         case ${words[3]} in
@@ -247,6 +264,14 @@ _eprint() {
       # Filtered by what has been typed: the whole list is 21,000 names.
       vals=$(eprint completions authors "$cur" 2>/dev/null | cut -d: -f1)
       _eprint_offer "$vals" "$cur"; return ;;
+    --notify)
+      _eprint_offer 'off
+all
+summary
+watched' "$cur"; return ;;
+    --launcher)
+      _eprint_offer 'on
+off' "$cur"; return ;;
     --scope)
       _eprint_offer 'all
 title' "$cur"; return ;;
@@ -295,7 +320,9 @@ config' "$cur"
       config) vals='--init
 -e
 --edit
---completions' ;;
+--completions
+--notify
+--launcher' ;;
       watch)
         case $sub in
           add) vals='--author

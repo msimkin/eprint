@@ -21,6 +21,14 @@ pub struct Config {
     /// Matched case-insensitively as a substring, like `--author`. Undocumented
     /// on purpose; it lives in the config so no name is ever committed.
     pub favourite_author: Option<String>,
+    /// off | all | summary | watched. Stored verbatim and validated where it is
+    /// used, like `theme` and `scope`: this parser never fails, so an unreadable
+    /// value has to fall back rather than error.
+    pub notify: String,
+    /// How to open a terminal for the desktop launcher, with `{cmd}` standing in
+    /// for the command line to run. `None` means Terminal.app on macOS and the
+    /// desktop's own choice on Linux, which is what almost everyone wants.
+    pub terminal_command: Option<String>,
 }
 
 impl Default for Config {
@@ -32,6 +40,8 @@ impl Default for Config {
             latest_limit: 10,
             watches: Vec::new(),
             favourite_author: None,
+            notify: "off".into(),
+            terminal_command: None,
         }
     }
 }
@@ -57,6 +67,15 @@ limit = 20
 # last batch you get the whole batch; if fewer, the list is topped up with recent
 # arrivals so it is never empty. A cap is `-n`, not this.
 latest_limit = 10
+
+# Desktop notifications for papers that arrive while you are not looking.
+#   off      no notifications (the default)
+#   all      one banner per new paper, then a roll-up once a burst gets long
+#   summary  a single banner saying how many arrived
+#   watched  only papers matching a `watch` line below, naming the watch
+# `eprint config --notify <mode>` writes this line *and* installs the background
+# updater that produces the notifications, so prefer it to editing by hand.
+notify = "off"
 
 # Saved searches. Papers matching one are marked with a gold ✱ wherever papers are
 # listed, and `w` in `browse` filters to them. One `watch` line each, written
@@ -212,6 +231,60 @@ pub fn set_watches(labels: &[String]) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Set one scalar key, leaving the rest of the file exactly as it was.
+///
+/// Line-surgical for the same reason `set_watches` is: this file is hand-editable
+/// and `config --edit` invites exactly that, so comments and keys this build has
+/// never heard of have to survive being written through.
+pub fn set_scalar(key: &str, value: &str) -> Result<PathBuf> {
+    let (path, _) = init()?;
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, rewrite_scalar(&text, key, value))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// The pure half, so the placement rules above are testable without a filesystem.
+fn rewrite_scalar(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key} = \"{value}\"");
+    let names = |l: &str, k: &str| l.split('=').next().map(|n| n.trim() == k).unwrap_or(false);
+    let mut out: Vec<String> = Vec::new();
+    let mut written = false;
+    for l in text.lines() {
+        if names(l, key) {
+            // In place, so a key sitting under its own explanatory comment stays
+            // under it. Any later duplicate is dropped rather than left to shadow.
+            if !written {
+                out.push(line.clone());
+                written = true;
+            }
+            continue;
+        }
+        out.push(l.to_string());
+    }
+    if !written {
+        // Before the watch block, never after it: `set_watches` re-emits that block
+        // wherever its first line was, and a scalar appended below the watches would
+        // end up inside it the next time a watch is added.
+        let at = out.iter().position(|l| names(l, "watch"));
+        match at {
+            Some(i) => {
+                out.insert(i, String::new());
+                out.insert(i, line);
+            }
+            None => {
+                if !out.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
+                    out.push(String::new());
+                }
+                out.push(line);
+            }
+        }
+    }
+    let mut body = out.join("\n");
+    body.push('\n');
+    body
+}
+
 pub fn path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("EPRINT_CONFIG") {
         return Some(PathBuf::from(p));
@@ -265,6 +338,10 @@ pub fn load() -> Config {
             "favourite_author" => {
                 c.favourite_author = Some(v).filter(|s| !s.trim().is_empty());
             }
+            "notify" => c.notify = v,
+            "terminal_command" => {
+                c.terminal_command = Some(v).filter(|s| !s.trim().is_empty());
+            }
             "watch" => {
                 let next = c.watches.len() as i64 + 1;
                 if let Some(w) = parse_watch(next, &raw) {
@@ -287,4 +364,98 @@ pub fn init() -> Result<(PathBuf, bool)> {
     }
     std::fs::write(&p, TEMPLATE).with_context(|| format!("writing {}", p.display()))?;
     Ok((p, true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scalar_is_replaced_where_it_already_sits() {
+        let before = "# eprint configuration\n\n# Colour palette.\ntheme = \"dark\"\n\nnotify = \"off\"\nlimit = 20\n";
+        let after = rewrite_scalar(before, "notify", "watched");
+        assert!(after.contains("notify = \"watched\""));
+        assert!(!after.contains("notify = \"off\""));
+        // Everything else, comments included, is exactly where it was.
+        assert!(after.contains("# Colour palette.\ntheme = \"dark\""));
+        assert!(after.contains("limit = 20"));
+        assert_eq!(before.lines().count(), after.lines().count());
+    }
+
+    #[test]
+    fn a_new_scalar_lands_above_the_watch_block() {
+        // `set_watches` re-emits the watch block wherever its first line was, so a
+        // scalar appended below the watches would be swallowed by it next time.
+        let before = "theme = \"dark\"\n\nwatch = lattice\nwatch = --author Boneh\n";
+        let after = rewrite_scalar(before, "notify", "all");
+        let lines: Vec<&str> = after.lines().collect();
+        let scalar = lines.iter().position(|l| l.starts_with("notify")).unwrap();
+        let first_watch = lines.iter().position(|l| l.starts_with("watch")).unwrap();
+        assert!(scalar < first_watch, "{after}");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("watch")).count(), 2);
+    }
+
+    #[test]
+    fn a_new_scalar_is_appended_when_there_are_no_watches() {
+        let after = rewrite_scalar("theme = \"dark\"\n", "notify", "summary");
+        assert!(after.ends_with("notify = \"summary\"\n"), "{after}");
+        assert!(after.contains("theme = \"dark\""));
+    }
+
+    #[test]
+    fn a_duplicate_key_is_collapsed_rather_than_left_to_shadow() {
+        // `load()` takes the last value it sees, so leaving a stale duplicate below
+        // the rewritten one would make the write appear to do nothing.
+        let after = rewrite_scalar(
+            "notify = \"off\"\nlimit = 5\nnotify = \"all\"\n",
+            "notify",
+            "summary",
+        );
+        assert_eq!(after.matches("notify").count(), 1, "{after}");
+        assert!(after.contains("notify = \"summary\""));
+    }
+
+    #[test]
+    fn what_is_written_is_what_load_reads_back() {
+        // The two halves of this file have to agree: `load()` strips the quotes that
+        // `rewrite_scalar` adds.
+        for mode in ["off", "all", "summary", "watched"] {
+            let text = rewrite_scalar("", "notify", mode);
+            let line = text.lines().find(|l| l.starts_with("notify")).unwrap();
+            let (_, v) = line.split_once('=').unwrap();
+            assert_eq!(v.trim().trim_matches(['"', '\'']), mode);
+        }
+    }
+
+    #[test]
+    fn the_template_declares_the_keys_load_understands() {
+        // A key documented in the template but missing from `load` is invisible; one
+        // in `load` but missing from the template is undiscoverable.
+        for key in ["theme", "scope", "limit", "latest_limit", "notify"] {
+            assert!(
+                TEMPLATE
+                    .lines()
+                    .any(|l| l.split('=').next().map(str::trim) == Some(key)),
+                "{key} is not in the template"
+            );
+        }
+        let c = load_from(TEMPLATE);
+        assert_eq!(c.notify, "off", "the template's default must be off");
+    }
+
+    /// `load()` reads a path; this is the same match on text, for the test above.
+    fn load_from(text: &str) -> Config {
+        let mut c = Config::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let v = v.trim().trim_matches(['"', '\'']).to_string();
+            if k.trim() == "notify" {
+                c.notify = v;
+            }
+        }
+        c
+    }
 }

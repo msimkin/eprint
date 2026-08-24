@@ -809,6 +809,38 @@ pub fn watch_counts(conn: &Connection, watches: &[Watch]) -> Result<HashMap<Stri
     Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
 }
 
+/// Which watches matched which of these papers, for the ones that matched at all.
+///
+/// Deliberately does *not* call `sync_watch_cache`: the only caller is the notifier,
+/// which runs at the end of `do_update` where `db::watched` has already brought the
+/// cache up to date for the harvest that just finished. The table's primary key is
+/// `(id, label)`, so this probe is a covered index scan.
+///
+/// The alternative — one `search(Watch::query(Some(watermark), n))` per watch — is
+/// the shape the cache was built to remove: 630ms at twenty-three watches.
+pub fn watch_labels(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Vec<String>>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let holes = vec!["?"; ids.len()].join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, label FROM watch_hits WHERE id IN ({holes})"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, label) = row?;
+        out.entry(id).or_default().push(label);
+    }
+    // Stable order, so a paper matching two watches always names the same one.
+    for labels in out.values_mut() {
+        labels.sort();
+    }
+    Ok(out)
+}
+
 /// Bring `watch_hits` in line with the watch list, doing as little as possible.
 ///
 /// The labels the cache was built from are recorded in `meta`, so the work is the
