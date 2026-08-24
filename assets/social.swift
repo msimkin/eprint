@@ -22,8 +22,13 @@ guard let art = NSImage(contentsOfFile: icnsPath) else {
 
 // GitHub renders at 1280x640 and trims the edges, so everything sits well inside.
 let W = 1280, H = 640
+// Opaque, with no alpha channel at all: the card is a solid rectangle, so an alpha
+// channel is 58KB of nothing, and GitHub's uploader is the sort of thing best handed
+// the plainest possible file. sRGB explicitly, rather than device RGB, so the colours
+// do not shift once it is served on the web.
 let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
-                    space: rgb, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
 ctx.setAllowsAntialiasing(true)
 ctx.interpolationQuality = .high
 
