@@ -1,3 +1,5 @@
+<img src="docs/icon.png" width="88" align="right" alt="">
+
 # eprint
 
 Fast command-line search over the [IACR Cryptology ePrint Archive](https://eprint.iacr.org).
