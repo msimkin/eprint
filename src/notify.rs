@@ -81,15 +81,31 @@ impl Mode {
 
 /// The programs worth trying, best first.
 ///
-/// `terminal-notifier` is strictly better than `osascript` where it exists: it is
-/// attributed to itself rather than to "Script Editor", it takes a subtitle, and
-/// `-open` makes the banner click through to the paper. It is also not installed on
-/// a stock Mac, which is why `osascript` has to be the one that always works.
+/// `Eprint` is the bundle `desktop::install_notifier` writes: terminal-notifier's
+/// binary wearing eprint's name and icon, so the banner is attributed to the tool
+/// that posted it. Bare `terminal-notifier` is next — same click-through, wrong
+/// sender — and it is strictly better than `osascript` where it exists: an
+/// AppleScript banner belongs to "Script Editor" and clicking it opens *that*.
+/// `osascript` stays last because it is the one that is always installed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Backend {
+    Eprint,
     TerminalNotifier,
     Osascript,
     NotifySend,
+}
+
+impl Backend {
+    /// What to call the sender when reporting which backend posted — `set_notify`
+    /// uses this to say whose name the banner will carry.
+    fn name(self) -> &'static str {
+        match self {
+            Backend::Eprint => "eprint",
+            Backend::TerminalNotifier => "terminal-notifier",
+            Backend::Osascript => "osascript",
+            Backend::NotifySend => "notify-send",
+        }
+    }
 }
 
 fn candidates() -> Vec<Backend> {
@@ -100,7 +116,11 @@ fn candidates() -> Vec<Backend> {
 /// is compiled but never reached — the same reason `tui::candidates_for` exists.
 fn candidates_for(macos: bool) -> Vec<Backend> {
     if macos {
-        vec![Backend::TerminalNotifier, Backend::Osascript]
+        vec![
+            Backend::Eprint,
+            Backend::TerminalNotifier,
+            Backend::Osascript,
+        ]
     } else {
         vec![Backend::NotifySend]
     }
@@ -161,7 +181,7 @@ struct Banner<'a> {
 /// data instead, which cannot be misread whatever it contains. The `--` is not
 /// decoration either: without it `osascript` reads a title beginning with `-` as its
 /// own option and exits with a usage message.
-fn argv(b: Backend, n: &Banner) -> (&'static str, Vec<String>) {
+fn argv(b: Backend, n: &Banner) -> (String, Vec<String>) {
     match b {
         Backend::Osascript => {
             let mut a: Vec<String> = [
@@ -180,9 +200,18 @@ fn argv(b: Backend, n: &Banner) -> (&'static str, Vec<String>) {
             a.push(n.body.to_string());
             a.push(n.title.to_string());
             a.push(n.subtitle.to_string());
-            ("osascript", a)
+            ("osascript".to_string(), a)
         }
-        Backend::TerminalNotifier => {
+        // The same binary either way; only who gets the credit differs. An empty
+        // program when no home directory can be found is fine: the spawn fails and
+        // the candidate list moves on, exactly as for a missing install.
+        Backend::Eprint | Backend::TerminalNotifier => {
+            let prog = match b {
+                Backend::Eprint => crate::desktop::notifier_bin()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                _ => "terminal-notifier".to_string(),
+            };
             let mut a = vec![
                 "-title".to_string(),
                 n.title.to_string(),
@@ -195,7 +224,7 @@ fn argv(b: Backend, n: &Banner) -> (&'static str, Vec<String>) {
                 a.push("-open".to_string());
                 a.push(n.url.to_string());
             }
-            ("terminal-notifier", a)
+            (prog, a)
         }
         Backend::NotifySend => {
             // Two fields, not three, so the subtitle joins the body rather than
@@ -206,7 +235,7 @@ fn argv(b: Backend, n: &Banner) -> (&'static str, Vec<String>) {
                 (false, false) => format!("{}\n{}", n.subtitle, n.body),
             };
             (
-                "notify-send",
+                "notify-send".to_string(),
                 vec![
                     "-a".to_string(),
                     "eprint".to_string(),
@@ -219,9 +248,12 @@ fn argv(b: Backend, n: &Banner) -> (&'static str, Vec<String>) {
     }
 }
 
-/// First backend that exists and exits cleanly wins. A missing binary is not a
-/// failure, just the next one's turn.
-fn post(n: &Banner) -> bool {
+/// First backend that exists and exits cleanly wins; the winner is returned so a
+/// caller can say whose name the banner carried. A missing binary is not a
+/// failure, just the next one's turn — and so is a denied one: the eprint bundle
+/// exits non-zero until its notification permission is granted, and falling
+/// through to the next sender is better than a banner that never appears.
+fn post(n: &Banner) -> Option<Backend> {
     for b in candidates() {
         let (prog, args) = argv(b, n);
         let status = std::process::Command::new(prog)
@@ -231,12 +263,12 @@ fn post(n: &Banner) -> bool {
             .stderr(std::process::Stdio::null())
             .status();
         match status {
-            Ok(s) if s.success() => return true,
+            Ok(s) if s.success() => return Some(b),
             // Not installed, or it failed — either way, try the next one.
             _ => continue,
         }
     }
-    false
+    None
 }
 
 /// Strip everything a banner cannot render.
@@ -296,7 +328,9 @@ fn announce_each(hits: &[db::Hit], why: impl Fn(&db::Hit) -> String) -> usize {
             subtitle: &subtitle,
             body: &body,
             url: &p.url,
-        }) {
+        })
+        .is_some()
+        {
             posted += 1;
         }
     }
@@ -311,7 +345,9 @@ fn announce_each(hits: &[db::Hit], why: impl Fn(&db::Hit) -> String) -> usize {
             subtitle: "",
             body: &body,
             url: SITE,
-        }) {
+        })
+        .is_some()
+        {
             posted += 1;
         }
     }
@@ -321,8 +357,11 @@ fn announce_each(hits: &[db::Hit], why: impl Fn(&db::Hit) -> String) -> usize {
 /// Confirm, on screen, that notifications work — posted by `eprint config --notify`
 /// while the user is watching. That is the point of it: macOS asks permission the
 /// first time anything posts a banner, and the moment to be asked is now, not
-/// silently at three in the morning.
-pub fn confirm(mode: Mode) -> bool {
+/// silently at three in the morning. Returns the name of the backend that posted,
+/// because "it worked" is not the whole answer: a banner that appeared but was
+/// posted by bare terminal-notifier means the eprint bundle is still waiting for
+/// its own permission, and this is the moment to say so.
+pub fn confirm(mode: Mode) -> Option<&'static str> {
     post(&Banner {
         title: "eprint",
         subtitle: "",
@@ -330,6 +369,7 @@ pub fn confirm(mode: Mode) -> bool {
         // So the very first banner is also the click-through test.
         url: SITE,
     })
+    .map(Backend::name)
 }
 
 /// The whole pass: diff against this module's watermark, post, advance it.
@@ -359,12 +399,15 @@ pub fn announce(conn: &Connection, mode: Mode, watches: &[db::Watch]) -> Result<
             if hits.is_empty() {
                 0
             } else {
-                usize::from(post(&Banner {
-                    title: "eprint",
-                    subtitle: "",
-                    body: &summary_line(hits.len()),
-                    url: SITE,
-                }))
+                usize::from(
+                    post(&Banner {
+                        title: "eprint",
+                        subtitle: "",
+                        body: &summary_line(hits.len()),
+                        url: SITE,
+                    })
+                    .is_some(),
+                )
             }
         }
         Mode::All => announce_each(&hits, |h| plain(&h.paper.category, TITLE_MAX)),
@@ -448,11 +491,37 @@ mod tests {
 
     #[test]
     fn linux_candidates_are_reachable_from_macos() {
+        // The eprint bundle first — attribution — then bare terminal-notifier —
+        // click-through — then the one that is always installed.
         assert_eq!(
             candidates_for(true),
-            vec![Backend::TerminalNotifier, Backend::Osascript]
+            vec![
+                Backend::Eprint,
+                Backend::TerminalNotifier,
+                Backend::Osascript
+            ]
         );
         assert_eq!(candidates_for(false), vec![Backend::NotifySend]);
+    }
+
+    #[test]
+    fn the_eprint_bundle_takes_terminal_notifier_arguments() {
+        // Same binary inside, so the argument vector must be identical — only the
+        // program differs, and it must point into the bundle `install_notifier`
+        // writes, or clicks are handled by an app that no longer exists.
+        let n = Banner {
+            title: "T",
+            subtitle: "S",
+            body: "B",
+            url: "https://eprint.iacr.org/2026/1540",
+        };
+        let (prog, args) = argv(Backend::Eprint, &n);
+        let (_, tn_args) = argv(Backend::TerminalNotifier, &n);
+        assert_eq!(args, tn_args);
+        assert!(
+            prog.ends_with("eprint.app/Contents/MacOS/eprint") || prog.is_empty(),
+            "{prog}"
+        );
     }
 
     #[test]

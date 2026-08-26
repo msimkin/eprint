@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 /// bundle that belongs to no registered domain.
 const SCHED_LABEL: &str = "local.eprint.update";
 const LAUNCHER_ID: &str = "local.eprint.launcher";
+const NOTIFIER_ID: &str = "local.eprint.notifier";
 
 /// Thirty minutes. ePrint posts in bursts once or twice a day, so this is about
 /// noticing a burst within the hour rather than about polling hard.
@@ -69,6 +70,28 @@ fn systemd_dir() -> Result<PathBuf> {
 
 fn app_path() -> Result<PathBuf> {
     Ok(home()?.join("Applications").join("eprint.app"))
+}
+
+/// Inside Application Support rather than `~/Applications`, and not only because
+/// the launcher already owns `eprint.app` there: this bundle exists to be *blamed*
+/// for notifications, not to be launched, and a second Spotlight hit called
+/// "eprint" would recreate exactly the two-same-names fight the launcher section
+/// documents.
+fn notifier_app_path() -> Result<PathBuf> {
+    Ok(home()?
+        .join("Library")
+        .join("Application Support")
+        .join("eprint")
+        .join("eprint.app"))
+}
+
+/// Where `notify.rs` finds the binary to post through. The path is returned whether
+/// or not anything is installed there — a failed spawn is how the candidate list
+/// moves on, same as a missing `terminal-notifier`.
+pub fn notifier_bin() -> Option<PathBuf> {
+    notifier_app_path()
+        .ok()
+        .map(|a| a.join("Contents").join("MacOS").join("eprint"))
 }
 
 fn desktop_path() -> Result<PathBuf> {
@@ -235,6 +258,159 @@ fn info_plist() -> String {
 "#,
         version = env!("CARGO_PKG_VERSION")
     )
+}
+
+/// The notifier bundle's Info.plist. Unlike the launcher this one *is*
+/// `LSUIElement`: LaunchServices flags it a ui-element and Spotlight never offers
+/// it, which for a bundle whose whole job is to be the named sender of a banner is
+/// the point, not the bug — and it keeps a Dock icon from bouncing when macOS
+/// relaunches the bundle to handle a click. `NSPrincipalClass` is carried over from
+/// terminal-notifier's own plist, since its binary is what runs in here.
+fn notifier_info_plist() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>eprint</string>
+  <key>CFBundleDisplayName</key><string>eprint</string>
+  <key>CFBundleIdentifier</key><string>{NOTIFIER_ID}</string>
+  <key>CFBundleExecutable</key><string>eprint</string>
+  <key>CFBundleIconFile</key><string>eprint</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>{version}</string>
+  <key>CFBundleVersion</key><string>{version}</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+"#,
+        version = env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The path a Homebrew wrapper script execs, if this is one. The wrapper is a
+/// two-line `#!/bin/bash` whose `exec` names the bundle binary in double quotes;
+/// anything else — a Mach-O, some other script — answers `None` here and is
+/// handled by the caller.
+fn wrapper_target(script: &str) -> Option<PathBuf> {
+    for segment in script.split('"') {
+        if segment.ends_with(".app/Contents/MacOS/terminal-notifier") {
+            return Some(PathBuf::from(segment));
+        }
+    }
+    None
+}
+
+/// This machine's real terminal-notifier binary — the Mach-O inside the app
+/// bundle, not Homebrew's wrapper script. A copy of the *script* would not do:
+/// notification attribution follows the executable of the posting process, so a
+/// script that execs the Cellar binary posts as terminal-notifier no matter which
+/// bundle the script sits in.
+fn terminal_notifier_binary() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("terminal-notifier"));
+        }
+    }
+    // `opt` rather than `Cellar` so a version bump does not stale the path, plus
+    // the release-zip location, for a PATH that hides all of them.
+    for fixed in [
+        "/opt/homebrew/opt/terminal-notifier/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+        "/usr/local/opt/terminal-notifier/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+        "/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+    ] {
+        candidates.push(PathBuf::from(fixed));
+    }
+    for c in candidates {
+        let Ok(bytes) = std::fs::read(&c) else {
+            continue;
+        };
+        if bytes.starts_with(b"#!") {
+            if let Some(target) = wrapper_target(&String::from_utf8_lossy(&bytes)) {
+                if target.is_file() {
+                    return Some(target);
+                }
+            }
+        } else if c.display().to_string().contains(".app/Contents/MacOS/") {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Wrap this machine's terminal-notifier binary in an `eprint` bundle, so banners
+/// carry eprint's name and icon rather than terminal-notifier's. Copying the binary
+/// is what makes that work — attribution follows the posting process's enclosing
+/// bundle — and it also means a later `brew upgrade` or uninstall cannot break
+/// installed notifications; the next `config --notify` picks up a newer copy.
+///
+/// The re-sign is load-bearing, not hygiene: the copied binary's signature seals
+/// terminal-notifier's own bundle identifier, and `usernoted` validates exactly
+/// that (watch it in the log with `com.apple.securityd`). One ad-hoc pass derives
+/// the identifier from the new Info.plist, making the two agree.
+///
+/// `Ok(None)` means there is nothing to wrap — no terminal-notifier, or not macOS —
+/// and the caller falls back to whatever `notify::candidates` can still reach.
+pub fn install_notifier() -> Result<Option<String>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let Some(src) = terminal_notifier_binary() else {
+        return Ok(None);
+    };
+    let app = notifier_app_path()?;
+    let bin = app.join("Contents").join("MacOS").join("eprint");
+    write_file(
+        &app.join("Contents").join("Info.plist"),
+        &notifier_info_plist(),
+    )?;
+    write_bytes(
+        &app.join("Contents").join("Resources").join("eprint.icns"),
+        ICON,
+    )?;
+    if let Some(dir) = bin.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::copy(&src, &bin)
+        .with_context(|| format!("copying {} into the bundle", src.display()))?;
+    make_executable(&bin)?;
+    run(
+        "/usr/bin/codesign",
+        &[
+            "--force".into(),
+            "--sign".into(),
+            "-".into(),
+            app.display().to_string(),
+        ],
+    )
+    .context("codesign could not re-sign the notifier bundle")?;
+    let _ = run(LSREGISTER, &["-f".into(), app.display().to_string()]);
+    Ok(Some(app.display().to_string()))
+}
+
+pub fn remove_notifier() -> Result<Option<String>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let app = notifier_app_path()?;
+    if !app.exists() {
+        return Ok(None);
+    }
+    // Checked, not assumed — the `remove_launcher` rule: a recursive delete of a
+    // path built from `$HOME` must prove the target is ours first.
+    let info = std::fs::read_to_string(app.join("Contents").join("Info.plist")).unwrap_or_default();
+    if !info.contains(NOTIFIER_ID) {
+        bail!(
+            "{} was not created by eprint — remove it by hand",
+            app.display()
+        );
+    }
+    std::fs::remove_dir_all(&app).with_context(|| format!("removing {}", app.display()))?;
+    Ok(Some(app.display().to_string()))
 }
 
 /// The bundle's executable: ask a terminal to run one command line, then get out of
@@ -753,5 +929,52 @@ mod tests {
         // `remove_launcher` refuses to delete a bundle whose Info.plist lacks this,
         // so the two must not drift apart.
         assert!(info_plist().contains(LAUNCHER_ID));
+    }
+
+    #[test]
+    fn the_notifier_bundle_is_an_agent_the_launcher_must_not_be() {
+        let out = notifier_info_plist();
+        // Opposite requirement to the launcher, on purpose: this bundle must never
+        // win a Spotlight slot named "eprint" from the launcher, and `LSUIElement`
+        // is exactly the flag that keeps a bundle indexed but unofferable.
+        assert!(out.contains("<key>LSUIElement</key><true/>"), "{out}");
+        // `remove_notifier` refuses to delete a bundle without its identifier.
+        assert!(out.contains(NOTIFIER_ID));
+        // Same icon rules as the launcher: named without extension, really shipped.
+        assert!(out.contains("<key>CFBundleIconFile</key><string>eprint</string>"));
+        // The executable key must name what `install_notifier` writes and what
+        // `notifier_bin` looks up, or clicks relaunch a bundle with no binary.
+        assert!(out.contains("<key>CFBundleExecutable</key><string>eprint</string>"));
+        assert!(out.contains("<key>CFBundleVersion</key>"), "{out}");
+    }
+
+    #[test]
+    fn the_wrapper_parse_takes_the_bundle_binary_and_nothing_else() {
+        // Homebrew's actual wrapper shape.
+        let brew = "#!/bin/bash\nexec \"/opt/homebrew/Cellar/terminal-notifier/3.0.0_1/terminal-notifier.app/Contents/MacOS/terminal-notifier\" \"$@\"\n";
+        assert_eq!(
+            wrapper_target(brew),
+            Some(PathBuf::from(
+                "/opt/homebrew/Cellar/terminal-notifier/3.0.0_1/terminal-notifier.app/Contents/MacOS/terminal-notifier"
+            ))
+        );
+        // A script that execs something else is not a wrapper we understand: better
+        // no bundle than one wrapping the wrong program.
+        assert_eq!(
+            wrapper_target("#!/bin/sh\nexec \"/usr/bin/true\" \"$@\"\n"),
+            None
+        );
+        assert_eq!(wrapper_target(""), None);
+    }
+
+    #[test]
+    fn the_notifier_lives_outside_spotlight_reach() {
+        // `notifier_bin` must agree with where `install_notifier` writes, and the
+        // bundle must not sit in `~/Applications`, where the launcher already owns
+        // the name `eprint.app`.
+        let bin = notifier_bin().expect("a home directory exists in tests");
+        let s = bin.display().to_string();
+        assert!(s.ends_with("eprint.app/Contents/MacOS/eprint"), "{s}");
+        assert!(s.contains("Application Support"), "{s}");
     }
 }

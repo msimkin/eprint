@@ -1373,20 +1373,42 @@ fn set_notify(mode: &str) -> Result<()> {
     println!("  notify = {} in {}", m.label(), path.display());
     if m == notify::Mode::Off {
         println!("  {}", desktop::remove_scheduler()?);
+        if let Some(app) = desktop::remove_notifier()? {
+            println!("  removed {app}");
+        }
         println!();
         return Ok(());
     }
     println!("  {}", desktop::install_scheduler(desktop::INTERVAL_SECS)?);
+    // The bundle that lets banners carry eprint's own name and icon. Best-effort:
+    // without it banners still post, just credited to terminal-notifier.
+    match desktop::install_notifier() {
+        Ok(Some(app)) => println!("  {app}"),
+        Ok(None) => {}
+        Err(e) => println!("  notifier bundle skipped ({e:#})"),
+    }
     // Posted now, on purpose. macOS asks permission the first time anything shows a
     // banner, and the moment to be asked is while you are looking at the screen —
-    // not silently at three in the morning when the first batch lands.
-    if notify::confirm(m) {
-        println!("  a test notification has just been posted");
-        if let Some(tip) = notify::click_hint() {
-            println!("  {tip}");
+    // not silently at three in the morning when the first batch lands. The names
+    // matched here are `notify::Backend::name` values; an unmatched one only costs
+    // the advice line, never the confirmation.
+    let allow =
+        "allow \"eprint\" in System Settings > Notifications and banners will carry its name";
+    match notify::confirm(m) {
+        Some("terminal-notifier") => {
+            println!("  a test notification has just been posted — as terminal-notifier;");
+            println!("  {allow}");
         }
-    } else {
-        println!("  {}", notify::hint());
+        Some("osascript") => {
+            println!("  a test notification has just been posted — via osascript;");
+            match notify::click_hint() {
+                Some(tip) => println!("  {tip}"),
+                // terminal-notifier exists, so only permission stands in the way.
+                None => println!("  {allow}"),
+            }
+        }
+        Some(_) => println!("  a test notification has just been posted"),
+        None => println!("  {}", notify::hint()),
     }
     println!();
     Ok(())
