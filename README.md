@@ -387,7 +387,8 @@ eprint config --notify off       # and it is gone again
 
 That writes the mode to the config file *and* installs a background updater — a launchd agent on
 macOS, a systemd user timer on Linux — which harvests every 30 minutes and announces what arrived.
-A test banner is posted straight away, so macOS asks its permission question while you are watching.
+A test banner is posted straight away, and the output says which sender posted it — read that line,
+because it also spells out whatever setup step is still missing.
 
 | mode | what you get |
 |---|---|
@@ -400,9 +401,29 @@ ePrint posts in bursts of forty, so `watched` is the mode worth having. A harves
 never posts a banner; one that happened behind your back does. `eprint config` and `eprint status`
 both say whether the updater is installed.
 
-Banners use whatever the platform already ships, so there is nothing to install on macOS —
-`brew install terminal-notifier` only buys you better attribution and a clickable banner. Linux
-needs `notify-send` (`sudo apt install libnotify-bin`).
+Banners use whatever the platform already ships. On a stock macOS that is `osascript`, which works
+but poorly: the banner is attributed to "Script Editor", and clicking it opens Script Editor rather
+than anything useful. Two steps fix both:
+
+```sh
+brew install terminal-notifier
+eprint config --notify summary    # run again, now that it has something to wrap
+```
+
+With terminal-notifier present, `config --notify` wraps its binary in a small `eprint.app` (kept
+under `~/Library/Application Support/eprint/`), so banners carry eprint's own name and icon — and
+clicks work: the summary banner opens [eprint.iacr.org](https://eprint.iacr.org), a per-paper
+banner opens that paper's page. One manual step remains: open System Settings → Notifications,
+find **eprint** in the list, and switch *Allow notifications* on. macOS never shows its usual
+permission prompt for this bundle — it is assembled on your machine and only ad-hoc signed, and
+macOS silently declines such apps instead of asking — so until the switch is flipped, banners fall
+back to the best sender that is allowed, and the `config --notify` output names it. The toggle is
+needed once; it survives upgrades and reinstalls, and `eprint config --notify off` removes the
+bundle along with the updater.
+
+Linux needs `notify-send` (`sudo apt install libnotify-bin`); banners post under eprint's name
+as they are. There is no click-through there by design: `notify-send` can only observe a click by
+blocking until the banner is dismissed, and a scheduled job must never hang on one.
 
 ### Opening `browse` from Spotlight
 
@@ -857,6 +878,7 @@ Everything lives in two places, both safe to delete — the index rebuilds from 
 |---|---|---|
 | Background updater | `~/Library/LaunchAgents/local.eprint.update.plist` | `~/.config/systemd/user/eprint-update.{service,timer}` |
 | Updater's error log | `~/Library/Logs/eprint-update.log` | `journalctl --user -u eprint-update` |
+| Notification sender | `~/Library/Application Support/eprint/eprint.app` | — (`notify-send` is used directly) |
 | Launcher | `~/Applications/eprint.app` | `~/.local/share/applications/eprint.desktop` |
 
 The database is roughly 94 MB with metadata only, or ~112 MB once CryptoBib entries are
