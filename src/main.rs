@@ -547,8 +547,7 @@ pub fn open_url(url: &str) -> Result<()> {
             bail!("{opener} could not open {url}");
         }
     } else {
-        cmd.spawn()
-            .with_context(|| format!("launching {opener}"))?;
+        cmd.spawn().with_context(|| format!("launching {opener}"))?;
     }
     Ok(())
 }
@@ -1383,6 +1382,9 @@ fn set_notify(mode: &str) -> Result<()> {
     // not silently at three in the morning when the first batch lands.
     if notify::confirm(m) {
         println!("  a test notification has just been posted");
+        if let Some(tip) = notify::click_hint() {
+            println!("  {tip}");
+        }
     } else {
         println!("  {}", notify::hint());
     }

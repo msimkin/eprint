@@ -34,6 +34,12 @@ const NOTIFY_CAP: usize = 500;
 /// but they do it by bytes, which can cut a multi-byte character in half.
 const TITLE_MAX: usize = 110;
 
+/// Where a banner that is not about one specific paper lands when clicked: the
+/// summary, the roll-up and the `--notify` confirmation all point at the archive
+/// itself, so no banner is ever a dead end. Per-paper banners carry the paper's
+/// own page instead.
+const SITE: &str = "https://eprint.iacr.org";
+
 /// What to announce. `Off` is the default, so nothing here happens to anyone who
 /// has not asked for it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -109,6 +115,32 @@ pub fn hint() -> &'static str {
     } else {
         "no notification tool — sudo apt install libnotify-bin"
     }
+}
+
+/// The one improvement worth suggesting when posting already works: only
+/// `terminal-notifier` can make a click open the paper. An `osascript` banner is
+/// attributed to Script Editor and clicking it opens *that*, which reads as a bug
+/// rather than as a missing feature — so `config --notify` says so while the user
+/// is watching, instead of leaving the first click to explain itself. Linux gets
+/// no equivalent: `notify-send` actions (`-A`) block until the banner is dismissed,
+/// which on a tray can be indefinitely — an unbounded child, which nothing in this
+/// codebase is allowed to be.
+pub fn click_hint() -> Option<&'static str> {
+    if cfg!(target_os = "macos") && !have("terminal-notifier") {
+        Some(
+            "clicking a banner opens Script Editor rather than the paper — \
+             brew install terminal-notifier to make clicks open the page",
+        )
+    } else {
+        None
+    }
+}
+
+/// `Command::new` can only answer by failing to spawn; existence is a PATH walk.
+fn have(prog: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
+        .unwrap_or(false)
 }
 
 /// A banner, in the three fields macOS offers. Linux has two, so `subtitle` and
@@ -278,7 +310,7 @@ fn announce_each(hits: &[db::Hit], why: impl Fn(&db::Hit) -> String) -> usize {
             title: "eprint",
             subtitle: "",
             body: &body,
-            url: "",
+            url: SITE,
         }) {
             posted += 1;
         }
@@ -295,7 +327,8 @@ pub fn confirm(mode: Mode) -> bool {
         title: "eprint",
         subtitle: "",
         body: &format!("notifications are on ({})", mode.label()),
-        url: "",
+        // So the very first banner is also the click-through test.
+        url: SITE,
     })
 }
 
@@ -330,7 +363,7 @@ pub fn announce(conn: &Connection, mode: Mode, watches: &[db::Watch]) -> Result<
                     title: "eprint",
                     subtitle: "",
                     body: &summary_line(hits.len()),
-                    url: "",
+                    url: SITE,
                 }))
             }
         }
@@ -441,6 +474,34 @@ mod tests {
             );
         }
         assert!(args[sep + 1..].contains(&n.title.to_string()));
+    }
+
+    #[test]
+    fn terminal_notifier_gets_the_click_url() {
+        // Clicking a banner opened Script Editor for want of this: the summary and
+        // roll-up banners carried no URL, so even the backend that can click
+        // through had nowhere to go.
+        let n = Banner {
+            title: "eprint",
+            subtitle: "",
+            body: "7 new papers",
+            url: SITE,
+        };
+        let (prog, args) = argv(Backend::TerminalNotifier, &n);
+        assert_eq!(prog, "terminal-notifier");
+        let at = args.iter().position(|a| a == "-open").expect("needs -open");
+        assert_eq!(args[at + 1], SITE);
+
+        // And no dangling `-open` with nowhere to go — terminal-notifier would
+        // read the next flag as its value.
+        let bare = Banner {
+            title: "eprint",
+            subtitle: "",
+            body: "b",
+            url: "",
+        };
+        let (_, args) = argv(Backend::TerminalNotifier, &bare);
+        assert!(!args.contains(&"-open".to_string()));
     }
 
     #[test]
