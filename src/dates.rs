@@ -175,7 +175,11 @@ pub(crate) fn parse_bound(s: &str, upper: bool) -> Result<String> {
             let one = one.trim();
             if one.len() == 4 && one.chars().all(|c| c.is_ascii_digit()) {
                 let y = num(one)?;
-                return if upper { build(y, 12, 31) } else { build(y, 1, 1) };
+                return if upper {
+                    build(y, 12, 31)
+                } else {
+                    build(y, 1, 1)
+                };
             }
             // 30d, 2y, 1w, 1m — a window ending now.
             let (n, unit) = one.split_at(one.len().saturating_sub(1));
@@ -189,10 +193,7 @@ pub(crate) fn parse_bound(s: &str, upper: bool) -> Result<String> {
                 "y" => n * 365,
                 _ => bail!("{t:?} is not a date — try 28/04/2024, 04/2024, 2024 or 30d"),
             };
-            Ok(format_iso(now() - days * 86400)
-                .chars()
-                .take(10)
-                .collect())
+            Ok(format_iso(now() - days * 86400).chars().take(10).collect())
         }
         [m, y] => {
             let (m, y) = (num(m)?, num(y)?);

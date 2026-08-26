@@ -62,9 +62,7 @@ fn detect_mode() -> Mode {
     // Cached for the life of the process: `Theme::resolve` is called more than
     // once per command and the terminal's answer cannot change underneath it.
     static PROBED: std::sync::OnceLock<Option<Mode>> = std::sync::OnceLock::new();
-    PROBED
-        .get_or_init(query_background)
-        .unwrap_or(Mode::Dark)
+    PROBED.get_or_init(query_background).unwrap_or(Mode::Dark)
 }
 
 /// Ask the terminal what colour it is painting behind us (OSC 11), and read the
@@ -294,7 +292,10 @@ mod tests {
         assert!(black < 0.01, "black was {black}");
         // 8-bit components, ST-terminated — also legal.
         let same = luminance_of("\x1b]11;rgb:ff/ff/ff\x1b\\").unwrap();
-        assert!((same - white).abs() < 0.01, "width should not change the value");
+        assert!(
+            (same - white).abs() < 0.01,
+            "width should not change the value"
+        );
     }
 
     #[test]
@@ -312,6 +313,9 @@ mod tests {
     fn nonsense_is_declined_rather_than_guessed() {
         assert!(luminance_of("").is_none());
         assert!(luminance_of("\x1b]11;?\x07").is_none());
-        assert!(luminance_of("rgb:ffff/ffff").is_none(), "two channels is not a colour");
+        assert!(
+            luminance_of("rgb:ffff/ffff").is_none(),
+            "two channels is not a colour"
+        );
     }
 }

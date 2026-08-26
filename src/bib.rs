@@ -11,14 +11,22 @@ const URL: &str = "https://cryptobib.di.ens.fr/cryptobib/static/files/crypto.bib
 /// crypto.bib reference them by bare identifier, so a record is not usable on
 /// its own until they are substituted in.
 const ABBREV_URL: &str = "https://cryptobib.di.ens.fr/cryptobib/static/files/abbrev3.bib";
-const UA: &str = concat!("eprint-cli/", env!("CARGO_PKG_VERSION"), " (CryptoBib client)");
+const UA: &str = concat!(
+    "eprint-cli/",
+    env!("CARGO_PKG_VERSION"),
+    " (CryptoBib client)"
+);
 
 pub const KEY_ETAG: &str = "bib_etag";
 pub const KEY_UPDATED: &str = "bib_updated";
 
 pub enum Outcome {
     UpToDate,
-    Rebuilt { entries: usize, linked: usize, published: usize },
+    Rebuilt {
+        entries: usize,
+        linked: usize,
+        published: usize,
+    },
 }
 
 // ---------- BibTeX parsing ----------
@@ -356,8 +364,8 @@ fn rebuild_entry(entry: &str, macros: &HashMap<String, String>) -> String {
         const MONTHS: [&str; 12] = [
             "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
         ];
-        let bare = expanded.chars().all(|c| c.is_ascii_digit())
-            || MONTHS.contains(&expanded.as_str());
+        let bare =
+            expanded.chars().all(|c| c.is_ascii_digit()) || MONTHS.contains(&expanded.as_str());
         if bare {
             out.push_str(&format!("  {name:<13} = {expanded},\n"));
         } else {
@@ -494,7 +502,10 @@ fn download(etag: Option<&str>, quiet: bool) -> Result<Option<(String, Option<St
         }
     }
     if show {
-        eprintln!("\r  downloaded crypto.bib ({:.0} MB)   ", read_total as f64 / 1e6);
+        eprintln!(
+            "\r  downloaded crypto.bib ({:.0} MB)   ",
+            read_total as f64 / 1e6
+        );
     }
     Ok(Some((String::from_utf8_lossy(&buf).into_owned(), new_etag)))
 }
@@ -555,10 +566,11 @@ pub fn update(conn: &mut Connection, force: bool, quiet: bool, now: &str) -> Res
             }
         } else {
             let year = e.year.trim().parse::<i64>().unwrap_or(0);
-            by_title
-                .entry(norm_title(&e.title))
-                .or_default()
-                .push((idx, surnames(&e.author), year));
+            by_title.entry(norm_title(&e.title)).or_default().push((
+                idx,
+                surnames(&e.author),
+                year,
+            ));
         }
     }
 
@@ -599,7 +611,12 @@ pub fn update(conn: &mut Connection, force: bool, quiet: bool, now: &str) -> Res
                     99
                 };
                 best = match best {
-                    Some(b) if (b.0, entries[b.1].key.as_str()) <= (dist, entries[*pidx].key.as_str()) => Some(b),
+                    Some(b)
+                        if (b.0, entries[b.1].key.as_str())
+                            <= (dist, entries[*pidx].key.as_str()) =>
+                    {
+                        Some(b)
+                    }
                     _ => Some((dist, *pidx)),
                 };
             }

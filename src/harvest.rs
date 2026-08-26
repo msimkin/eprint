@@ -8,7 +8,11 @@ use std::time::Duration;
 use crate::db::{self, Paper};
 
 const BASE: &str = "https://eprint.iacr.org/oai";
-const UA: &str = concat!("eprint-cli/", env!("CARGO_PKG_VERSION"), " (OAI-PMH metadata harvester)");
+const UA: &str = concat!(
+    "eprint-cli/",
+    env!("CARGO_PKG_VERSION"),
+    " (OAI-PMH metadata harvester)"
+);
 /// Politeness delay between successive OAI-PMH pages.
 const PAGE_DELAY: Duration = Duration::from_millis(200);
 
@@ -121,9 +125,7 @@ fn parse_page(xml: &str) -> Result<Page> {
                     "header" => {
                         in_header = true;
                         for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"status"
-                                && attr.value.as_ref() == b"deleted"
-                            {
+                            if attr.key.as_ref() == b"status" && attr.value.as_ref() == b"deleted" {
                                 deleted = true;
                             }
                         }
@@ -217,9 +219,7 @@ fn parse_page(xml: &str) -> Result<Page> {
                             let year = date
                                 .get(0..4)
                                 .and_then(|y| y.parse::<i64>().ok())
-                                .or_else(|| {
-                                    oai_id.split('/').next().and_then(|y| y.parse().ok())
-                                })
+                                .or_else(|| oai_id.split('/').next().and_then(|y| y.parse().ok()))
                                 .unwrap_or(0);
                             let final_url = if url.is_empty() {
                                 format!("https://eprint.iacr.org/{oai_id}")
@@ -334,7 +334,10 @@ pub fn run(conn: &mut Connection, from: Option<&str>, quiet: bool, now: &str) ->
 
         match page.token {
             Some(tok) => {
-                url = format!("{BASE}?verb=ListRecords&resumptionToken={}", url_encode(&tok));
+                url = format!(
+                    "{BASE}?verb=ListRecords&resumptionToken={}",
+                    url_encode(&tok)
+                );
             }
             None => break,
         }

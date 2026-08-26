@@ -646,7 +646,9 @@ pub fn run(
 
         // Lay out only what the viewport can show, starting from the hit the
         // scroll offset falls inside.
-        let first = starts.partition_point(|&s| s <= app.scroll).saturating_sub(1);
+        let first = starts
+            .partition_point(|&s| s <= app.scroll)
+            .saturating_sub(1);
         let intra = app.scroll - starts.get(first).copied().unwrap_or(0);
 
         // Fetch the marked-up text for just those rows. Done here, after the
@@ -742,10 +744,7 @@ pub fn run(
             // `intra` is at most one entry's height, so this cast is safe. Passing
             // the absolute line offset here was the old bug: past ~65,535 lines the
             // u16 truncated and scrolling landed somewhere arbitrary.
-            f.render_widget(
-                Paragraph::new(lines).scroll((intra as u16, 0)),
-                chunks[1],
-            );
+            f.render_widget(Paragraph::new(lines).scroll((intra as u16, 0)), chunks[1]);
 
             // --- footer ---
             let help = match app.editing {
