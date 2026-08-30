@@ -1,34 +1,29 @@
-mod bib;
 mod completions;
-mod config;
-mod dates;
-mod db;
 mod desktop;
-mod harvest;
-mod names;
 mod notify;
 mod pdf;
 mod render;
 mod theme;
 mod tui;
 
+// The index and the archive live in the library half of this crate. Imported at
+// the crate root rather than per-module so that every existing `crate::db::…`,
+// `crate::names::…` and `crate::config::…` path below keeps resolving: a `use`
+// here is in scope for every descendant module, which is what makes the split a
+// move rather than a rewrite.
+use eprint::db::{self, Query, Scope};
+use eprint::harvest::{incremental_from, index_age, STALE_SECS};
+use eprint::{bib, config, dates, feed, harvest, names};
+
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use db::{Query, Scope};
 use render::{Style, StyleOpts};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use theme::{Theme, Tone};
 
-/// Refresh the index in the background when it is older than this.
-const STALE_SECS: u64 = 24 * 3600;
 /// Never spawn a background refresh more often than this.
 const ATTEMPT_COOLDOWN_SECS: u64 = 3600;
-/// Re-request a small overlap window so nothing slips through the cracks.
-const OVERLAP_SECS: u64 = 2 * 24 * 3600;
-/// Sanity bound on one arrival batch, for someone coming back after a long
-/// absence. Not a display limit: `latest_limit` is a floor, not a cap.
-const BATCH_MAX: usize = 500;
 /// How many author names one `--author` completion offers. A menu is for choosing
 /// from, not for reading: past this the answer is "type another letter".
 const AUTHOR_MATCHES: usize = 40;
@@ -309,38 +304,6 @@ impl SearchArgs {
 // ---------- minimal civil-time helpers (no chrono dependency) ----------
 
 // ---------- index freshness ----------
-
-/// Where an incremental harvest should start: the **earlier** of the last harvest
-/// and the newest record actually indexed, less the re-request window.
-///
-/// Taking the harvest clock alone opens a hole that never heals. The watermark is
-/// the server's `responseDate`, so a harvest that comes back empty still advances
-/// it; once it has run ahead of the data, every later run asks about a window that
-/// starts after the records it is missing, and `OVERLAP_SECS` is far too short to
-/// reach back. That is not hypothetical — it cost this index 2026/1540 to 1575, a
-/// week of papers, while `status` reported a harvest minutes old.
-///
-/// Bounding it by `MAX(papers.date)` makes the request describe the data rather
-/// than the clock, so a gap of any size closes itself on the next update. The
-/// harvest clock still bounds the other side: a paper dated in the future must not
-/// be able to push the window forward.
-fn incremental_from(last_harvest: Option<&str>, newest: Option<&str>) -> Option<String> {
-    let at = |s: Option<&str>| s.and_then(dates::parse_iso);
-    let (harvested, newest) = (at(last_harvest), at(newest));
-    let start = match (harvested, newest) {
-        (Some(h), Some(n)) => h.min(n),
-        (Some(h), None) => h,
-        // Nothing harvested yet: the caller asks for everything.
-        (None, _) => return None,
-    };
-    Some(dates::format_iso(start - OVERLAP_SECS as i64))
-}
-
-fn index_age(conn: &rusqlite::Connection) -> Result<Option<i64>> {
-    Ok(db::meta_get(conn, harvest::KEY_LAST_HARVEST)?
-        .and_then(|v| dates::parse_iso(&v))
-        .map(|t| (dates::now() - t).max(0)))
-}
 
 /// Kick off `eprint update --quiet` as a detached child and return
 /// immediately, so a stale index never delays a search.
@@ -955,83 +918,18 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
     // `latest_limit` is a *floor*, not a cap: a quiet day still shows something, and
     // a big batch is shown whole rather than truncated to a number that has nothing
     // to do with how much arrived. `-n` overrides it as an exact count.
-    let floor = a.limit.unwrap_or(cfg.latest_limit);
+    let f = feed::build(&conn, a.limit.unwrap_or(cfg.latest_limit), a.limit)?;
 
-    let watermark = db::meta_get(&conn, harvest::KEY_LAST_SEEN)?
-        .unwrap_or_else(|| dates::format_iso(dates::now() - 7 * 86400));
-
-    let day = |ts: &str| render::fmt_date(ts);
-
-    // No cap on the batch itself, only a sanity bound for the case where someone
-    // returns from a long absence.
-    let mut hits = db::added_since(&conn, &watermark, BATCH_MAX)?;
-    let fresh_count = hits.len();
-    // The window whose papers are on screen: the fresh diff normally, the
-    // remembered one when there is no fresh diff to show.
-    let mut window = watermark.clone();
-    let mut replayed = false;
-
-    // ePrint posts in bursts, so most runs find nothing. Rather than report an
-    // empty diff, show the last one again until the archive actually moves.
-    if hits.is_empty() {
-        if let Some(prev) = db::meta_get(&conn, harvest::KEY_NEW_BATCH)? {
-            let again = db::added_since(&conn, &prev, BATCH_MAX)?;
-            if !again.is_empty() {
-                hits = again;
-                window = prev;
-                replayed = true;
-            }
-        }
-    }
-
-    // Still short of the floor — either nothing is new or the batch was tiny — so
-    // top up with the most recent arrivals. They are ordered the same way, so the
-    // new ones stay at the top and the rest are simply context.
-    let topped_up = hits.len() < floor;
-    if topped_up {
-        hits = db::recent_arrivals(&conn, floor)?;
-    }
-    // With `-n`, the number given wins outright, batch or not.
-    if let Some(n) = a.limit {
-        hits.truncate(n);
-    }
-
-    if hits.is_empty() {
+    if f.hits.is_empty() {
         // Only reachable on an empty index, which the caller has already handled.
         println!("\nNothing to show yet — try `eprint update`.\n");
         return Ok(());
     }
 
-    // The two dates in this header deliberately mean different things. A count of
-    // new papers is *about* your last look, so it is dated by it. "Nothing new",
-    // dated by your last look, only ever says "you ran this recently" — the useful
-    // answer there is when the archive itself last posted.
-    let posted = db::newest(&conn)?.map(|(_, date)| day(&date));
-
-    // Order matters: a topped-up listing is no longer "the last batch", even if a
-    // replay is what it was topped up from, so that case is reported first.
-    let label = if topped_up {
-        match (fresh_count, &posted) {
-            (0, Some(p)) => format!("nothing new since {p}"),
-            // Only with no papers at all, which the caller has already handled.
-            (0, None) => "nothing new".to_string(),
-            (n, _) => format!("{n} new since {}", day(&watermark)),
-        }
-    } else if replayed {
-        // The batch's own newest paper, not the window that produced it: the window
-        // start is another "when you last ran it" date, and a late-published paper
-        // (recent arrival, older date) would make the index-wide answer name a date
-        // no paper on screen carries.
-        let batch = hits
-            .iter()
-            .map(|h| h.paper.date.as_str())
-            .max()
-            .map(day)
-            .unwrap_or_else(|| day(&window));
-        format!("last batch, from {batch} · nothing new yet")
-    } else {
-        format!("since {}", day(&window))
-    };
+    if a.json {
+        println!("{}", render::json_of(&f.hits));
+        return Ok(());
+    }
 
     // A stale index looks exactly like a quiet archive once the header is dated by
     // the archive, so say which it is. Only when stale: the feed is the most-typed
@@ -1040,33 +938,18 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
         .filter(|s| *s as u64 > STALE_SECS)
         .map(dates::human_age);
 
-    if a.json {
-        println!("{}", render::json_of(&hits));
-        return Ok(());
-    }
     let mut out = String::new();
-    render::render_header(&mut out, hits.len(), hits.len(), age, &label, &st);
-    let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
+    render::render_header(&mut out, f.hits.len(), f.hits.len(), age, &f.label, &st);
+    let ids: Vec<String> = f.hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
     let watched = db::watched(&conn, &watches(&conn)).unwrap_or_default();
-    for hit in &hits {
+    for hit in &f.hits {
         let w = watched.contains(&hit.paper.id);
         render::render_hit(&mut out, hit, &st, a.abstracts, bibs.get(&hit.paper.id), w);
     }
     page(&out, &st, a.no_pager)?;
 
-    // Remember a *fresh* diff so later runs can replay it; a replay needs no
-    // pointer write, since the pointer already names that window, and a topped-up
-    // listing is not a batch at all.
-    if fresh_count > 0 {
-        db::meta_set(&conn, harvest::KEY_NEW_BATCH, &watermark)?;
-    }
-    db::meta_set(
-        &conn,
-        harvest::KEY_LAST_SEEN,
-        &dates::format_iso(dates::now()),
-    )?;
-    Ok(())
+    feed::mark_seen(&conn, &f.window, f.fresh)
 }
 
 /// The saved searches, from the config file — plus the one-time move of anything an
@@ -1746,35 +1629,6 @@ mod tests {
         let (from, till) = dates::parse_range("2020..2024").unwrap();
         assert_eq!(from.unwrap(), "2020-01-01");
         assert_eq!(till.unwrap(), "2025-01-01");
-    }
-
-    #[test]
-    fn an_incremental_window_never_outruns_the_data() {
-        // The bug this exists for: a harvest that comes back empty still advances
-        // the watermark, so the window marched past 2026/1540-1575 and no later run
-        // could reach back. The window has to describe the data, not the clock.
-        let day = 24 * 3600;
-        let harvested = dates::format_iso(30 * day);
-        let newest = dates::format_iso(10 * day);
-        assert_eq!(
-            incremental_from(Some(&harvested), Some(&newest)),
-            Some(dates::format_iso(10 * day - OVERLAP_SECS as i64)),
-            "the newest record bounds it, not the harvest clock"
-        );
-        // Up to date: the harvest clock is the earlier of the two and still wins,
-        // so the usual case asks about two days rather than everything since.
-        let newest = dates::format_iso(40 * day);
-        assert_eq!(
-            incremental_from(Some(&harvested), Some(&newest)),
-            Some(dates::format_iso(30 * day - OVERLAP_SECS as i64)),
-            "a paper dated in the future must not push the window forward"
-        );
-        // An empty index has nothing to bound, and no harvest means a full one.
-        assert_eq!(
-            incremental_from(Some(&harvested), None),
-            Some(dates::format_iso(30 * day - OVERLAP_SECS as i64))
-        );
-        assert_eq!(incremental_from(None, Some(&newest)), None);
     }
 
     #[test]

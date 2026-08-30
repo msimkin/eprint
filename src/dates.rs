@@ -12,7 +12,7 @@
 use anyhow::{bail, Context, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -22,7 +22,7 @@ pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -35,7 +35,7 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-pub(crate) fn parse_iso(s: &str) -> Option<i64> {
+pub fn parse_iso(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 10 {
         return None;
@@ -49,7 +49,7 @@ pub(crate) fn parse_iso(s: &str) -> Option<i64> {
     Some(secs)
 }
 
-pub(crate) fn format_iso(epoch: i64) -> String {
+pub fn format_iso(epoch: i64) -> String {
     let days = epoch.div_euclid(86400);
     let rem = epoch.rem_euclid(86400);
     let (y, m, d) = civil_from_days(days);
@@ -61,14 +61,14 @@ pub(crate) fn format_iso(epoch: i64) -> String {
     )
 }
 
-pub(crate) fn now() -> i64 {
+pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
-pub(crate) fn human_age(secs: i64) -> String {
+pub fn human_age(secs: i64) -> String {
     if secs < 90 {
         "just now".to_string()
     } else if secs < 5400 {
@@ -83,7 +83,7 @@ pub(crate) fn human_age(secs: i64) -> String {
 /// Accepts `YYYY-MM-DD` or a relative window like `30d` / `6m` / `2y`.
 /// The date window a set of flags asks for. `--date` is the documented spelling;
 /// `--since` predates it and means the same thing, so whichever is present wins.
-pub(crate) fn date_window(
+pub fn date_window(
     date: &Option<String>,
     since: &Option<String>,
 ) -> Result<(Option<String>, Option<String>)> {
@@ -115,7 +115,7 @@ pub(crate) fn date_window(
 /// Accepts `28/04/2024`, `04/2024` and `2024` — the same day/month/year shape the
 /// tool prints — plus ISO `2024-04-28`, which stays parseable but undocumented so
 /// older scripts and habits keep working.
-pub(crate) fn parse_bound(s: &str, upper: bool) -> Result<String> {
+pub fn parse_bound(s: &str, upper: bool) -> Result<String> {
     let t = s.trim();
     if t.is_empty() {
         bail!("empty date");
@@ -210,7 +210,7 @@ pub(crate) fn parse_bound(s: &str, upper: bool) -> Result<String> {
 
 /// `--date` in full: one flag carrying both ends. `2023..2024`, `2023..`, `..2020`,
 /// or a single bound standing for the whole period it names.
-pub(crate) fn parse_range(s: &str) -> Result<(Option<String>, Option<String>)> {
+pub fn parse_range(s: &str) -> Result<(Option<String>, Option<String>)> {
     let t = s.trim();
     if let Some((lo, hi)) = t.split_once("..") {
         let (lo, hi) = (lo.trim(), hi.trim());
@@ -247,7 +247,7 @@ pub(crate) fn parse_range(s: &str) -> Result<(Option<String>, Option<String>)> {
 }
 
 /// `30d`, `2y`, `1w`, `1m`: a number and a unit, meaning "since then, until now".
-pub(crate) fn is_relative(t: &str) -> bool {
+pub fn is_relative(t: &str) -> bool {
     let (n, unit) = t.split_at(t.len().saturating_sub(1));
     matches!(unit, "d" | "w" | "m" | "y") && !n.is_empty() && n.parse::<i64>().is_ok()
 }

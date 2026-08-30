@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
-pub(crate) use rusqlite::Connection;
+pub use rusqlite::Connection;
 use rusqlite::ToSql;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A single ePrint paper as exposed by the OAI-PMH `oai_dc` feed.
 #[derive(Debug, Clone)]
@@ -43,6 +43,11 @@ pub enum Scope {
 }
 
 impl Scope {
+    // Deliberately not `FromStr`: that trait returns a `Result`, and this is
+    // infallible on purpose — an unreadable `scope` in the config falls back to
+    // `All` the same way an unreadable `theme` falls back, rather than failing a
+    // command over a typo. The lint only fires now that the enum is library API.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Scope {
         match s.trim().to_ascii_lowercase().as_str() {
             "title" | "titles" => Scope::Title,
@@ -96,13 +101,58 @@ pub fn db_path() -> Result<PathBuf> {
     Ok(base.join("eprint").join("eprint.db"))
 }
 
+/// How much memory a connection may keep, for callers that are not a laptop.
+///
+/// The defaults were measured against a 110MB index on a desktop and are right
+/// there. They are not right everywhere: 64MB of page cache per connection plus a
+/// 256MB mapping is a lot to hold inside a short-lived background task on a phone,
+/// and a memory-mapped file whose pages the operating system can make unreadable
+/// turns a permission error into a SIGBUS — a crash rather than something a caller
+/// can handle. Both are therefore knobs rather than constants, and both keep the
+/// values the command-line tool has always used.
+#[derive(Clone, Copy, Debug)]
+pub struct Tuning {
+    /// `cache_size` in KiB, negative as SQLite expects.
+    pub cache_kib: i64,
+    /// `mmap_size` in bytes; zero disables the mapping.
+    pub mmap_bytes: i64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            cache_kib: -65_536,
+            mmap_bytes: 268_435_456,
+        }
+    }
+}
+
+/// Open the index wherever this machine keeps it.
 pub fn open() -> Result<Connection> {
-    let path = db_path()?;
+    open_at(&db_path()?)
+}
+
+/// Open the index at an explicit path, with the usual tuning.
+///
+/// Separate from [`open`] because [`db_path`] answers a question only a desktop has
+/// a convention for: it reads `$EPRINT_DB`, then falls back to the platform data
+/// directory, which inside a sandboxed application is a plausible-looking wrong
+/// answer. An embedder knows where its own storage is and says so.
+pub fn open_at(path: &Path) -> Result<Connection> {
+    open_tuned(path, Tuning::default())
+}
+
+/// The one constructor. Everything else delegates here.
+///
+/// The pragmas and the `author_match` function are not decoration: an author filter
+/// calls that function *from SQL*, so a connection built any other way fails at
+/// runtime with "no such function" the first time someone searches by name.
+pub fn open_tuned(path: &Path, tuning: Tuning) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     // A stale index spawns a detached `update --quiet` child, so a foreground
@@ -115,9 +165,9 @@ pub fn open() -> Result<Connection> {
     // query evicted the lot, which is why a cold search measured 330ms and the
     // same one warm measured 20ms. The sort below also spills: `browse` orders
     // every match by date, and that temp B-tree belongs in memory.
-    conn.pragma_update(None, "cache_size", -65_536)?; // KiB, i.e. 64MB
+    conn.pragma_update(None, "cache_size", tuning.cache_kib)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
-    conn.pragma_update(None, "mmap_size", 268_435_456i64)?;
+    conn.pragma_update(None, "mmap_size", tuning.mmap_bytes)?;
     // Author matching is one predicate, evaluated per row. It replaced a `fold`
     // function that compared whole bylines, which is why no query folds any more.
     conn.create_scalar_function(

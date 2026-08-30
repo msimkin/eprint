@@ -907,19 +907,35 @@ scheduled job, so testing this cannot point a background harvest at your real in
 
 ### Layout
 
+The crate is a library plus the binary that uses it. The division is not decorative:
+everything in `src/lib.rs` is free of the terminal — no ratatui, no ANSI, no
+`std::process`, no `current_exe` — so the index, the harvester and the author-name
+table can be reused without dragging a terminal along, while every decision *about* a
+terminal stays with the binary.
+
+**The library** — the index, and what is true about it:
+
+| File | Responsibility |
+|---|---|
+| `src/lib.rs` | The library root, and why the boundary is where it is |
+| `src/db.rs` | SQLite schema, migrations, FTS5 query building, the watch cache |
+| `src/harvest.rs` | OAI-PMH harvester, the incremental window, progress and cancellation |
+| `src/feed.rs` | What a bare `eprint` shows: the batch, the top-up, the replay, the label |
+| `src/bib.rs` | CryptoBib fetch, BibTeX parsing, `@String` macro expansion |
+| `src/names.rs` | Who an author is: folding, the name table, the one matching predicate |
+| `src/dates.rs` | Civil-date arithmetic, ISO storage, the day-first grammar |
+| `src/config.rs` | Config file reading and writing (settings and watches) |
+| `src/text.rs` | Layout with no opinion about colour: wrapping, bylines, dates, `--json` |
+
+**The binary** — the terminal, and the integrations it installs:
+
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | CLI definition, command dispatch, config/flag resolution |
-| `src/db.rs` | SQLite schema, migrations, FTS5 query building |
-| `src/harvest.rs` | OAI-PMH harvester for paper metadata |
-| `src/bib.rs` | CryptoBib fetch, BibTeX parsing, `@String` macro expansion |
-| `src/render.rs` | Inline output: wrapping, highlighting, hyperlinks |
-| `src/pdf.rs` | The local PDF library: filing and finding saved papers |
+| `src/render.rs` | Inline output: styling, highlighting, hyperlinks |
 | `src/tui.rs` | Interactive browser (ratatui) |
 | `src/theme.rs` | Colour palettes shared by both front-ends |
-| `src/config.rs` | Config file reading and writing (settings and watches) |
-| `src/names.rs` | Who an author is: folding, the name table, the one matching predicate |
-| `src/dates.rs` | Civil-date arithmetic, ISO storage, the day-first grammar |
+| `src/pdf.rs` | The local PDF library: filing and finding saved papers |
 | `src/completions.rs` | The zsh and bash functions, and installing them |
 | `src/notify.rs` | Desktop banners: which tool posts them, and what they say |
 | `src/desktop.rs` | The launchd/systemd/`.app`/`.desktop` files, and installing them |

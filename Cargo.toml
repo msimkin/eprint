@@ -7,16 +7,35 @@ rust-version = "1.86"
 description = "Search the IACR Cryptology ePrint Archive from the command line"
 license = "MIT"
 
+[features]
+# The terminal. On by default, so `cargo build`, `cargo test` and
+# `cargo clippy --all-targets` behave exactly as they always have and the binary is
+# what you get for free.
+#
+# Turning it off leaves the library: the index, the harvester, the feed and the
+# author-name table, with no ratatui and no clap behind them. That is not a
+# packaging nicety — it is what makes "the library is free of the terminal" a fact
+# the compiler checks rather than a rule someone has to remember, because Cargo
+# resolves dependencies per *package*, so without this a library-only consumer
+# still builds crossterm.
+default = ["cli"]
+cli = ["dep:clap", "dep:ratatui", "dep:terminal_size"]
+
 [dependencies]
 anyhow = "1"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
 dirs = "5"
 quick-xml = "0.36"
-ratatui = "0.29"
+ratatui = { version = "0.29", optional = true }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 serde_json = "1"
-terminal_size = "0.4"
+terminal_size = { version = "0.4", optional = true }
 ureq = "2.10"
+
+[[bin]]
+name = "eprint"
+# Says out loud what is already true: the binary is the terminal front-end.
+required-features = ["cli"]
 
 [profile.release]
 opt-level = 3
