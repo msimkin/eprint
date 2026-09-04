@@ -763,6 +763,8 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         only_watched: false,
         author: a.author.clone(),
         category: a.category.clone(),
+        venue: None,
+        venue_year: None,
         limit: a.limit.unwrap_or(if a.is_latest() {
             cfg.latest_limit
         } else {

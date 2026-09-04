@@ -104,6 +104,8 @@ impl App {
             only_watched: self.watched_only,
             author: self.filters.author.clone(),
             category: self.filters.category.clone(),
+            venue: None,
+            venue_year: None,
             limit: self.filters.limit,
             scope: self.scope,
             prefix: self.filters.prefix,

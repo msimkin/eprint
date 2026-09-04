@@ -784,6 +784,13 @@ impl Watch {
             only_watched: false,
             author: self.author.clone(),
             category: self.category.clone(),
+            // A `Watch` is deliberately a subset of `Query`, and a venue is the
+            // clearest case for staying out: it is *retroactive* information,
+            // landing months after the ePrint posting, so a venue watch would
+            // almost never fire on a new arrival — which is the whole job of a
+            // watch.
+            venue: None,
+            venue_year: None,
             limit,
             scope: self.scope,
             prefix: true,
@@ -1031,6 +1038,23 @@ pub struct Query<'a> {
     pub only_watched: bool,
     pub author: Option<String>,
     pub category: Option<String>,
+    /// Where the paper was *published*, via a `venues` table keyed by paper id.
+    ///
+    /// Nothing in the command-line tool sets this — there is no `--venue` flag and
+    /// no `venues` table in its index. It exists for the iOS front-end, which ships
+    /// a CryptoBib extract as a bundled asset and creates the table itself. The
+    /// clause is only emitted when this is `Some`, so an index without the table can
+    /// never be asked about it.
+    ///
+    /// It lives here rather than in a second query path so that `run_search`,
+    /// `browse`, `count_matches` and `matching_ids` all learn it at once — the same
+    /// reason `added_since` and `only_watched` are fields. A filter applied after the
+    /// fact would let the header count disagree with the rows it counted.
+    pub venue: Option<String>,
+    /// The venue's own year — the proceedings year, not `p.date`. Honoured **only**
+    /// alongside `venue`: a year belonging to no venue would filter nothing while
+    /// looking like it filtered something.
+    pub venue_year: Option<String>,
     pub limit: usize,
     pub scope: Scope,
     /// Treat bare terms as prefixes so partial words match.
@@ -1227,6 +1251,20 @@ fn filter_sql(q: &Query, args: &mut Vec<Box<dyn ToSql>>) -> String {
     if let Some(c) = &q.category {
         args.push(Box::new(format!("%{}%", c.to_lowercase())));
         sql.push_str(&format!(" AND lower(p.category) LIKE ?{}", args.len()));
+    }
+    // The same subquery shape as `only_watched`, against a table the front-end owns.
+    // `venue_year` is nested inside deliberately — see `Query::venue_year`.
+    if let Some(v) = &q.venue {
+        args.push(Box::new(v.clone()));
+        sql.push_str(&format!(
+            " AND p.id IN (SELECT id FROM venues WHERE venue = ?{}",
+            args.len()
+        ));
+        if let Some(y) = &q.venue_year {
+            args.push(Box::new(y.clone()));
+            sql.push_str(&format!(" AND year = ?{}", args.len()));
+        }
+        sql.push(')');
     }
     sql
 }
