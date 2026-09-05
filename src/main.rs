@@ -1123,14 +1123,13 @@ fn do_bib(id: Option<&str>, update: bool, force: bool, want_entry: bool) -> Resu
                 linked,
                 published,
             } => {
+                // No percentage: `published` is no longer a subset of `linked`.
+                // The second matching pass reaches papers CryptoBib has not yet
+                // ingested as `EPRINT:` entries, so it adds published versions
+                // for papers that were never counted as linked.
                 eprintln!(
                     "Parsed {entries} entries — {linked} ePrint papers linked, \
-                     {published} with a published version ({:.0}%).",
-                    if linked > 0 {
-                        published as f64 / linked as f64 * 100.0
-                    } else {
-                        0.0
-                    }
+                     {published} with a published version."
                 );
             }
         }
