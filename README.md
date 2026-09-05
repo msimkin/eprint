@@ -120,9 +120,9 @@ on screen are ever laid out. `-n` still exists if you want a smaller set.
 | `g` / `G`, home / end | first / last |
 | `ctrl-d` / `ctrl-u`, page keys | jump |
 | `space` / `tab` | expand or collapse the abstract |
-| `a` | expand or collapse everything |
 | `t` | toggle where the query is matched: `in: title, authors, abstract` ⇄ `in: title, authors` |
 | `d` | filter by date — same grammar as `--date`; empty clears it |
+| `v` | filter by venue — `CRYPTO` or `CRYPTO 2025`; prefixes work; empty clears it |
 | `w` | show only papers matching a watch — searches apply within that subset |
 | `/` | edit the query — results filter live as you type |
 | `ctrl-u` | clear the query (while editing) |
@@ -627,6 +627,13 @@ newer build moves them into the config for you and says so.
 
 ## Citation keys (CryptoBib)
 
+**It refreshes itself weekly.** Nothing below is needed for ordinary use: the background
+update that keeps the index current also asks CryptoBib, at most once a week, whether it has
+published anything new. That check is a conditional request costing nothing when the answer is
+no, and CryptoBib publishes a handful of times a year. `eprint bib` reports both dates — when
+the data was last published and when it was last checked — because a months-old publication
+date beside a recent check is a quiet upstream, not a stale index.
+
 ```sh
 eprint bib --update          # download / refresh the CryptoBib database
 eprint bib --update --force  # re-download even if unchanged
@@ -650,6 +657,42 @@ $ eprint bib 2018/116
 
 In `browse`, `b` copies the citation key and `B` copies the complete BibTeX record. The key
 is shown in the meta line once an abstract is expanded, and `eprint show` displays it too.
+
+### Where a paper was published
+
+The same data answers a more useful question, and it is shown without asking:
+
+```
+  2024/1291    Raccoon: A Masking-Friendly Signature Proven in the Probing Model
+               Pino, Katsumata, et al. · CRYPTO 2024
+```
+
+About 42% of the archive carries a venue — everything CryptoBib has matched to an ePrint
+paper. It appears on the byline in listings, in `browse`, in `eprint show`, and as a `venue`
+key in `--json` (absent, not null, when there is none).
+
+`--venue` filters on it, in searches and in `browse`:
+
+```sh
+eprint --venue CRYPTO                # every CRYPTO paper
+eprint --venue "CRYPTO 2025"         # one year
+eprint --venue euroc lattice         # prefixes and case do not matter
+eprint zero knowledge --venue TCC -a
+```
+
+One flag carries both parts, the way `--date` carries both ends of a range. A name is matched
+case-insensitively and then by unique prefix, and a name that matches nothing is an error
+rather than an empty listing — an empty listing would read as "nothing was published there".
+Tab completion offers the venues in the index, flagships first. In `browse`, `v` opens the
+same prompt.
+
+Venue names are the series without the edition: `CRYPTO`, not `Advances in Cryptology —
+CRYPTO 2024, Part III`. Journals are spelled out and the `IACR` prefix dropped, since the
+archive is IACR's and saying so adds nothing — `Transactions on Symmetric Cryptology`, not
+`IACR Trans. Symm. Cryptol.`.
+
+A venue is **not** something you can watch. It arrives long after the ePrint posting, so a
+venue watch would almost never fire on a new arrival, which is the whole job of a watch.
 
 ```sh
 eprint bib 2018/116 --entry >> refs.bib
