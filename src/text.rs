@@ -11,6 +11,7 @@
 //! drift from what is drawn. The test at the bottom is what holds them together.
 
 use crate::db::{Hit, MARK_END, MARK_START};
+use std::collections::HashMap;
 /// Visible width, ignoring ANSI escapes and match markers.
 pub fn visible_len(s: &str) -> usize {
     let mut n = 0;
@@ -270,12 +271,12 @@ pub fn short_license(rights: &str) -> String {
 pub const BADGE: &str = "✱";
 pub const BADGE_W: usize = 2;
 
-pub fn json_of(hits: &[Hit]) -> String {
+pub fn json_of(hits: &[Hit], venues: &HashMap<String, String>) -> String {
     let arr: Vec<serde_json::Value> = hits
         .iter()
         .map(|h| {
             let p = &h.paper;
-            serde_json::json!({
+            let mut o = serde_json::json!({
                 "id": p.id,
                 "title": p.title,
                 "authors": p.authors.split("; ").filter(|s| !s.is_empty()).collect::<Vec<_>>(),
@@ -285,7 +286,15 @@ pub fn json_of(hits: &[Hit]) -> String {
                 "year": p.year,
                 "license": p.rights,
                 "url": p.url,
-            })
+            });
+            // Additive, and *absent* rather than null for the ~58% of papers with no
+            // published version. Inserted afterwards because `json!` with an
+            // `Option` writes a null, which is not the same thing: a reader can then
+            // tell "no venue" from "this build does not know about venues".
+            if let Some(v) = venues.get(&p.id) {
+                o["venue"] = serde_json::json!(v);
+            }
+            o
         })
         .collect();
     serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())

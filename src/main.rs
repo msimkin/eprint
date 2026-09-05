@@ -219,6 +219,9 @@ struct BrowseArgs {
     /// Filter by IACR category (substring match)
     #[arg(long)]
     category: Option<String>,
+    /// Filter by publication venue, e.g. CRYPTO or "CRYPTO 2025"
+    #[arg(long, value_name = "VENUE")]
+    venue: Option<String>,
     /// Match whole words only, disabling automatic prefix matching
     #[arg(long, hide = true)]
     exact: bool,
@@ -240,6 +243,9 @@ struct SearchArgs {
     /// Filter by IACR category (substring match)
     #[arg(long)]
     category: Option<String>,
+    /// Filter by publication venue, e.g. CRYPTO or "CRYPTO 2025"
+    #[arg(long, value_name = "VENUE")]
+    venue: Option<String>,
     /// Match titles and authors only, ignoring abstracts
     #[arg(short = 't', long)]
     title: bool,
@@ -298,6 +304,7 @@ impl SearchArgs {
             && self.since.is_none()
             && self.author.is_none()
             && self.category.is_none()
+            && self.venue.is_none()
     }
 }
 
@@ -307,6 +314,28 @@ impl SearchArgs {
 
 /// Kick off `eprint update --quiet` as a detached child and return
 /// immediately, so a stale index never delays a search.
+/// Turn a typed `--venue` into the stored spelling and its year, or explain why not.
+///
+/// Failing loudly matters more here than for the other filters: a venue that does
+/// not resolve would otherwise return no rows, which reads as "nothing was published
+/// there" rather than "you spelled it differently from CryptoBib".
+fn resolve_venue_filter(
+    conn: &rusqlite::Connection,
+    typed: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(raw) = typed else {
+        return Ok((None, None));
+    };
+    let (name, year) = eprint::venue::parse_filter(raw);
+    match db::resolve_venue(conn, &name)? {
+        Some(v) => Ok((Some(v), year)),
+        None => bail!(
+            "no venue matching {name:?} — `eprint completions venues` lists them, \
+             and CryptoBib may not carry it yet"
+        ),
+    }
+}
+
 fn spawn_background_refresh(conn: &rusqlite::Connection) -> Result<()> {
     let last_attempt = db::meta_get(conn, harvest::KEY_LAST_ATTEMPT)?
         .and_then(|v| dates::parse_iso(&v))
@@ -408,6 +437,10 @@ fn do_update(full: bool, quiet: bool) -> Result<()> {
             eprintln!("Done — {n} records processed, {total} papers indexed.");
         }
     }
+    // After the harvest, which is the part anyone is waiting for. This is where a
+    // venue comes from, and it is the whole reason the terminal no longer needs
+    // anyone to type `eprint bib --update`.
+    refresh_bib_if_due(&mut conn, quiet);
     Ok(())
 }
 
@@ -753,6 +786,7 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
     let terms = a.query.join(" ");
     let (since, before) = dates::date_window(&a.date, &a.since)?;
     let scope = effective_scope(a.title, a.scope.as_deref(), cfg);
+    let (venue, venue_year) = resolve_venue_filter(&conn, a.venue.as_deref())?;
 
     let q = Query {
         terms: &terms,
@@ -763,8 +797,8 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
         only_watched: false,
         author: a.author.clone(),
         category: a.category.clone(),
-        venue: None,
-        venue_year: None,
+        venue: venue.clone(),
+        venue_year: venue_year.clone(),
         limit: a.limit.unwrap_or(if a.is_latest() {
             cfg.latest_limit
         } else {
@@ -781,7 +815,9 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
     db::hydrate_all(&conn, &q, &mut hits);
 
     if a.json {
-        println!("{}", render::json_of(&hits));
+        let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
+        let venues = db::venue_map(&conn, &ids).unwrap_or_default();
+        println!("{}", render::json_of(&hits, &venues));
         return Ok(());
     }
 
@@ -796,10 +832,19 @@ fn do_search_inner(a: &SearchArgs, st: &Style, cfg: &config::Config) -> Result<(
     render::render_header(&mut out, hits.len(), total, age, scope.label(), st);
     let ids: Vec<String> = hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
+    let venues = db::venue_map(&conn, &ids).unwrap_or_default();
     let watched = db::watched(&conn, &watches(&conn)).unwrap_or_default();
     for hit in &hits {
         let w = watched.contains(&hit.paper.id);
-        render::render_hit(&mut out, hit, st, a.abstracts, bibs.get(&hit.paper.id), w);
+        render::render_hit(
+            &mut out,
+            hit,
+            st,
+            a.abstracts,
+            bibs.get(&hit.paper.id),
+            venues.get(&hit.paper.id).map(String::as_str),
+            w,
+        );
     }
     page(&out, st, a.no_pager)
 }
@@ -824,6 +869,7 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
     }
     let (since, before) = dates::date_window(&a.date, &a.since)?;
     let cfg = config::load();
+    let (venue, venue_year) = resolve_venue_filter(&conn, a.venue.as_deref())?;
     let filters = tui::Filters {
         year: a.year,
         since,
@@ -835,6 +881,15 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
             .unwrap_or_default(),
         author: a.author.clone(),
         category: a.category.clone(),
+        venue: venue.clone(),
+        venue_year: venue_year.clone(),
+        venue_text: venue
+            .as_ref()
+            .map(|v| match &venue_year {
+                Some(y) => format!("{v} {y}"),
+                None => v.clone(),
+            })
+            .unwrap_or_default(),
         // No limit means no limit: laying out only the visible rows made loading
         // the whole archive cost nothing measurable.
         limit: a.limit.unwrap_or(usize::MAX),
@@ -862,11 +917,69 @@ fn do_browse(a: &BrowseArgs) -> Result<()> {
 /// the threshold — `None` means "recent enough to say nothing".
 const BIB_STALE_DAYS: i64 = 30;
 
+/// How often to ask CryptoBib whether it has anything new.
+///
+/// Weekly, and cheap in the ordinary case: without `--force`, `bib::update` sends
+/// `If-None-Match` and an unchanged file comes back 304 having transferred nothing.
+/// Only a file that actually moved costs the ~40MB download, and CryptoBib publishes
+/// a handful of times a year.
+const BIB_REFRESH_SECS: i64 = 7 * 24 * 3600;
+
+/// Is a CryptoBib check due?
+///
+/// Reads `bib_checked`, never `bib_updated` — see `bib::KEY_CHECKED`. A table that
+/// has never been fetched is due, which is what populates it on a first run without
+/// anyone being told to.
+fn bib_check_due(conn: &rusqlite::Connection) -> Result<bool> {
+    let last = db::meta_get(conn, bib::KEY_CHECKED)?
+        .and_then(|v| dates::parse_iso(&v))
+        .unwrap_or(0);
+    Ok(dates::now() - last >= BIB_REFRESH_SECS)
+}
+
+/// Refresh CryptoBib if a week has passed since the last check.
+///
+/// Folded into `do_update` rather than given a detached child of its own. The child
+/// that already runs when the index is stale picks this up within a day of it
+/// falling due, and no second process means no second cooldown and no repeat of the
+/// parent-stamps-the-key-the-child-reads bug documented above: the gate lives here,
+/// inside the child, and nothing outside touches it.
+fn refresh_bib_if_due(conn: &mut rusqlite::Connection, quiet: bool) {
+    if !bib_check_due(conn).unwrap_or(false) {
+        return;
+    }
+    if !quiet {
+        eprintln!("Checking CryptoBib for new publication data…");
+    }
+    let outcome = bib::update(conn, false, quiet, &dates::format_iso(dates::now()));
+    // Stamped whatever happened, including a failure. See `bib::KEY_CHECKED`.
+    let _ = db::meta_set(conn, bib::KEY_CHECKED, &dates::format_iso(dates::now()));
+    if quiet {
+        return;
+    }
+    match outcome {
+        Ok(bib::Outcome::UpToDate) => eprintln!("CryptoBib is unchanged."),
+        Ok(bib::Outcome::Rebuilt { published, .. }) => {
+            eprintln!("CryptoBib refreshed — {published} papers with a published version.");
+        }
+        // Never fatal: the index is what the command was about, and a venue nobody
+        // could fetch is not a reason to fail the harvest that succeeded.
+        Err(e) => eprintln!("note: could not refresh CryptoBib ({e:#})"),
+    }
+}
+
+/// Keyed on when a refresh was last *attempted*, not on when the data last changed.
+///
+/// The tool checks weekly on its own now, so "your data is 40 days old" says nothing
+/// a reader can act on — CryptoBib simply had not published. What is worth saying is
+/// that the automatic checks have stopped working, and that is what `bib_checked`
+/// going quiet means. `bib_updated` remains what `bib` and `status` print as the
+/// data's own date, which is a different question.
 fn bib_stale_days(conn: &rusqlite::Connection) -> Result<Option<i64>> {
     if db::bib_count(conn)? == 0 {
         return Ok(None);
     }
-    let Some(ts) = db::meta_get(conn, bib::KEY_UPDATED)? else {
+    let Some(ts) = db::meta_get(conn, bib::KEY_CHECKED)? else {
         return Ok(None);
     };
     let Some(t) = dates::parse_iso(&ts) else {
@@ -929,7 +1042,9 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
     }
 
     if a.json {
-        println!("{}", render::json_of(&f.hits));
+        let ids: Vec<String> = f.hits.iter().map(|h| h.paper.id.clone()).collect();
+        let venues = db::venue_map(&conn, &ids).unwrap_or_default();
+        println!("{}", render::json_of(&f.hits, &venues));
         return Ok(());
     }
 
@@ -944,10 +1059,19 @@ fn do_feed_inner(a: &SearchArgs, cfg: &config::Config) -> Result<()> {
     render::render_header(&mut out, f.hits.len(), f.hits.len(), age, &f.label, &st);
     let ids: Vec<String> = f.hits.iter().map(|h| h.paper.id.clone()).collect();
     let bibs = db::bib_map(&conn, &ids).unwrap_or_default();
+    let venues = db::venue_map(&conn, &ids).unwrap_or_default();
     let watched = db::watched(&conn, &watches(&conn)).unwrap_or_default();
     for hit in &f.hits {
         let w = watched.contains(&hit.paper.id);
-        render::render_hit(&mut out, hit, &st, a.abstracts, bibs.get(&hit.paper.id), w);
+        render::render_hit(
+            &mut out,
+            hit,
+            &st,
+            a.abstracts,
+            bibs.get(&hit.paper.id),
+            venues.get(&hit.paper.id).map(String::as_str),
+            w,
+        );
     }
     page(&out, &st, a.no_pager)?;
 
@@ -1177,7 +1301,11 @@ fn do_bib(id: Option<&str>, update: bool, force: bool, want_entry: bool) -> Resu
     }
 
     let total = db::bib_count(&conn)?;
-    let updated = db::meta_get(&conn, bib::KEY_UPDATED)?.unwrap_or_else(|| "never".into());
+    // Dates, not timestamps: the two lines below sit under each other and the hour
+    // CryptoBib published at is not a fact anyone needs.
+    let updated = db::meta_get(&conn, bib::KEY_UPDATED)?
+        .map(|v| v.chars().take(10).collect::<String>())
+        .unwrap_or_else(|| "never".into());
     let published: i64 = conn.query_row(
         "SELECT COUNT(*) FROM bib WHERE kind = 'published'",
         [],
@@ -1193,9 +1321,16 @@ fn do_bib(id: Option<&str>, update: bool, force: bool, want_entry: bool) -> Resu
     } else {
         println!("  ePrint papers linked   {eprints}");
         println!("  with published version {published}");
-        match bib_stale_days(&conn)? {
-            Some(d) => println!("  last updated           {updated}  ({d} days ago)"),
-            None => println!("  last updated           {updated}"),
+        // Two dates, two meanings, and conflating them is what made the old note
+        // misleading: `bib_updated` is when CryptoBib last published something we
+        // took, `bib_checked` is when we last asked. A months-old "last updated"
+        // beside a recent "last checked" is a quiet upstream, not a stale index.
+        println!("  data published         {updated}");
+        if let Some(ts) = db::meta_get(&conn, bib::KEY_CHECKED)? {
+            let age = dates::parse_iso(&ts)
+                .map(|t| (dates::now() - t).max(0) / 86400)
+                .unwrap_or(0);
+            println!("  last checked           {}  ({age} days ago)", &ts[..10]);
         }
     }
     println!();
@@ -1203,9 +1338,17 @@ fn do_bib(id: Option<&str>, update: bool, force: bool, want_entry: bool) -> Resu
     Ok(())
 }
 
+/// Only when the automatic weekly check has stopped happening.
+///
+/// It used to fire on the *data's* age, which is now noise: the tool refreshes
+/// itself, and CryptoBib publishing nothing for two months is not something to act
+/// on. Silence here means the checks are running, whatever they found.
 fn warn_if_stale(conn: &rusqlite::Connection) -> Result<()> {
     if let Some(d) = bib_stale_days(conn)? {
-        eprintln!("note: CryptoBib data is {d} days old — run `eprint bib --update` to refresh");
+        eprintln!(
+            "note: CryptoBib has not been checked for {d} days — \
+             `eprint bib --update` refreshes it now"
+        );
     }
     Ok(())
 }
@@ -1550,8 +1693,9 @@ fn real_main() -> Result<()> {
             match db::get(&conn, &id)? {
                 Some(p) => {
                     let key = db::bib_for(&conn, &p.id).unwrap_or(None);
+                    let venue = db::venue_for(&conn, &p.id).unwrap_or(None);
                     let mut out = String::new();
-                    render::render_full(&mut out, &p, &st, key.as_ref());
+                    render::render_full(&mut out, &p, &st, key.as_ref(), venue.as_deref());
                     page(&out, &st, false)
                 }
                 None => bail!("no paper {id} in the local index (try `eprint update`)"),

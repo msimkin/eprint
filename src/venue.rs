@@ -287,6 +287,25 @@ pub fn rank_of(venue: &str) -> usize {
     RANK.iter().position(|v| *v == venue).unwrap_or(RANK.len())
 }
 
+/// Split a typed venue into the series and an optional year.
+///
+/// `"CRYPTO 2025"` -> `("CRYPTO", Some("2025"))`, `"CRYPTO"` -> `("CRYPTO", None)`.
+/// One flag carrying both parts, the way `--date` carries both ends of a range, and
+/// one grammar shared by `--venue` and the browser's `v` — the same reason the date
+/// prompt calls `dates::parse_range` rather than growing its own parser.
+///
+/// Only a *trailing* four-digit token counts, so `IEEE S&P` keeps its name and a
+/// venue is never split on a number in the middle of it.
+pub fn parse_filter(s: &str) -> (String, Option<String>) {
+    let s = s.trim();
+    if let Some((head, tail)) = s.rsplit_once(char::is_whitespace) {
+        if tail.len() == 4 && tail.chars().all(|c| c.is_ascii_digit()) && !head.trim().is_empty() {
+            return (head.trim().to_string(), Some(tail.to_string()));
+        }
+    }
+    (s.to_string(), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +386,31 @@ mod tests {
         assert_eq!(rank_of("CRYPTO"), 0);
         assert!(rank_of("EUROCRYPT") < rank_of("ACM CCS"));
         assert_eq!(rank_of("Some Workshop Nobody Ranked"), RANK.len());
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    /// The grammar `--venue` and the browser's `v` share. Only a *trailing*
+    /// four-digit token is a year, so a venue keeps a number in the middle of its
+    /// name and `IEEE S&P` keeps its own.
+    #[test]
+    fn a_trailing_year_splits_and_nothing_else_does() {
+        assert_eq!(
+            parse_filter("CRYPTO 2025"),
+            ("CRYPTO".into(), Some("2025".into()))
+        );
+        assert_eq!(parse_filter("  CRYPTO  "), ("CRYPTO".into(), None));
+        assert_eq!(parse_filter("IEEE S&P"), ("IEEE S&P".into(), None));
+        assert_eq!(
+            parse_filter("IEEE S&P 2025"),
+            ("IEEE S&P".into(), Some("2025".into()))
+        );
+        // A bare year is a venue nobody has, not a yearless filter — splitting it
+        // would silently turn `--venue 2025` into "every venue in 2025".
+        assert_eq!(parse_filter("2025"), ("2025".into(), None));
+        assert_eq!(parse_filter("ACM CCS 25"), ("ACM CCS 25".into(), None));
     }
 }

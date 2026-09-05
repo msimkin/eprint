@@ -125,6 +125,7 @@ pub fn render_hit(
     st: &Style,
     show_abstract: bool,
     bib: Option<&(String, bool)>,
+    venue: Option<&str>,
     watched: bool,
 ) {
     let p = &hit.paper;
@@ -178,12 +179,16 @@ pub fn render_hit(
         );
     }
 
-    // Authors only in the list; date and citation key join once an abstract
-    // is open.
+    // Authors always; date and citation key join once an abstract is open. The
+    // venue shows either way, unlike the key: it is what the paper *is* to a reader
+    // scanning a listing, where a citation key is something you go and fetch.
     let fav = st.favourite.as_deref();
     let mut meta: Vec<String> = vec![short_authors(&p.authors, fav)];
     if show_abstract && !p.date.is_empty() {
         meta.push(fmt_date(&p.date));
+    }
+    if let Some(v) = venue {
+        meta.push(v.to_string());
     }
     if show_abstract {
         if let Some((key, _)) = bib {
@@ -256,7 +261,13 @@ pub fn render_header(
     );
 }
 
-pub fn render_full(out: &mut String, p: &Paper, st: &Style, bib: Option<&(String, bool)>) {
+pub fn render_full(
+    out: &mut String,
+    p: &Paper,
+    st: &Style,
+    bib: Option<&(String, bool)>,
+    venue: Option<&str>,
+) {
     let width = st.width.saturating_sub(2);
     let th = &st.theme;
     let _ = writeln!(out);
@@ -285,6 +296,9 @@ pub fn render_full(out: &mut String, p: &Paper, st: &Style, bib: Option<&(String
     }
     if !p.date.is_empty() {
         meta.push(fmt_date(&p.date));
+    }
+    if let Some(v) = venue {
+        meta.push(v.to_string());
     }
     let lic = short_license(&p.rights);
     if !lic.is_empty() {

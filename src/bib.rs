@@ -19,6 +19,16 @@ const UA: &str = concat!(
 
 pub const KEY_ETAG: &str = "bib_etag";
 pub const KEY_UPDATED: &str = "bib_updated";
+/// When a refresh was last *attempted*, as distinct from when the data last
+/// changed.
+///
+/// `KEY_UPDATED` cannot serve: it is written only on the `Rebuilt` path, so an
+/// upstream file that has genuinely not changed for two months leaves it two months
+/// old and every command would think a refresh was overdue. This one advances on
+/// every outcome — rebuilt, 304, and failure — which is the rule `notified_through`
+/// already encodes: a watermark that moved only on success would re-attempt a 40MB
+/// download on every command on a machine that cannot reach the server.
+pub const KEY_CHECKED: &str = "bib_checked";
 
 pub enum Outcome {
     UpToDate,

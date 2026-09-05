@@ -21,6 +21,7 @@ enum Editing {
     None,
     Query,
     Date,
+    Venue,
 }
 
 #[derive(Default, Clone)]
@@ -30,6 +31,12 @@ pub struct Filters {
     pub before: Option<String>,
     pub author: Option<String>,
     pub category: Option<String>,
+    pub venue: Option<String>,
+    pub venue_year: Option<String>,
+    /// The venue filter as the user typed it, for the header — a filter passed as
+    /// `--venue` is otherwise invisible from inside the browser. Same reason as
+    /// `date_text`.
+    pub venue_text: String,
     pub limit: usize,
     pub prefix: bool,
     /// What the user typed for the date, kept verbatim so the header can show it
@@ -54,6 +61,8 @@ struct App {
     editing: Editing,
     /// The date prompt's buffer, separate from `query` so cancelling restores.
     date_input: String,
+    /// The venue prompt's buffer, for the same reason.
+    venue_input: String,
     /// Keyed by paper id so expansion survives re-searching.
     expanded: HashSet<String>,
     status: Option<String>,
@@ -66,6 +75,11 @@ struct App {
     /// `watch_hits` cache. Badging is then a hash lookup per visible row rather
     /// than a query per search.
     watched: HashSet<String>,
+    /// eprint id -> "CRYPTO 2025", the whole table, read once at startup for the
+    /// same reason as `watched`: laying out a frame touches every hit, so this has
+    /// to be a lookup rather than a query. Unlike `bib` it is not cleared per
+    /// search — a venue does not depend on the query.
+    venues: HashMap<String, String>,
     /// The unfiltered listing, kept while `w` is on so switching it off restores
     /// instantly instead of re-running a 26,000-row query. Dropped as soon as the
     /// query or a filter changes, since it would no longer be what to return to.
@@ -102,10 +116,10 @@ impl App {
             before: self.filters.before.clone(),
             added_since: None,
             only_watched: self.watched_only,
+            venue: self.filters.venue.clone(),
+            venue_year: self.filters.venue_year.clone(),
             author: self.filters.author.clone(),
             category: self.filters.category.clone(),
-            venue: None,
-            venue_year: None,
             limit: self.filters.limit,
             scope: self.scope,
             prefix: self.filters.prefix,
@@ -184,7 +198,7 @@ impl App {
 
     fn stale_hint(&self) -> String {
         match self.bib_stale_days {
-            Some(d) => format!("  · bib data {d}d old, run `eprint bib --update`"),
+            Some(d) => format!("  · CryptoBib unchecked for {d}d, run `eprint bib --update`"),
             None => String::new(),
         }
     }
@@ -241,33 +255,63 @@ fn widths(app: &App, hit: &Hit, width: usize) -> (usize, usize, usize) {
 /// How many lines a hit occupies, counted without building any of them. This is
 /// what lets the viewport be found without laying out all 26,000 papers, and it
 /// **must** agree with `hit_lines` — `hit_lines` debug-asserts that it does.
+/// The lines under the title, as text.
+///
+/// Shared by `hit_height` and `hit_lines` so the two cannot build different
+/// strings. They had a copy each, and the whole viewport rests on them agreeing —
+/// `hit_lines` debug-asserts it, but only in a debug build.
+fn meta_lines(app: &App, hit: &Hit, is_open: bool) -> Vec<String> {
+    let p = &hit.paper;
+    let fav = app.favourite.as_deref();
+    let venue = app.venues.get(&p.id);
+    // Surnames while collapsed, so rows stay scannable. Expanding gives the full
+    // byline its own line — as `eprint show` does — because appending eight first
+    // names to the `·`-joined line buries the date behind them.
+    let mut first = if is_open {
+        full_authors(&p.authors, fav)
+    } else {
+        short_authors(&p.authors, fav)
+    };
+    // Collapsed, the venue rides the byline exactly as it does inline. Expanded,
+    // that line is already a list of names, so it joins the trailer instead.
+    if !is_open {
+        if let Some(v) = venue {
+            first.push_str(" · ");
+            first.push_str(v);
+        }
+    }
+    let mut out = vec![first];
+    if is_open {
+        let mut trailer: Vec<String> = Vec::new();
+        if !p.date.is_empty() {
+            trailer.push(crate::render::fmt_date(&p.date));
+        }
+        if let Some(v) = venue {
+            trailer.push(v.clone());
+        }
+        if let Some((key, _)) = app.bib.get(&p.id) {
+            trailer.push(key.clone());
+        }
+        if !trailer.is_empty() {
+            out.push(trailer.join(" · "));
+        }
+    }
+    out
+}
+
 fn hit_height(app: &App, hit: &Hit, width: usize) -> usize {
     let p = &hit.paper;
     let is_open = app.expanded.contains(&p.id);
-    let fav = app.favourite.as_deref();
     let (body_w, title_w, meta_w) = widths(app, hit, width);
     // Counted from the *unmarked* text on purpose. `visible_len` skips the match
     // markers, so the marked and unmarked forms wrap identically — which is what
     // lets heights be known for all 26,000 hits while only the rows on screen are
     // hydrated. `hit_lines` wraps the marked form and debug-asserts they agree.
     let mut n = crate::render::wrap_count(&p.title, title_w);
-    let byline = if is_open {
-        full_authors(&p.authors, fav)
-    } else {
-        short_authors(&p.authors, fav)
-    };
-    n += crate::render::wrap_count(&byline, meta_w);
+    for src in meta_lines(app, hit, is_open) {
+        n += crate::render::wrap_count(&src, meta_w);
+    }
     if is_open {
-        let mut trailer: Vec<String> = Vec::new();
-        if !p.date.is_empty() {
-            trailer.push(crate::render::fmt_date(&p.date));
-        }
-        if let Some((key, _)) = app.bib.get(&p.id) {
-            trailer.push(key.clone());
-        }
-        if !trailer.is_empty() {
-            n += crate::render::wrap_count(&trailer.join(" · "), meta_w);
-        }
         n += crate::render::wrap_body_count(&p.abstract_, body_w);
     }
     n + 1 // the blank line between entries
@@ -366,27 +410,8 @@ fn hit_lines(app: &App, i: usize, hit: &Hit, width: usize) -> Vec<Line<'static>>
             lines.push(Line::from(spans));
         }
 
-        // Surnames while collapsed, so rows stay scannable. Expanding gives the
-        // full byline its own line — as `eprint show` does — because appending
-        // eight first names to the `·`-joined line buries the date behind them.
         let fav = app.favourite.as_deref();
-        let mut meta = vec![if is_open {
-            full_authors(&p.authors, fav)
-        } else {
-            short_authors(&p.authors, fav)
-        }];
-        if is_open {
-            let mut trailer: Vec<String> = Vec::new();
-            if !p.date.is_empty() {
-                trailer.push(crate::render::fmt_date(&p.date));
-            }
-            if let Some((key, _)) = app.bib.get(&p.id) {
-                trailer.push(key.clone());
-            }
-            if !trailer.is_empty() {
-                meta.push(trailer.join(" · "));
-            }
-        }
+        let meta = meta_lines(app, hit, is_open);
         // Same reservation as the inline renderer: a heart may be two cells wide.
         let meta_w = if loved(&p.authors, fav) {
             body_w.saturating_sub(LOVE_W)
@@ -578,8 +603,10 @@ pub fn run(
         scroll: 0,
         editing: Editing::None,
         date_input: String::new(),
+        venue_input: String::new(),
         expanded: HashSet::new(),
         watched: db::watched(&conn, &watch_list).unwrap_or_default(),
+        venues: db::venue_all(&conn).unwrap_or_default(),
         unfiltered: None,
         watched_only: false,
         watch_list,
@@ -708,13 +735,22 @@ pub fn run(
             if !app.filters.date_text.is_empty() {
                 modes.push_str(&format!(" · {}", app.filters.date_text));
             }
+            if !app.filters.venue_text.is_empty() {
+                modes.push_str(&format!(" · {}", app.filters.venue_text));
+            }
             if let Some(d) = app.bib_stale_days {
-                modes.push_str(&format!(" · bib {d}d old"));
+                modes.push_str(&format!(" · bib unchecked {d}d"));
             }
             let head = if app.editing == Editing::Date {
                 Line::from(vec![
                     Span::styled("  date ", th.style(Tone::Meta)),
                     Span::styled(app.date_input.clone(), th.style(Tone::Title)),
+                    Span::styled("▏", th.style(Tone::Marker)),
+                ])
+            } else if app.editing == Editing::Venue {
+                Line::from(vec![
+                    Span::styled("  venue ", th.style(Tone::Meta)),
+                    Span::styled(app.venue_input.clone(), th.style(Tone::Title)),
                     Span::styled("▏", th.style(Tone::Marker)),
                 ])
             } else if app.editing == Editing::Query {
@@ -766,6 +802,17 @@ pub fn run(
                     ],
                     "esc cancel",
                 ),
+                Editing::Venue => fit_hints(
+                    width,
+                    &[
+                        "CRYPTO",
+                        "CRYPTO 2025",
+                        "enter apply",
+                        "empty clears",
+                        "prefixes work",
+                    ],
+                    "esc cancel",
+                ),
                 Editing::Query => fit_hints(
                     width,
                     &["type to filter", "enter accept", "ctrl-u clear"],
@@ -776,7 +823,6 @@ pub fn run(
                     &[
                         "j/k move",
                         "space expand",
-                        "a all",
                         "/ search",
                         "enter open",
                         "y url",
@@ -784,6 +830,7 @@ pub fn run(
                         "B entry",
                         "t scope",
                         "d date",
+                        "v venue",
                         "w watched",
                     ],
                     "q quit",
@@ -860,6 +907,55 @@ pub fn run(
             continue;
         }
 
+        if app.editing == Editing::Venue {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('c') if ctrl => break,
+                KeyCode::Esc => {
+                    app.editing = Editing::None;
+                    app.status = None;
+                }
+                KeyCode::Enter => {
+                    let typed = app.venue_input.trim().to_string();
+                    if typed.is_empty() {
+                        // An empty prompt is how you clear the filter.
+                        app.filters.venue = None;
+                        app.filters.venue_year = None;
+                        app.filters.venue_text.clear();
+                        app.editing = Editing::None;
+                        app.search(&conn);
+                    } else {
+                        // The same grammar and the same resolver the flag uses, so
+                        // `--venue` and `v` cannot drift apart.
+                        let (name, year) = eprint::venue::parse_filter(&typed);
+                        match db::resolve_venue(&conn, &name) {
+                            Ok(Some(v)) => {
+                                app.filters.venue_text = match &year {
+                                    Some(y) => format!("{v} {y}"),
+                                    None => v.clone(),
+                                };
+                                app.filters.venue = Some(v);
+                                app.filters.venue_year = year;
+                                app.editing = Editing::None;
+                                app.search(&conn);
+                            }
+                            // Stay in the prompt so the mistake can be corrected
+                            // rather than retyped.
+                            Ok(None) => app.status = Some(format!("no venue matching {name:?}")),
+                            Err(e) => app.status = Some(format!("{e}")),
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.venue_input.pop();
+                }
+                KeyCode::Char('u') if ctrl => app.venue_input.clear(),
+                KeyCode::Char(c) if !ctrl => app.venue_input.push(c),
+                _ => {}
+            }
+            continue;
+        }
+
         if app.editing == Editing::Query {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
@@ -915,18 +1011,6 @@ pub fn run(
             KeyCode::PageDown => app.selected = (app.selected + 10).min(last),
             KeyCode::PageUp => app.selected = app.selected.saturating_sub(10),
             KeyCode::Char(' ') | KeyCode::Tab => app.expand_selected(&conn),
-            KeyCode::Char('a') => {
-                if app.expanded.is_empty() {
-                    let ids: Vec<String> = app.hits.iter().map(|h| h.paper.id.clone()).collect();
-                    // The one place the bulk lookup still earns its keep: an
-                    // explicit keypress that really does expand everything, once,
-                    // rather than a query rerun on every keystroke.
-                    app.bib = db::bib_map(&conn, &ids).unwrap_or_default();
-                    app.expanded = ids.into_iter().collect();
-                } else {
-                    app.expanded.clear();
-                }
-            }
             KeyCode::Char('t') => {
                 app.scope = match app.scope {
                     Scope::All => Scope::Title,
@@ -969,6 +1053,11 @@ pub fn run(
             KeyCode::Char('d') => {
                 app.date_input = app.filters.date_text.clone();
                 app.editing = Editing::Date;
+                app.status = None;
+            }
+            KeyCode::Char('v') => {
+                app.venue_input = app.filters.venue_text.clone();
+                app.editing = Editing::Venue;
                 app.status = None;
             }
             KeyCode::Enter | KeyCode::Char('o') => {

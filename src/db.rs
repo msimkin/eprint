@@ -648,6 +648,28 @@ pub fn venue_map(conn: &Connection, ids: &[String]) -> Result<HashMap<String, St
     Ok(out)
 }
 
+/// Every published paper's venue, for the browser.
+///
+/// The whole table rather than a per-listing probe, and read once at startup like
+/// `watched`: `hit_height` runs over every hit on every frame, so the venue has to
+/// be a hash lookup and can never be a query. 11,000 short rows is nothing.
+pub fn venue_all(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT id, venue, year FROM venues")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, venue, year) = row?;
+        out.insert(id, label(&venue, &year));
+    }
+    Ok(out)
+}
+
 /// Where one paper was published, for `show`.
 pub fn venue_for(conn: &Connection, id: &str) -> Result<Option<String>> {
     let row = conn
@@ -674,6 +696,31 @@ pub fn venue_names(conn: &Connection) -> Result<Vec<(String, i64)>> {
     // Ordered here rather than in SQL because the ranking is a list, not a column.
     rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     Ok(rows.into_iter().map(|(_, v, n)| (v, n)).collect())
+}
+
+/// The stored spelling of a venue the user typed, or `None`.
+///
+/// Case-insensitive, then a unique case-insensitive prefix, so `--venue crypto`
+/// works and `--venue euro` reaches EUROCRYPT. Resolving here rather than folding
+/// inside `filter_sql` keeps that shared clause an indexed equality — and lets the
+/// caller say *which* venue it could not find, which a silent zero-row answer
+/// cannot.
+pub fn resolve_venue(conn: &Connection, typed: &str) -> Result<Option<String>> {
+    let want = typed.trim().to_lowercase();
+    if want.is_empty() {
+        return Ok(None);
+    }
+    let names = venue_names(conn)?;
+    if let Some((v, _)) = names.iter().find(|(v, _)| v.to_lowercase() == want) {
+        return Ok(Some(v.clone()));
+    }
+    let mut hits = names
+        .iter()
+        .filter(|(v, _)| v.to_lowercase().starts_with(&want));
+    match (hits.next(), hits.next()) {
+        (Some((v, _)), None) => Ok(Some(v.clone())),
+        _ => Ok(None),
+    }
 }
 
 /// `"CRYPTO"` + `"2025"` -> `"CRYPTO 2025"`, and just the venue if the year is

@@ -69,6 +69,11 @@ _eprint() {
       (( ${#values} )) && _describe -t categories 'IACR category' values $nocase
       return
       ;;
+    --venue)
+      values=(${(f)"$(eprint completions venues 2>/dev/null)"})
+      (( ${#values} )) && _describe -t venues 'venue' values $nocase
+      return
+      ;;
     --notify)
       values=(
         'off:no notifications'
@@ -123,6 +128,7 @@ _eprint() {
       '-n[maximum results]' '--limit[maximum results]'
       '--date[date or range, e.g. 2023..2024]'
       '--author[filter by author name]' '--category[filter by IACR category]'
+      '--venue[filter by publication venue]'
       '-t[titles and authors only]' '--title[titles and authors only]'
     )
     case ${words[2]} in
@@ -260,6 +266,9 @@ _eprint() {
     --category)
       vals=$(eprint completions categories 2>/dev/null | cut -d: -f1)
       _eprint_offer "$vals" "$cur"; return ;;
+    --venue)
+      vals=$(eprint completions venues 2>/dev/null | cut -d: -f1)
+      _eprint_offer "$vals" "$cur"; return ;;
     --author)
       # Filtered by what has been typed: the whole list is 21,000 names.
       vals=$(eprint completions authors "$cur" 2>/dev/null | cut -d: -f1)
@@ -306,6 +315,7 @@ config' "$cur"
 --date
 --author
 --category
+--venue
 -t
 --title'
     case $cmd in
@@ -380,6 +390,15 @@ pub(crate) fn do_completions(what: &str, needle: Option<&str>) -> Result<()> {
                 println!("{name}:{n} papers");
             }
         }
+        "venues" => {
+            let conn = db::open()?;
+            // Ranked, not alphabetical: `db::venue_names` orders by standing in the
+            // field, so the flagships are the first thing a menu shows. A colon can
+            // never appear in a venue name, which is what `_describe` splits on.
+            for (name, n) in db::venue_names(&conn)? {
+                println!("{name}:{n} papers");
+            }
+        }
         "watches" => {
             let conn = db::open()?;
             // The number is the position `eprint watch` prints, which is what
@@ -410,7 +429,7 @@ pub(crate) fn do_completions(what: &str, needle: Option<&str>) -> Result<()> {
         }
         other => bail!(
             "unknown completion target {other:?} — \
-             try `zsh`, `bash`, `ids`, `categories`, `watches` or `authors`"
+             try `zsh`, `bash`, `ids`, `categories`, `venues`, `watches` or `authors`"
         ),
     }
     Ok(())
