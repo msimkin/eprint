@@ -1,6 +1,6 @@
 [package]
 name = "eprint"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 # The lockfile is held back to releases that still build here; CI checks it.
 rust-version = "1.86"
