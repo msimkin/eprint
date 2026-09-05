@@ -29,6 +29,25 @@ pub const KEY_UPDATED: &str = "bib_updated";
 /// already encodes: a watermark that moved only on success would re-attempt a 40MB
 /// download on every command on a machine that cannot reach the server.
 pub const KEY_CHECKED: &str = "bib_checked";
+/// Which matcher built the current table.
+///
+/// Bump it whenever matching changes, exactly as `db::CACHE_VERSION` is bumped for
+/// the watch cache, and for a sharper reason: without this an improvement to
+/// matching **can never reach an existing index**. The ETag is the whole problem —
+/// CryptoBib publishes a few times a year, so the server answers 304, `update`
+/// returns `UpToDate` before matching runs at all, and the better matcher is
+/// unreachable until the file happens to move. A version mismatch suppresses the
+/// validator once, which costs one download and re-matches everything.
+///
+/// v2 is the index-driven second pass.
+pub const KEY_MATCHER: &str = "bib_matcher";
+const MATCHER_VERSION: &str = "v2";
+
+/// Is the stored table older than the current matcher?
+pub fn needs_rematch(conn: &Connection) -> Result<bool> {
+    Ok(db::bib_count(conn)? > 0
+        && db::meta_get(conn, KEY_MATCHER)?.as_deref() != Some(MATCHER_VERSION))
+}
 
 pub enum Outcome {
     UpToDate,
@@ -562,7 +581,10 @@ fn best_match(
 pub fn update(conn: &mut Connection, force: bool, quiet: bool, now: &str) -> Result<Outcome> {
     // Only send the validator when we actually have a usable table to keep.
     let have_rows = db::bib_count(conn)? > 0;
-    let etag = if force || !have_rows {
+    // A table built by an older matcher has to be rebuilt even though the file has
+    // not moved, so the validator is suppressed for that case too. See KEY_MATCHER.
+    let stale_matcher = needs_rematch(conn)?;
+    let etag = if force || stale_matcher || !have_rows {
         None
     } else {
         db::meta_get(conn, KEY_ETAG)?
@@ -715,6 +737,7 @@ pub fn update(conn: &mut Connection, force: bool, quiet: bool, now: &str) -> Res
         db::meta_set(&tx, KEY_ETAG, tag)?;
     }
     db::meta_set(&tx, KEY_UPDATED, now)?;
+    db::meta_set(&tx, KEY_MATCHER, MATCHER_VERSION)?;
     tx.commit()?;
 
     if !quiet {

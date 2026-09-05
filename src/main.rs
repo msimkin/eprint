@@ -931,6 +931,11 @@ const BIB_REFRESH_SECS: i64 = 7 * 24 * 3600;
 /// has never been fetched is due, which is what populates it on a first run without
 /// anyone being told to.
 fn bib_check_due(conn: &rusqlite::Connection) -> Result<bool> {
+    // A table built by an older matcher is due whatever the clock says: the file it
+    // came from may never move again, and the better matching would never run.
+    if bib::needs_rematch(conn)? {
+        return Ok(true);
+    }
     let last = db::meta_get(conn, bib::KEY_CHECKED)?
         .and_then(|v| dates::parse_iso(&v))
         .unwrap_or(0);
@@ -949,7 +954,11 @@ fn refresh_bib_if_due(conn: &mut rusqlite::Connection, quiet: bool) {
         return;
     }
     if !quiet {
-        eprintln!("Checking CryptoBib for new publication data…");
+        if bib::needs_rematch(conn).unwrap_or(false) {
+            eprintln!("Re-matching papers against CryptoBib (one time)…");
+        } else {
+            eprintln!("Checking CryptoBib for new publication data…");
+        }
     }
     let outcome = bib::update(conn, false, quiet, &dates::format_iso(dates::now()));
     // Stamped whatever happened, including a failure. See `bib::KEY_CHECKED`.
