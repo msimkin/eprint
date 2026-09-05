@@ -254,6 +254,18 @@ CREATE TABLE IF NOT EXISTS bib (
   PRIMARY KEY (eprint_id, kind)
 );
 
+-- Where a paper was published, derived from `bib` by `venue::of_entry` whenever
+-- CryptoBib is refreshed. It is a table rather than a view because `filter_sql`
+-- probes it per query and because the iOS front-end fills the same shape from a
+-- bundled extract, having no CryptoBib of its own — one table, two producers.
+CREATE TABLE IF NOT EXISTS venues (
+  id    TEXT PRIMARY KEY,
+  key   TEXT NOT NULL DEFAULT '',
+  venue TEXT NOT NULL,
+  year  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS venues_venue ON venues(venue, year);
+
 -- Saved searches are *not* here: they live in the config file, so that copying it
 -- carries a whole setup to another machine. `legacy_watches` reads the table an
 -- older build created, once, and then drops it.
@@ -326,6 +338,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     )?;
     if has_entry == 0 {
         conn.execute_batch("ALTER TABLE bib ADD COLUMN entry TEXT NOT NULL DEFAULT '';")?;
+    }
+    // An index that already carries CryptoBib data would otherwise show no venues
+    // until the next refresh, which is up to a week away. Derive them once from the
+    // `bib` rows already present. Only when `venues` is empty and `bib` is not, so
+    // this is a one-time cost on the first run of a build that has the column, and
+    // a no-op for a fresh index (`bib` is empty) and for every run after.
+    let venues: i64 = conn.query_row("SELECT COUNT(*) FROM venues", [], |r| r.get(0))?;
+    if venues == 0 && bib_count(conn)? > 0 {
+        rebuild_venues(conn)?;
     }
     // Author equivalence used to be computed and cached; it is a table in `names`
     // now, applied to the stored byline instead.
@@ -565,6 +586,104 @@ pub fn categories(conn: &Connection) -> Result<Vec<(String, i64)>> {
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Rebuild `venues` from the `published` rows of `bib`.
+///
+/// Called by `bib::update` inside the transaction that rewrites `bib`, so the two
+/// can never disagree, and once by `migrate` to backfill an index that predates the
+/// table. Takes `&Connection` rather than a transaction so both callers fit.
+pub fn rebuild_venues(conn: &Connection) -> Result<usize> {
+    conn.execute("DELETE FROM venues", [])?;
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT eprint_id, key, entry FROM bib WHERE kind = 'published'")?;
+        let mut q = stmt.query([])?;
+        while let Some(r) = q.next()? {
+            let entry: String = r.get(2)?;
+            // A record with neither `booktitle` nor `journal` names no venue. That
+            // is a handful of rows, not an error.
+            let Some((venue, year)) = crate::venue::of_entry(&entry) else {
+                continue;
+            };
+            rows.push((r.get(0)?, r.get(1)?, venue, year));
+        }
+    }
+    let mut ins =
+        conn.prepare("INSERT OR REPLACE INTO venues(id, key, venue, year) VALUES (?1,?2,?3,?4)")?;
+    for (id, key, venue, year) in &rows {
+        ins.execute([id, key, venue, year])?;
+    }
+    Ok(rows.len())
+}
+
+/// Where each of these papers was published, as `"CRYPTO 2025"`.
+///
+/// Rendered here rather than in either front-end, so the inline renderer and the
+/// TUI cannot format the same fact two ways. Same shape and the same reason as
+/// `bib_map`: one query per listing, never one per row.
+pub fn venue_map(conn: &Connection, ids: &[String]) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id, venue, year FROM venues WHERE id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn ToSql> = ids.iter().map(|s| s as &dyn ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, venue, year) = row?;
+        out.insert(id, label(&venue, &year));
+    }
+    Ok(out)
+}
+
+/// Where one paper was published, for `show`.
+pub fn venue_for(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let row = conn
+        .query_row("SELECT venue, year FROM venues WHERE id = ?1", [id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .ok();
+    Ok(row.map(|(v, y)| label(&v, &y)))
+}
+
+/// Every venue with a paper in the index, in `venue::RANK` order then alphabetical,
+/// with how many papers each has. Feeds Tab completion.
+pub fn venue_names(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.venue, COUNT(*) FROM venues v JOIN papers p ON p.id = v.id GROUP BY v.venue",
+    )?;
+    let mut rows: Vec<(usize, String, i64)> = stmt
+        .query_map([], |r| {
+            let v: String = r.get(0)?;
+            Ok((crate::venue::rank_of(&v), v, r.get::<_, i64>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    // Ordered here rather than in SQL because the ranking is a list, not a column.
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(rows.into_iter().map(|(_, v, n)| (v, n)).collect())
+}
+
+/// `"CRYPTO"` + `"2025"` -> `"CRYPTO 2025"`, and just the venue if the year is
+/// missing — a venue with a blank year would otherwise render a trailing space.
+fn label(venue: &str, year: &str) -> String {
+    if year.is_empty() {
+        venue.to_string()
+    } else {
+        format!("{venue} {year}")
+    }
 }
 
 pub fn bib_map(conn: &Connection, ids: &[String]) -> Result<HashMap<String, (String, bool)>> {
@@ -1040,11 +1159,11 @@ pub struct Query<'a> {
     pub category: Option<String>,
     /// Where the paper was *published*, via a `venues` table keyed by paper id.
     ///
-    /// Nothing in the command-line tool sets this — there is no `--venue` flag and
-    /// no `venues` table in its index. It exists for the iOS front-end, which ships
-    /// a CryptoBib extract as a bundled asset and creates the table itself. The
-    /// clause is only emitted when this is `Some`, so an index without the table can
-    /// never be asked about it.
+    /// Both front-ends fill that table, from different sources: the terminal derives
+    /// it from its own `bib` rows on every CryptoBib refresh, the iOS app loads a
+    /// bundled extract, having no CryptoBib of its own. For a long time only the
+    /// second existed and this clause named a table the terminal never created —
+    /// harmless only because nothing here set the field.
     ///
     /// It lives here rather than in a second query path so that `run_search`,
     /// `browse`, `count_matches` and `matching_ids` all learn it at once — the same

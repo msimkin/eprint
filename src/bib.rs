@@ -105,7 +105,9 @@ fn read_value(body: &str, start: usize) -> String {
     String::new()
 }
 
-fn field(body: &str, name: &str) -> String {
+/// `pub(crate)` for `venue::of_entry`, which reads `booktitle`/`journal` out of a
+/// stored record and needs the same brace matching this uses.
+pub(crate) fn field(body: &str, name: &str) -> String {
     find_field(body, name)
         .map(|i| read_value(body, i))
         .unwrap_or_default()
@@ -695,6 +697,10 @@ pub fn update(conn: &mut Connection, force: bool, quiet: bool, now: &str) -> Res
             published += 1;
         }
     }
+    // In the same transaction as the rows it is derived from, so `bib` and `venues`
+    // cannot disagree about where a paper appeared.
+    db::rebuild_venues(&tx)?;
+
     if let Some(tag) = &new_etag {
         db::meta_set(&tx, KEY_ETAG, tag)?;
     }

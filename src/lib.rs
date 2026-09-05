@@ -23,3 +23,4 @@ pub mod feed;
 pub mod harvest;
 pub mod names;
 pub mod text;
+pub mod venue;
